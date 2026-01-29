@@ -1,3 +1,0 @@
-mod diff;
-
-fn main() {}

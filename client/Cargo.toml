@@ -1,0 +1,11 @@
+[package]
+name = "hsync-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.56", features = ["derive"] }
+inotify = "0.11.0"
+quinn = "0.11.9"
+similar = "2.7.0"
