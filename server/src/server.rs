@@ -6,9 +6,13 @@ use quinn::{Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
-use tokio::sync::{
-    Mutex,
-    mpsc::{Receiver, Sender, unbounded_channel},
+use tokio::{
+    io::AsyncReadExt,
+    select,
+    sync::{
+        Mutex,
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    },
 };
 
 const INITIAL_QUERY: &str = "
@@ -21,7 +25,7 @@ pub struct Server {
     max_conns: Option<usize>,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
-    streams: Mutex<HashMap<SocketAddr, Sender<()>>>,
+    streams: Mutex<HashMap<SocketAddr, UnboundedSender<()>>>,
 }
 
 pub struct Client {}
@@ -101,17 +105,32 @@ impl Server {
 
     async fn handle_conn(self: Arc<Self>, conn: quinn::Incoming) -> anyhow::Result<()> {
         let conn = conn.await?;
-        let stream = match conn.accept_bi().await {
+        let mut buf = String::new();
+
+        let mut stream = match conn.accept_bi().await {
             Ok(s) => s,
             Err(_) => anyhow::bail!("bidi stream could not be accepted"),
         };
 
-        let (send, recv) = unbounded_channel::<()>();
+        let (send, mut recv) = unbounded_channel::<()>();
 
         {
             let mut lock = self.streams.lock().await;
-            if lock.contains_key(k)
+            lock.insert(conn.remote_address(), send);
         }
+
+        select! {
+            m = recv.recv() => {
+                if let Some(m) = m {
+
+                }
+            }
+
+            sz = stream.1.read_to_string(&mut buf) => {
+
+            }
+        }
+
         Ok(())
     }
 }

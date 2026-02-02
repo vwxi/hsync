@@ -1,9 +1,13 @@
+syntax = "proto3";
+
+package hsync;
+
 message Auth {
-    string id = 1;
-    string room = 2;
+  string id = 1;
+  string room = 2;
 }
 
 message Die {
-    string id = 1;
-    optional string reason = 2;
+  string id = 1;
+  optional string reason = 2;
 }

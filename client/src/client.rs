@@ -8,6 +8,10 @@ use xxhash_rust;
 
 use crate::Config;
 
+pub mod protocol {
+    include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
+}
+
 const INITIAL_QUERY: &str = "
 CREATE TABLE IF NOT EXISTS files (name TEXT, hash INTEGER)
 ";

@@ -23,10 +23,10 @@ struct Config {
     #[arg(short, long, value_name = "TOBIND", default_value = "[::]:7777")]
     bind: SocketAddr,
 
-    #[arg(short, long, value_name = "PRIVKEY", requires = "key")]
+    #[arg(short, long, value_name = "PRIVKEY")]
     key: PathBuf,
 
-    #[arg(short, long, value_name = "CERT", requires = "cert")]
+    #[arg(short, long, value_name = "CERT")]
     cert: PathBuf,
 
     #[arg(short, long, value_name = "MAXCONNS")]
