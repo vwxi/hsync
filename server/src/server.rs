@@ -2,6 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use crate::Config;
 use anyhow::Context;
+use prost::Message;
 use quinn::{Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -15,6 +16,10 @@ use tokio::{
     },
 };
 
+pub mod protocol {
+    include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
+}
+
 const INITIAL_QUERY: &str = "
 
 ";
@@ -25,7 +30,7 @@ pub struct Server {
     max_conns: Option<usize>,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
-    streams: Mutex<HashMap<SocketAddr, UnboundedSender<()>>>,
+    streams: Mutex<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
 }
 
 pub struct Client {}
@@ -112,7 +117,7 @@ impl Server {
             Err(_) => anyhow::bail!("bidi stream could not be accepted"),
         };
 
-        let (send, mut recv) = unbounded_channel::<()>();
+        let (send, mut recv) = unbounded_channel::<protocol::Packet>();
 
         {
             let mut lock = self.streams.lock().await;
@@ -120,12 +125,15 @@ impl Server {
         }
 
         select! {
+            // to send over the wire
             m = recv.recv() => {
                 if let Some(m) = m {
-
+                    let encoded = m.encode_to_vec();
+                    stream.0.write_all(&encoded).await?;
                 }
             }
 
+            // what we receive
             sz = stream.1.read_to_string(&mut buf) => {
 
             }

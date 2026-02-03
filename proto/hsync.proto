@@ -11,3 +11,17 @@ message Die {
   string id = 1;
   optional string reason = 2;
 }
+
+enum Tag {
+  Ping = 0;
+  Authenticate = 1;
+  Disconnect = 2;
+}
+
+message Packet {
+  Tag tag = 1;
+  oneof message {
+    Auth auth = 2;
+    Die die = 3;
+  }
+}

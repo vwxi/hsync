@@ -13,7 +13,7 @@ pub mod protocol {
 }
 
 const INITIAL_QUERY: &str = "
-CREATE TABLE IF NOT EXISTS files (name TEXT, hash INTEGER)
+CREATE TABLE IF NOT EXISTS files (name INTEGER, hash INTEGER)
 ";
 
 pub struct Client {
@@ -65,11 +65,16 @@ impl Client {
                     buffer.clear();
                     let _ = file.read_to_end(&mut buffer);
 
-                    let res = i64::try_from(xxhash_rust::xxh3::xxh3_64(&buffer))?;
+                    let name = i64::try_from(xxhash_rust::xxh3::xxh3_64(
+                        path.to_str()
+                            .ok_or(anyhow::anyhow!("bad file name"))?
+                            .as_bytes(),
+                    ))?;
+                    let hash = i64::try_from(xxhash_rust::xxh3::xxh3_64(&buffer))?;
 
                     db.execute(
                         "INSERT INTO files (name, hash) VALUES (?1, ?2)",
-                        (path.to_str().ok_or(anyhow::anyhow!("bad file name"))?, res),
+                        (name, hash),
                     )?;
                 }
                 _ => continue,
