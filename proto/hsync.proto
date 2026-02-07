@@ -3,25 +3,38 @@ syntax = "proto3";
 package hsync;
 
 message Auth {
-  string id = 1;
+  int64 id = 1;
   string room = 2;
 }
 
 message Die {
-  string id = 1;
+  int64 id = 1;
   optional string reason = 2;
 }
 
-enum Tag {
-  Ping = 0;
-  Authenticate = 1;
-  Disconnect = 2;
+// batch comparisons
+message Compare {
+  message FilePair {
+    int64 name = 1;
+    int64 hash = 2;
+  }
+  repeated FilePair entries = 1;
+}
+
+message CreateEvent {}
+message DeleteEvent {}
+message ModifyEvent {}
+
+message Event {
+  oneof info {
+    CreateEvent create = 1;
+  }
 }
 
 message Packet {
-  Tag tag = 1;
   oneof message {
-    Auth auth = 2;
-    Die die = 3;
+    Auth auth = 1;
+    Die die = 2;
+    Compare compare = 3;
   }
 }

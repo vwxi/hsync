@@ -12,6 +12,7 @@ mod server;
 use anyhow::Context;
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use tracing::{Instrument, info_span};
 
 use crate::server::Server;
 
@@ -24,24 +25,36 @@ struct Config {
     bind: SocketAddr,
 
     #[arg(short, long, value_name = "PRIVKEY")]
-    key: PathBuf,
+    key: Option<PathBuf>,
 
     #[arg(short, long, value_name = "CERT")]
-    cert: PathBuf,
+    cert: Option<PathBuf>,
 
     #[arg(short, long, value_name = "MAXCONNS")]
     max_conns: Option<usize>,
 }
 
 fn main() {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install default CryptoProvider");
+
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+
     let config = Config::parse();
 
-    std::process::exit(if run(config).is_err() { 1 } else { 0 });
+    if let Err(e) = run(config) {
+        tracing::error!("{:?}", e);
+    }
 }
 
 #[tokio::main]
 async fn run(config: Config) -> anyhow::Result<()> {
     let server = Arc::new(Server::new(config)?);
+    let span = info_span!("run thread");
 
-    server.run().await
+    let span2 = span.clone();
+    server.run(span2).instrument(span).await
 }
