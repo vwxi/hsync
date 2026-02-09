@@ -7,13 +7,14 @@ use quinn::{Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     select,
     sync::{
         Mutex,
-        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        mpsc::{UnboundedSender, unbounded_channel},
     },
 };
 use tracing::{Instrument, Span, instrument};
@@ -23,11 +24,9 @@ pub mod protocol {
 }
 
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
-const USERS_INSERT_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS users (id INTEGER, current_folder INTEGER)";
-const FOLDERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (password TEXT)";
-const ENTRIES_INSERT_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS entries (folder INTEGER, name INTEGER, hash INTEGER)";
+const USERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, current_folder INTEGER)";
+const FOLDERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
+const ENTRIES_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS entries (time DATETIME DEFAULT CURRENT_TIMESTAMP, folder INTEGER, name INTEGER, hash INTEGER, contents BLOB)";
 
 pub type UserId = u64;
 
@@ -105,7 +104,12 @@ impl Server {
         tracing::info!("initialized QUIC endpoint at {}", config.bind);
 
         // INIT SQLITE
-        let manager = SqliteConnectionManager::memory();
+        let manager = if let Some(db) = config.db {
+            SqliteConnectionManager::file(db)
+        } else {
+            SqliteConnectionManager::memory()
+        };
+
         let pool = Pool::new(manager)?;
         {
             let conn = pool.get()?;
@@ -155,10 +159,12 @@ impl Server {
 
     async fn handle_conn(self: Arc<Self>, conn: quinn::Incoming) -> anyhow::Result<()> {
         let conn = conn.await?;
-        let mut buf = String::new();
 
         let mut stream = match conn.accept_bi().await {
-            Ok(s) => s,
+            Ok(s) => {
+                tracing::debug!("accepted bidi stream");
+                s
+            }
             Err(_) => anyhow::bail!("bidi stream could not be accepted"),
         };
 
@@ -169,19 +175,23 @@ impl Server {
             lock.insert(conn.remote_address(), send);
         }
 
-        select! {
-            // outgoing messages to client
-            Some(m) = recv.recv() => {
-                let encoded = m.encode_to_vec();
-                stream.0.write_all(&encoded).await?;
-            }
+        loop {
+            select! {
+                // outgoing messages to client
+                Some(m) = recv.recv() => {
+                    Self::write_packet(&mut stream.0, &m).await?;
+                }
 
-            // incoming from client
-            _ = stream.1.read_to_string(&mut buf) => {
-                let msg = protocol::Packet::decode(buf.as_bytes())?;
-
-                if let Err(e) = self.handle_packet(msg).await {
-                    tracing::error!("packet handler: {:?}", e);
+                // incoming from client
+                pkt = Self::read_packet(&mut stream.1) => {
+                    match pkt? {
+                        Some(msg) => {
+                            if let Err(e) = self.handle_packet(msg).await {
+                                tracing::error!("packet handler: {:?}", e);
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -189,18 +199,51 @@ impl Server {
         Ok(())
     }
 
+    async fn write_packet(stream: &mut SendStream, pkt: &protocol::Packet) -> anyhow::Result<()> {
+        let encoded = pkt.encode_to_vec();
+        let len = encoded.len() as u32;
+        stream.write_u32(len).await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    async fn read_packet(stream: &mut RecvStream) -> anyhow::Result<Option<protocol::Packet>> {
+        let len = match stream.read_u32().await {
+            Ok(len) => len,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut buf = vec![0u8; len as usize];
+        stream.read_exact(&mut buf).await?;
+        let pkt = protocol::Packet::decode(&buf[..])?;
+        Ok(Some(pkt))
+    }
+
     async fn handle_packet(self: &Arc<Self>, pkt: protocol::Packet) -> anyhow::Result<()> {
         let message = pkt
             .message
             .ok_or(anyhow::anyhow!("why is this happening?"))?;
 
+        tracing::debug!("pkt recvd: {:?}", message);
+
         match message {
-            protocol::packet::Message::Auth(auth) => {}
+            protocol::packet::Message::Auth(auth) => self.handle_auth(auth).await?,
 
             protocol::packet::Message::Die(die) => {}
 
-            protocol::packet::Message::Compare(compare) => {}
+            _ => {}
         }
+
+        Ok(())
+    }
+
+    async fn handle_auth(self: &Arc<Self>, auth: protocol::Auth) -> anyhow::Result<()> {
+        let conn = self.db_pool.get()?;
+
+        let mut id_stmt = conn.prepare("SELECT * FROM users WHERE id = ?1")?;
+        let id_res = id_stmt.query([auth.id])?.size_hint();
 
         Ok(())
     }

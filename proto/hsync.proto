@@ -2,9 +2,18 @@ syntax = "proto3";
 
 package hsync;
 
+import "google/protobuf/timestamp.proto";
+
+// if there is no room provided then
+// the passcode will be interpreted as the passcode for a new folder
 message Auth {
   int64 id = 1;
-  string room = 2;
+  optional string room = 2;
+  string passcode = 3;
+}
+
+message RoomInfo {
+  string code = 1;
 }
 
 message Die {
@@ -12,13 +21,23 @@ message Die {
   optional string reason = 2;
 }
 
-// batch comparisons
-message Compare {
-  message FilePair {
-    int64 name = 1;
-    int64 hash = 2;
-  }
-  repeated FilePair entries = 1;
+message BlockMetadata {
+  uint64 offset = 1;
+  uint64 hash = 2;
+}
+
+message Block {
+  BlockMetadata metadata = 1;
+  bytes data = 2;
+}
+
+// describes a file.
+// server checks if filename exists for folder in database. if none, creates file in folder on database.
+// server then checks for individual blocks,
+//    if more than threshold% of blocks are missing,
+message FileManifest {
+  string filename = 1;
+  repeated BlockMetadata blocks = 2;
 }
 
 message CreateEvent {}
@@ -35,6 +54,5 @@ message Packet {
   oneof message {
     Auth auth = 1;
     Die die = 2;
-    Compare compare = 3;
   }
 }

@@ -1,6 +1,9 @@
 use std::{
     ffi::{OsStr, OsString},
+    fs::metadata,
     io::Read,
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -17,12 +20,14 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     select,
     sync::{
-        Mutex,
+        Mutex, MutexGuard,
         mpsc::{UnboundedSender, unbounded_channel},
     },
 };
+use tracing::instrument;
 use xxhash_rust;
 
 use crate::Config;
@@ -31,8 +36,7 @@ pub mod protocol {
     include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
 }
 
-/// WARNING: This is insecure and should only be used for development!
-/// This verifier accepts any certificate without validation.
+/// to be used with --insecure flag
 #[derive(Debug)]
 struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
@@ -88,10 +92,9 @@ impl ServerCertVerifier for SkipServerVerification {
 }
 
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
-const BUF_SIZE: usize = 1024;
-const INITIAL_QUERY: &str = "
-CREATE TABLE IF NOT EXISTS files (name INTEGER, hash INTEGER)
-";
+const BUF_SIZE: usize = 16384;
+const BLOCK_SIZE: usize = 2048;
+const INIT_BLOCK_TABLE_QUERY: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, offset INTEGER, hash INTEGER, timestamp INTEGER, UNIQUE(file, offset))";
 
 pub struct Client {
     config: Config,
@@ -112,32 +115,41 @@ impl Drop for Client {
 
 impl Client {
     pub fn new(config: Config) -> anyhow::Result<Client> {
+        // process all files currently in folder
+        let current_folder = PathBuf::from(".");
+
+        let folder = config.folder.as_ref().unwrap_or(&current_folder);
+        let manager = if let Some(ref db) = config.db {
+            SqliteConnectionManager::file(db)
+        } else {
+            SqliteConnectionManager::memory()
+        };
+
+        let db_pool = Pool::new(manager)?;
+        let mut diff_buffer = [0u8; BLOCK_SIZE];
+        {
+            let conn = db_pool.get()?;
+            conn.execute(INIT_BLOCK_TABLE_QUERY, ())?;
+            Self::process_files_into_db(&folder, &mut diff_buffer, &conn)?;
+        }
+
+        tracing::info!(
+            "initialized block database and processed folder {}",
+            folder.to_string_lossy()
+        );
+
         // create inotify stream
         // TODO: for subfolders we need to abstract out this part into something
         //       you can deploy for any number of folders
         let notify = Inotify::init()?;
         let wd = notify
             .watches()
-            .add(config.folder.clone(), WatchMask::all())?;
+            .add(folder, WatchMask::all() & !WatchMask::ONESHOT)?;
 
-        let buf = [0u8; 1024];
+        let buf = [0u8; BUF_SIZE];
         let stream = notify.into_event_stream(buf)?;
 
-        tracing::info!("created inotify for folder {}", config.folder);
-
-        // process all files currently in folder
-        let manager = SqliteConnectionManager::memory();
-        let db_pool = Pool::new(manager)?;
-        {
-            let conn = db_pool.get()?;
-            conn.execute(INITIAL_QUERY, ())?;
-            Self::process_files_into_db(config.folder.clone(), &conn)?;
-        }
-
-        tracing::info!(
-            "initialized metadata db and processed folder {}",
-            config.folder
-        );
+        tracing::info!("created inotify for folder {}", folder.to_string_lossy());
 
         // connect to server
         //
@@ -145,6 +157,8 @@ impl Client {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut endpoint = quinn::Endpoint::client(config.bind)?;
         endpoint.set_default_client_config(if config.insecure {
+            tracing::warn!("running in insecure mode.");
+
             let mut rustls_config = rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()?
                 .dangerous()
@@ -155,6 +169,8 @@ impl Client {
 
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config)?))
         } else {
+            tracing::warn!("running in secure mode.");
+
             quinn::ClientConfig::try_with_platform_verifier()?
         });
 
@@ -168,7 +184,7 @@ impl Client {
         })
     }
 
-    /// this function will init the
+    /// this function will init the connection
     async fn connect(&mut self) -> anyhow::Result<(Connection, SendStream, RecvStream)> {
         let conn = self
             .endpoint
@@ -176,46 +192,45 @@ impl Client {
             .connect(self.config.addr, "localhost")?
             .await?;
 
-        let (send, recv) = conn.open_bi().await?;
+        let (mut send, recv) = conn.open_bi().await?;
+
+        let pkt = protocol::Packet {
+            message: Some(protocol::packet::Message::Auth(protocol::Auth {
+                id: rand::random(),
+                room: self.config.code.clone(),
+                passcode: self.config.password.clone(),
+            })),
+        };
+
+        Self::write_packet(&mut send, &pkt).await?;
 
         Ok((conn, send, recv))
     }
 
-    /// hash any files in folder and register them in database
-    /// hashes are checked on any changes and are checked with
-    /// the server
+    /// processes files into entry database
     fn process_files_into_db(
-        folder: String,
+        folder: &PathBuf,
+        buf: &mut [u8],
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<()> {
-        let folder = format!("{}/*", folder);
+        let folder_glob = format!(
+            "{}/*",
+            folder.to_str().ok_or(anyhow::anyhow!("malformed folder"))?
+        );
 
-        for entry in glob(&folder)? {
+        for entry in glob(&folder_glob)? {
             match entry {
                 Ok(path) => {
-                    let mut file = std::fs::File::open(path.clone()).unwrap();
-                    let mut buffer = Vec::new();
-                    buffer.clear();
-                    let _ = file.read_to_end(&mut buffer);
-
-                    let name = (xxhash_rust::xxh3::xxh3_64(
-                        path.to_str()
-                            .ok_or(anyhow::anyhow!("bad file name"))?
-                            .as_bytes(),
-                    )) as i64;
-                    let hash = xxhash_rust::xxh3::xxh3_64(&buffer) as i64;
-
-                    tracing::debug!(
-                        "processed {} -> ({}: {})",
-                        path.to_string_lossy(),
-                        name,
-                        hash
-                    );
-
-                    db.execute(
-                        "INSERT INTO files (name, hash) VALUES (?1, ?2)",
-                        (name, hash),
+                    Self::check_diff(
+                        &path,
+                        buf,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                            .as_secs() as i64,
+                        db,
                     )?;
+
+                    tracing::debug!("parsed blocks for file {}", path.to_string_lossy());
                 }
                 _ => continue,
             }
@@ -224,13 +239,120 @@ impl Client {
         Ok(())
     }
 
-    fn handle_file_event(&mut self, event: Event<OsString>) -> anyhow::Result<()> {
-        tracing::debug!("event: {:?}", event);
+    async fn write_packet(stream: &mut SendStream, pkt: &protocol::Packet) -> anyhow::Result<()> {
+        let encoded = pkt.encode_to_vec();
+        let len = encoded.len() as u32;
+        stream.write_u32(len).await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+        Ok(())
+    }
 
+    async fn read_packet(stream: &mut RecvStream) -> anyhow::Result<Option<protocol::Packet>> {
+        let len = match stream.read_u32().await {
+            Ok(len) => len,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut buf = vec![0u8; len as usize];
+        stream.read_exact(&mut buf).await?;
+        let pkt = protocol::Packet::decode(&buf[..])?;
+        Ok(Some(pkt))
+    }
+
+    // check differences in a single file and report back a diff object
+    fn check_diff(
+        path: &PathBuf,
+        buf: &mut [u8],
+        new_timestamp: i64,
+        db: &PooledConnection<SqliteConnectionManager>,
+    ) -> anyhow::Result<()> {
+        let mut file = std::fs::File::open(&path)?;
+        let pathname = path.to_str().ok_or(anyhow::anyhow!("malformed filename"))?;
+        let hashed_filename = xxhash_rust::xxh3::xxh3_64(pathname.as_bytes()) as i64;
+        let mut offset = 0isize;
+
+        // NOTE: files are addressed in the block store by hash(filename).
+        //       if we have files with different filenames but identical content,
+        //       there will be redundant storage. in the future, consider loading
+        //       whole file, hashing contents then hashing blocks.
+        loop {
+            let sz = file.read(buf)?;
+
+            tracing::debug!("[file {}] read {} bytes", pathname, sz);
+
+            let current_hash = xxhash_rust::xxh3::xxh3_64(buf) as i64;
+
+            let mut stmt = db.prepare(
+                "
+                    INSERT INTO blocks (file, offset, hash, timestamp)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(file, offset) DO UPDATE SET
+                        hash = excluded.hash,
+                        timestamp = excluded.timestamp
+                    WHERE excluded.timestamp > blocks.timestamp
+                      AND excluded.hash != blocks.hash
+                    RETURNING hash, timestamp
+                    ",
+            )?;
+
+            let _ = stmt.query_one(
+                [hashed_filename, offset as i64, current_hash, new_timestamp],
+                |row| {
+                    tracing::debug!(
+                        "[file {}] updated block {} (now {})",
+                        pathname,
+                        offset,
+                        row.get::<_, i64>(0)?,
+                    );
+
+                    Ok(())
+                },
+            );
+
+            offset += sz as isize;
+
+            if sz < BLOCK_SIZE || sz == 0 {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_file_event(
+        &mut self,
+        buf: &mut [u8],
+        db: &PooledConnection<SqliteConnectionManager>,
+        event: Event<OsString>,
+    ) -> anyhow::Result<()> {
         match event.mask {
             EventMask::CREATE => {}
             EventMask::DELETE => {}
-            EventMask::DELETE_SELF => {
+            EventMask::MODIFY => {
+                let filename = if let Some(folder) = self.config.folder.clone() {
+                    folder
+                } else {
+                    PathBuf::from(".")
+                }
+                .join(
+                    event
+                        .name
+                        .as_ref()
+                        .ok_or(anyhow::anyhow!("event has no filename"))?
+                        .to_str()
+                        .ok_or(anyhow::anyhow!("malformed filename"))?,
+                );
+
+                let new_timestamp = metadata(&filename)?
+                    .accessed()?
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                    .as_secs() as i64;
+
+                Self::check_diff(&filename, buf, new_timestamp, db)?;
+            }
+            EventMask::DELETE_SELF | EventMask::IGNORED => {
                 // destroy client because folder is no longer watchable
                 return Err(anyhow::anyhow!("folder is no longer watchable"));
             }
@@ -241,15 +363,18 @@ impl Client {
     }
 
     fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
+        tracing::debug!("recved pkt: {:?}", packet);
+
         Ok(())
     }
 
     #[tokio::main]
     pub async fn client_main(config: Config) -> anyhow::Result<()> {
         let mut client = Self::new(config)?;
-        let mut buf = [0u8; BUF_SIZE];
-        let (conn, mut send, mut recv) = client.connect().await?;
+        //let (_conn, mut send, mut recv) = client.connect().await?;
         let (send_ch, mut recv_ch) = unbounded_channel::<protocol::Packet>();
+        let db = client.db_pool.get()?;
+        let mut diff_buffer = [0u8; BLOCK_SIZE];
 
         {
             let mut lock = client.send_ch.lock().await;
@@ -258,36 +383,30 @@ impl Client {
 
         loop {
             select! {
+                // outgoing messages to server
+                //Some(m) = recv_ch.recv() => {
+                //    tracing::debug!("to send: {:?}", m);
+                //    Self::write_packet(&mut send, &m).await?;
+                //},
+
                 // events from inotify
                 Some(Ok(event)) = client.stream.next() => {
-                    client.handle_file_event(event)?;
+                    client.handle_file_event(&mut diff_buffer, &db, event)?;
                 },
 
-                // outgoing messages to server
-                Some(m) = recv_ch.recv() => {
-                    let encoded = m.encode_to_vec();
-                    send.write_all(&encoded).await?;
-                },
-
-                // events from server
+                // incoming messages from server
                 // TODO: how do we stop inotify from renotifying us
                 //       maybe increment (stream.next) until we are done updating
                 //       or maybe keep a map of (filename, num of ignores) and decrement until 0 and remove
-                m = recv.read(&mut buf) => {
-                    match m {
-                        // stream has stopped, maybe closed
-                        Ok(None) => break,
-                        Err(e) => anyhow::bail!("server stream: {}", e),
-                        _ => {}
-                    }
-
-                    let pkt = protocol::Packet::decode(&buf[..])?;
-
-                    client.handle_server_event(pkt)?;
-                }
+                // pkt = Self::read_packet(&mut recv) => {
+                //     match pkt? {
+                //         Some(pkt) => client.handle_server_event(pkt)?,
+                //         None => break,
+                //     }
+                // }
             }
         }
 
-        Ok(())
+        // Ok(())
     }
 }

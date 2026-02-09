@@ -32,6 +32,9 @@ struct Config {
 
     #[arg(short, long, value_name = "MAXCONNS")]
     max_conns: Option<usize>,
+
+    #[arg(short, long, value_name = "DB")]
+    db: Option<PathBuf>,
 }
 
 fn main() {

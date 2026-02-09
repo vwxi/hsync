@@ -6,3 +6,4 @@ Cargo.lock
 rust-project.json
 *.pem
 *.der
+*.db
