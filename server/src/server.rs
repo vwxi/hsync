@@ -6,6 +6,7 @@ use prost::Message;
 use quinn::{Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rand::prelude::*;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
@@ -23,6 +24,7 @@ pub mod protocol {
     include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
 }
 
+const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const USERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, current_folder INTEGER)";
 const FOLDERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
@@ -186,7 +188,7 @@ impl Server {
                 pkt = Self::read_packet(&mut stream.1) => {
                     match pkt? {
                         Some(msg) => {
-                            if let Err(e) = self.handle_packet(msg).await {
+                            if let Err(e) = self.handle_packet(conn.remote_address(), msg).await {
                                 tracing::error!("packet handler: {:?}", e);
                             }
                         }
@@ -221,7 +223,11 @@ impl Server {
         Ok(Some(pkt))
     }
 
-    async fn handle_packet(self: &Arc<Self>, pkt: protocol::Packet) -> anyhow::Result<()> {
+    async fn handle_packet(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        pkt: protocol::Packet,
+    ) -> anyhow::Result<()> {
         let message = pkt
             .message
             .ok_or(anyhow::anyhow!("why is this happening?"))?;
@@ -229,7 +235,7 @@ impl Server {
         tracing::debug!("pkt recvd: {:?}", message);
 
         match message {
-            protocol::packet::Message::Auth(auth) => self.handle_auth(auth).await?,
+            protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth).await?,
 
             protocol::packet::Message::Die(die) => {}
 
@@ -239,12 +245,89 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_auth(self: &Arc<Self>, auth: protocol::Auth) -> anyhow::Result<()> {
-        let conn = self.db_pool.get()?;
+    fn generate_folder_code() -> String {
+        let mut rng = rand::rng();
+        let mut segments: Vec<String> = Vec::with_capacity(5);
 
-        let mut id_stmt = conn.prepare("SELECT * FROM users WHERE id = ?1")?;
-        id_stmt.query_one([auth.id], |row| Ok(()))?;
+        for _ in 0..5 {
+            let segment: String = (0..5)
+                .map(|_| {
+                    let idx = rng.random_range(0..CHARSET.len());
+                    CHARSET[idx] as char
+                })
+                .collect();
+            segments.push(segment);
+        }
 
+        segments.join("-")
+    }
+
+    async fn handle_auth(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        auth: protocol::Auth,
+    ) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+        let mut streams_lock = self.streams.lock().await;
+        let stream = streams_lock
+            .get_mut(&addr)
+            .ok_or(anyhow::anyhow!("could not find stream for peer"))?;
+
+        if let Some(folder) = auth.folder {
+            // user wants to join a folder and is new
+            stream.send(protocol::Packet { message: None })?;
+        } else {
+            // user wants to create a folder and is new
+            stream.send(protocol::Packet {
+                message: Some(
+                    if let Ok((folder_code, folder_id)) = {
+                        // generate folder and return folder code
+                        let (folder_code, folder_id) = loop {
+                            let folder_code = Self::generate_folder_code();
+
+                            let mut stmt = db.prepare(
+                                "
+                                INSERT INTO folders (code, password)
+                                SELECT ?1, ?2
+                                WHERE NOT EXISTS (
+                                    SELECT 1 FROM folders WHERE code = ?1
+                                )
+                                RETURNING code, id;
+                                ",
+                            )?;
+
+                            if let Ok((code, id)) = stmt
+                                .query_one([&folder_code, &auth.passcode], |row| {
+                                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                                })
+                            {
+                                tracing::debug!("created new room {}", folder_code);
+                                break Ok::<(String, i64), anyhow::Error>((code, id));
+                            }
+                        }?;
+
+                        // add user
+                        db.execute(
+                            "INSERT INTO users (current_folder) VALUES (?1)",
+                            [folder_id],
+                        )?;
+
+                        tracing::debug!("added new user for folder {}", folder_id);
+
+                        Ok::<(String, i64), anyhow::Error>((folder_code, folder_id))
+                    } {
+                        protocol::packet::Message::RoomInfo(protocol::RoomInfo {
+                            id: folder_id as u64,
+                            code: folder_code,
+                        })
+                    } else {
+                        protocol::packet::Message::Die(protocol::Die {
+                            reason: Some(String::from("failed to authenticate")),
+                        })
+                    },
+                ),
+            })?;
+        }
         Ok(())
     }
 }

@@ -4,21 +4,21 @@ package hsync;
 
 import "google/protobuf/timestamp.proto";
 
-// if there is no room provided then
+// if there is no folder provided then
 // the passcode will be interpreted as the passcode for a new folder
 message Auth {
-  int64 id = 1;
-  optional string room = 2;
-  string passcode = 3;
+  optional string folder = 1;
+  string passcode = 2;
 }
 
+// returned after auth works
 message RoomInfo {
-  string code = 1;
+  uint64 id = 1;
+  string code = 2;
 }
 
 message Die {
-  int64 id = 1;
-  optional string reason = 2;
+  optional string reason = 1;
 }
 
 message BlockMetadata {
