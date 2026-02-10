@@ -243,7 +243,7 @@ impl Server {
         let conn = self.db_pool.get()?;
 
         let mut id_stmt = conn.prepare("SELECT * FROM users WHERE id = ?1")?;
-        let id_res = id_stmt.query([auth.id])?.size_hint();
+        id_stmt.query_one([auth.id], |row| Ok(()))?;
 
         Ok(())
     }

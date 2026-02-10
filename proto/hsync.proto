@@ -24,6 +24,7 @@ message Die {
 message BlockMetadata {
   uint64 offset = 1;
   uint64 hash = 2;
+  uint64 timestamp = 3;
 }
 
 message Block {
@@ -33,8 +34,7 @@ message Block {
 
 // describes a file.
 // server checks if filename exists for folder in database. if none, creates file in folder on database.
-// server then checks for individual blocks,
-//    if more than threshold% of blocks are missing,
+// client checks if filename exists on local filesystem and database. if none, creates file in folder and db
 message FileManifest {
   string filename = 1;
   repeated BlockMetadata blocks = 2;
@@ -54,5 +54,7 @@ message Packet {
   oneof message {
     Auth auth = 1;
     Die die = 2;
+    RoomInfo room_info = 3;
+    FileManifest manifest = 4;
   }
 }

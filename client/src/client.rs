@@ -36,6 +36,13 @@ pub mod protocol {
     include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
 }
 
+const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
+const BUF_SIZE: usize = 16384;
+const BLOCK_SIZE: usize = 2048;
+const INIT_FILE_TABLE_QUERY: &str =
+    "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER)";
+const INIT_BLOCK_TABLE_QUERY: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, offset INTEGER, hash INTEGER, timestamp INTEGER, UNIQUE(file, offset))";
+
 /// to be used with --insecure flag
 #[derive(Debug)]
 struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
@@ -91,11 +98,6 @@ impl ServerCertVerifier for SkipServerVerification {
     }
 }
 
-const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
-const BUF_SIZE: usize = 16384;
-const BLOCK_SIZE: usize = 2048;
-const INIT_BLOCK_TABLE_QUERY: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, offset INTEGER, hash INTEGER, timestamp INTEGER, UNIQUE(file, offset))";
-
 pub struct Client {
     config: Config,
     stream: EventStream<[u8; BUF_SIZE]>,
@@ -129,6 +131,7 @@ impl Client {
         let mut diff_buffer = [0u8; BLOCK_SIZE];
         {
             let conn = db_pool.get()?;
+            conn.execute(INIT_FILE_TABLE_QUERY, ())?;
             conn.execute(INIT_BLOCK_TABLE_QUERY, ())?;
             Self::process_files_into_db(&folder, &mut diff_buffer, &conn)?;
         }
@@ -194,15 +197,17 @@ impl Client {
 
         let (mut send, recv) = conn.open_bi().await?;
 
-        let pkt = protocol::Packet {
-            message: Some(protocol::packet::Message::Auth(protocol::Auth {
-                id: rand::random(),
-                room: self.config.code.clone(),
-                passcode: self.config.password.clone(),
-            })),
-        };
+        {
+            let pkt = protocol::Packet {
+                message: Some(protocol::packet::Message::Auth(protocol::Auth {
+                    id: rand::random(),
+                    room: self.config.code.clone(),
+                    passcode: self.config.password.clone(),
+                })),
+            };
 
-        Self::write_packet(&mut send, &pkt).await?;
+            Self::write_packet(&mut send, &pkt).await?;
+        }
 
         Ok((conn, send, recv))
     }
@@ -273,6 +278,11 @@ impl Client {
         let hashed_filename = xxhash_rust::xxh3::xxh3_64(pathname.as_bytes()) as i64;
         let mut offset = 0isize;
 
+        db.execute(
+            "INSERT INTO filenames (name, hash) VALUES (?1, ?2)",
+            (pathname, hashed_filename),
+        )?;
+
         // NOTE: files are addressed in the block store by hash(filename).
         //       if we have files with different filenames but identical content,
         //       there will be redundant storage. in the future, consider loading
@@ -301,10 +311,11 @@ impl Client {
                 [hashed_filename, offset as i64, current_hash, new_timestamp],
                 |row| {
                     tracing::debug!(
-                        "[file {}] updated block {} (now {})",
+                        "[file {}] updated block {} (now {}, {})",
                         pathname,
                         offset,
                         row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
                     );
 
                     Ok(())
@@ -334,6 +345,8 @@ impl Client {
                 let filename = if let Some(folder) = self.config.folder.clone() {
                     folder
                 } else {
+                    // in the event that we are not hosting the folder,
+                    // the cwd will serve as the folder in which synced files are put
                     PathBuf::from(".")
                 }
                 .join(
@@ -362,8 +375,77 @@ impl Client {
         Ok(())
     }
 
+    async fn send_manifest(&mut self) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+        let mut send_ch = self.send_ch.lock().await;
+
+        let mut query_files = db.prepare("SELECT DISTINCT file FROM blocks")?;
+        let _ = query_files.query_map((), |row| {
+            let file_hash = row.get::<_, i64>(0)?;
+
+            let mut manifest = protocol::FileManifest::default();
+
+            let mut name_stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
+            name_stmt.query_one([&file_hash], |r| {
+                manifest.filename = r.get::<_, String>(0)?;
+
+                Ok(())
+            })?;
+
+            let mut query_blocks =
+                db.prepare("SELECT offset, hash, timestamp FROM blocks WHERE file = ?1")?;
+
+            let _ = query_blocks.query_map((), |block| {
+                let (offset, hash, timestamp) = (
+                    block.get::<_, i64>(0)? as u64,
+                    block.get::<_, i64>(1)? as u64,
+                    block.get::<_, i64>(2)? as u64,
+                );
+
+                manifest.blocks.push(protocol::BlockMetadata {
+                    offset,
+                    hash,
+                    timestamp,
+                });
+
+                Ok(())
+            })?;
+
+            let _ = send_ch.as_mut().map(|ch| {
+                if let Err(e) = ch.send(protocol::Packet {
+                    message: Some(protocol::packet::Message::Manifest(manifest)),
+                }) {
+                    anyhow::bail!("failed to send message: {}", e.to_string());
+                }
+
+                Ok(())
+            });
+
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
     fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
         tracing::debug!("recved pkt: {:?}", packet);
+
+        let message = packet
+            .message
+            .ok_or(anyhow::anyhow!("empty packet from server"))?;
+
+        match message {
+            protocol::packet::Message::RoomInfo(room_info) => {
+                tracing::info!("folder has been added to server.");
+                tracing::info!(
+                    "to sync as a client, connect using this code: {}",
+                    room_info.code
+                );
+
+                // get started on syncing
+            }
+            _ => {}
+        }
 
         Ok(())
     }
@@ -371,7 +453,7 @@ impl Client {
     #[tokio::main]
     pub async fn client_main(config: Config) -> anyhow::Result<()> {
         let mut client = Self::new(config)?;
-        //let (_conn, mut send, mut recv) = client.connect().await?;
+        let (_conn, mut send, mut recv) = client.connect().await?;
         let (send_ch, mut recv_ch) = unbounded_channel::<protocol::Packet>();
         let db = client.db_pool.get()?;
         let mut diff_buffer = [0u8; BLOCK_SIZE];
@@ -384,10 +466,10 @@ impl Client {
         loop {
             select! {
                 // outgoing messages to server
-                //Some(m) = recv_ch.recv() => {
-                //    tracing::debug!("to send: {:?}", m);
-                //    Self::write_packet(&mut send, &m).await?;
-                //},
+                Some(m) = recv_ch.recv() => {
+                    tracing::debug!("to send: {:?}", m);
+                    Self::write_packet(&mut send, &m).await?;
+                },
 
                 // events from inotify
                 Some(Ok(event)) = client.stream.next() => {
@@ -398,15 +480,15 @@ impl Client {
                 // TODO: how do we stop inotify from renotifying us
                 //       maybe increment (stream.next) until we are done updating
                 //       or maybe keep a map of (filename, num of ignores) and decrement until 0 and remove
-                // pkt = Self::read_packet(&mut recv) => {
-                //     match pkt? {
-                //         Some(pkt) => client.handle_server_event(pkt)?,
-                //         None => break,
-                //     }
-                // }
+                pkt = Self::read_packet(&mut recv) => {
+                    match pkt? {
+                        Some(pkt) => client.handle_server_event(pkt)?,
+                        None => break,
+                    }
+                }
             }
         }
 
-        // Ok(())
+        Ok(())
     }
 }
