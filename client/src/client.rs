@@ -110,6 +110,18 @@ pub struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         // disconnect from server
+        tokio::task::block_in_place(|| {
+            let send_ch = self.send_ch.blocking_lock();
+
+            send_ch.as_ref().map(|ch| {
+                ch.send(protocol::Packet {
+                    message: Some(protocol::packet::Message::Die(protocol::Die {
+                        reason: Some(String::from("disconnecting")),
+                    })),
+                })
+            })
+        });
+
         self.endpoint
             .close(quinn::VarInt::from_u32(0), b"client dropped");
     }
@@ -374,6 +386,7 @@ impl Client {
         Ok(())
     }
 
+    /// to be used in tandem with process_files_with_db?
     async fn send_manifest(&mut self) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
         let mut send_ch = self.send_ch.lock().await;
@@ -426,7 +439,7 @@ impl Client {
         Ok(())
     }
 
-    fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
+    async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
         tracing::debug!("recved pkt: {:?}", packet);
 
         let message = packet
@@ -442,6 +455,7 @@ impl Client {
                 );
 
                 // get started on syncing
+                self.send_manifest().await?;
             }
             _ => {}
         }
@@ -481,7 +495,7 @@ impl Client {
                 //       or maybe keep a map of (filename, num of ignores) and decrement until 0 and remove
                 pkt = Self::read_packet(&mut recv) => {
                     match pkt? {
-                        Some(pkt) => client.handle_server_event(pkt)?,
+                        Some(pkt) => client.handle_server_event(pkt).await?,
                         None => break,
                     }
                 }

@@ -27,7 +27,7 @@ pub mod protocol {
 
 const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
-const USERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, current_folder INTEGER)";
+const USERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const FOLDERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
 const ENTRIES_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS entries (time DATETIME DEFAULT CURRENT_TIMESTAMP, folder INTEGER, name INTEGER, hash INTEGER, contents BLOB)";
 
@@ -238,7 +238,11 @@ impl Server {
         match message {
             protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth).await?,
 
-            protocol::packet::Message::Die(die) => {}
+            protocol::packet::Message::Die(die) => self.handle_die(addr, die).await?,
+
+            protocol::packet::Message::Manifest(manifest) => {
+                self.handle_manifest(addr, manifest).await?
+            }
 
             _ => {}
         }
@@ -283,16 +287,16 @@ impl Server {
 
                 let mut hasher = blake2::Blake2b512::new();
                 hasher.update(&auth.password);
-                let digest = String::from_utf8(hasher.finalize().to_ascii_lowercase())
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let final_hash = hasher.finalize();
+                let digest = base16ct::lower::encode_string(&final_hash);
 
                 stream
                     .send(protocol::Packet {
                         message: Some(if digest == folder_pass_hash {
                             if db
                                 .execute(
-                                    "INSERT INTO users (current_folder) VALUES (?1)",
-                                    [folder_id],
+                                    "INSERT INTO users (addr, current_folder) VALUES (?1, ?2)",
+                                    (addr.to_string(), folder_id),
                                 )
                                 .is_err()
                             {
@@ -337,7 +341,8 @@ impl Server {
 
                             let mut hasher = blake2::Blake2b512::new();
                             hasher.update(&auth.password);
-                            let digest = String::from_utf8(hasher.finalize().to_ascii_lowercase())?;
+                            let final_hash = hasher.finalize();
+                            let digest = base16ct::lower::encode_string(&final_hash);
 
                             if let Ok((code, id)) = stmt.query_one([&folder_code, &digest], |row| {
                                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -369,6 +374,42 @@ impl Server {
                 ),
             })?;
         }
+        Ok(())
+    }
+
+    async fn handle_die(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        die: protocol::Die,
+    ) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+
+        db.execute(
+            "
+            DELETE FROM folders
+            WHERE id IN (
+                SELECT current_folder FROM users WHERE addr = ?1
+            )
+            AND (
+                SELECT COUNT(*) FROM users WHERE current_folder = (
+                    SELECT current_folder FROM users WHERE addr = ?1
+                )
+            ) = 1
+            ",
+            [addr.to_string()],
+        )?;
+
+        db.execute("DELETE FROM users WHERE addr = ?!", [addr.to_string()])?;
+
+        tracing::debug!("peer {} disconnected", addr);
+        Ok(())
+    }
+
+    async fn handle_manifest(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        manifest: protocol::FileManifest,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
