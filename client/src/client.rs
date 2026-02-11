@@ -201,7 +201,7 @@ impl Client {
             let pkt = protocol::Packet {
                 message: Some(protocol::packet::Message::Auth(protocol::Auth {
                     folder: self.config.code.clone(),
-                    passcode: self.config.password.clone(),
+                    password: self.config.password.clone(),
                 })),
             };
 

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+blake2 = "0.10.6"
 clap = { version = "4.5.56", features = ["derive"] }
 prost = "0.14.3"
 prost-types = "0.14.3"

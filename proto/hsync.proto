@@ -5,10 +5,10 @@ package hsync;
 import "google/protobuf/timestamp.proto";
 
 // if there is no folder provided then
-// the passcode will be interpreted as the passcode for a new folder
+// the password will be interpreted as the passcode for a new folder
 message Auth {
   optional string folder = 1;
-  string passcode = 2;
+  string password = 2;
 }
 
 // returned after auth works

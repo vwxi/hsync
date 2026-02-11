@@ -2,6 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use crate::Config;
 use anyhow::Context;
+use blake2::Digest;
 use prost::Message;
 use quinn::{Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
 use r2d2::Pool;
@@ -273,9 +274,47 @@ impl Server {
             .get_mut(&addr)
             .ok_or(anyhow::anyhow!("could not find stream for peer"))?;
 
-        if let Some(folder) = auth.folder {
+        if let Some(folder_code) = auth.folder {
             // user wants to join a folder and is new
-            stream.send(protocol::Packet { message: None })?;
+            let mut stmt = db.prepare("SELECT id, password FROM folders WHERE code = ?1")?;
+            stmt.query_one([&folder_code], |row| {
+                let (folder_id, folder_pass_hash) =
+                    (row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
+
+                let mut hasher = blake2::Blake2b512::new();
+                hasher.update(&auth.password);
+                let digest = String::from_utf8(hasher.finalize().to_ascii_lowercase())
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                stream
+                    .send(protocol::Packet {
+                        message: Some(if digest == folder_pass_hash {
+                            if db
+                                .execute(
+                                    "INSERT INTO users (current_folder) VALUES (?1)",
+                                    [folder_id],
+                                )
+                                .is_err()
+                            {
+                                protocol::packet::Message::RoomInfo(protocol::RoomInfo {
+                                    id: folder_id as u64,
+                                    code: folder_code.clone(),
+                                })
+                            } else {
+                                protocol::packet::Message::Die(protocol::Die {
+                                    reason: Some(String::from("could not add user to db")),
+                                })
+                            }
+                        } else {
+                            protocol::packet::Message::Die(protocol::Die {
+                                reason: Some(String::from("auth failure")),
+                            })
+                        }),
+                    })
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                Ok(())
+            })?;
         } else {
             // user wants to create a folder and is new
             stream.send(protocol::Packet {
@@ -296,11 +335,13 @@ impl Server {
                                 ",
                             )?;
 
-                            if let Ok((code, id)) = stmt
-                                .query_one([&folder_code, &auth.passcode], |row| {
-                                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                                })
-                            {
+                            let mut hasher = blake2::Blake2b512::new();
+                            hasher.update(&auth.password);
+                            let digest = String::from_utf8(hasher.finalize().to_ascii_lowercase())?;
+
+                            if let Ok((code, id)) = stmt.query_one([&folder_code, &digest], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                            }) {
                                 tracing::debug!("created new room {}", folder_code);
                                 break Ok::<(String, i64), anyhow::Error>((code, id));
                             }
