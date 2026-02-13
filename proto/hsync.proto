@@ -33,6 +33,10 @@ message Block {
 }
 
 // describes a file.
+// a manifest can describe parts of a file, the server will simply process whatever is sent to it
+// blocks that are newer than registered will be requested by the server
+// blocks that are older than registered will make the server send data
+//
 // server checks if filename exists for folder in database. if none, creates file in folder on database.
 // client checks if filename exists on local filesystem and database. if none, creates file in folder and db
 message FileManifest {
@@ -40,14 +44,27 @@ message FileManifest {
   repeated BlockMetadata blocks = 2;
 }
 
-message CreateEvent {}
-message DeleteEvent {}
-message ModifyEvent {}
+enum DataMode {
+  DATA_MODE_WHOLE_UNSPECIFIED = 0;
+  DATA_MODE_DELTA = 1;
+}
+
+// if no data, is a request for data
+// if data, is either a response to a request or lone data transfer (from server)
+message Transfer {
+  BlockMetadata metadata = 1;
+  DataMode mode = 2;
+  optional bytes data = 3;
+}
+
+enum FileEvent {
+  FILE_EVENT_CREATE_UNSPECIFIED = 0;
+  FILE_EVENT_DELETE = 1;
+}
 
 message Event {
-  oneof info {
-    CreateEvent create = 1;
-  }
+  FileEvent event = 1;
+  string filename = 2;
 }
 
 message Packet {
@@ -56,5 +73,7 @@ message Packet {
     Die die = 2;
     RoomInfo room_info = 3;
     FileManifest manifest = 4;
+    Transfer transfer = 5;
+    Event event = 6;
   }
 }

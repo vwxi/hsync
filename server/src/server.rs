@@ -5,11 +5,10 @@ use anyhow::Context;
 use blake2::Digest;
 use prost::Message;
 use quinn::{Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
-use r2d2::Pool;
+use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::prelude::*;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,7 +18,7 @@ use tokio::{
         mpsc::{UnboundedSender, unbounded_channel},
     },
 };
-use tracing::{Instrument, Span, instrument};
+use tracing::{Instrument, Span};
 
 pub mod protocol {
     include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
@@ -27,9 +26,11 @@ pub mod protocol {
 
 const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
-const USERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
-const FOLDERS_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
-const ENTRIES_INSERT_STMT: &str = "CREATE TABLE IF NOT EXISTS entries (time DATETIME DEFAULT CURRENT_TIMESTAMP, folder INTEGER, name INTEGER, hash INTEGER, contents BLOB)";
+const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
+const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
+const CREATE_FILENAMES_STMT: &str =
+    "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT, namehash INTEGER)";
+const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (time DATETIME DEFAULT CURRENT_TIMESTAMP, folder INTEGER, name INTEGER, hash INTEGER, contents BLOB)";
 
 pub type UserId = u64;
 
@@ -102,6 +103,9 @@ impl Server {
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(0_u8.into());
 
+        // TODO: WE NEED TO ADD HEARTBEATS! ADDING INFINITE TIMEOUT MEANS FUTURES
+        //       CAN HOLD SO WE NEED TO ADD A HEARTBEAT MECHANISM
+
         let endpoint = quinn::Endpoint::server(server_config, config.bind)?;
 
         tracing::info!("initialized QUIC endpoint at {}", config.bind);
@@ -110,15 +114,16 @@ impl Server {
         let manager = if let Some(db) = config.db {
             SqliteConnectionManager::file(db)
         } else {
-            SqliteConnectionManager::memory()
+            SqliteConnectionManager::file("file:hsyncdb?mode=memory&cache=shared")
         };
 
         let pool = Pool::new(manager)?;
         {
             let conn = pool.get()?;
-            conn.execute(USERS_INSERT_STMT, ())?;
-            conn.execute(FOLDERS_INSERT_STMT, ())?;
-            conn.execute(ENTRIES_INSERT_STMT, ())?;
+            conn.execute(CREATE_USERS_STMT, ())?;
+            conn.execute(CREATE_FOLDERS_STMT, ())?;
+            conn.execute(CREATE_FILENAMES_STMT, ())?;
+            conn.execute(CREATE_BLOCKS_STMT, ())?;
         }
 
         tracing::info!("initialized db");
@@ -179,6 +184,7 @@ impl Server {
         }
 
         loop {
+            tracing::debug!("waiting...");
             select! {
                 // outgoing messages to client
                 Some(m) = recv.recv() => {
@@ -193,7 +199,9 @@ impl Server {
                                 tracing::error!("packet handler: {:?}", e);
                             }
                         }
-                        None => break,
+                        None => {
+                            break
+                        },
                     }
                 }
             }
@@ -203,6 +211,8 @@ impl Server {
     }
 
     async fn write_packet(stream: &mut SendStream, pkt: &protocol::Packet) -> anyhow::Result<()> {
+        tracing::debug!("write packet: {:?}", pkt);
+
         let encoded = pkt.encode_to_vec();
         let len = encoded.len() as u32;
         stream.write_u32(len).await?;
@@ -236,13 +246,15 @@ impl Server {
         tracing::debug!("pkt recvd: {:?}", message);
 
         match message {
-            protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth).await?,
+            protocol::packet::Message::Auth(auth) => dbg!(self.handle_auth(addr, auth).await)?,
 
             protocol::packet::Message::Die(die) => self.handle_die(addr, die).await?,
 
             protocol::packet::Message::Manifest(manifest) => {
                 self.handle_manifest(addr, manifest).await?
             }
+
+            protocol::packet::Message::Event(event) => self.handle_event(addr, event).await?,
 
             _ => {}
         }
@@ -276,7 +288,7 @@ impl Server {
         let mut streams_lock = self.streams.lock().await;
         let stream = streams_lock
             .get_mut(&addr)
-            .ok_or(anyhow::anyhow!("could not find stream for peer"))?;
+            .ok_or(anyhow::anyhow!("could not find stream for client"))?;
 
         if let Some(folder_code) = auth.folder {
             // user wants to join a folder and is new
@@ -298,7 +310,7 @@ impl Server {
                                     "INSERT INTO users (addr, current_folder) VALUES (?1, ?2)",
                                     (addr.to_string(), folder_id),
                                 )
-                                .is_err()
+                                .is_ok()
                             {
                                 protocol::packet::Message::RoomInfo(protocol::RoomInfo {
                                     id: folder_id as u64,
@@ -354,8 +366,8 @@ impl Server {
 
                         // add user
                         db.execute(
-                            "INSERT INTO users (current_folder) VALUES (?1)",
-                            [folder_id],
+                            "INSERT INTO users (addr, current_folder) VALUES (?1, ?2)",
+                            (addr.to_string(), folder_id),
                         )?;
 
                         tracing::debug!("added new user for folder {}", folder_id);
@@ -399,7 +411,7 @@ impl Server {
             [addr.to_string()],
         )?;
 
-        db.execute("DELETE FROM users WHERE addr = ?!", [addr.to_string()])?;
+        db.execute("DELETE FROM users WHERE addr = ?1", [addr.to_string()])?;
 
         tracing::debug!("peer {} disconnected", addr);
         Ok(())
@@ -410,6 +422,151 @@ impl Server {
         addr: SocketAddr,
         manifest: protocol::FileManifest,
     ) -> anyhow::Result<()> {
+        let mut streams_lock = self.streams.lock().await;
+        let stream = streams_lock
+            .get_mut(&addr)
+            .ok_or(anyhow::anyhow!("could not find stream for peer"))?;
+
+        // reject empty manifests
+        if manifest.blocks.is_empty() {
+            stream.send(protocol::Packet {
+                message: Some(protocol::packet::Message::Die(protocol::Die {
+                    reason: Some(String::from("failed to authenticate")),
+                })),
+            })?;
+
+            return Ok(());
+        }
+
+        let db = self.db_pool.get()?;
+
+        let folder_id: i64 = db.query_row(
+            "SELECT current_folder FROM users WHERE addr = ?1",
+            [addr.to_string()],
+            |row| row.get(0),
+        )?;
+
+        let exists_in_db: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
+            (folder_id, &manifest.filename),
+            |row| row.get(0),
+        )?;
+
+        if !exists_in_db {
+            tracing::debug!(
+                "file {} is not part of folder {}, adding",
+                manifest.filename,
+                folder_id
+            );
+
+            let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
+            self.create_file_entry(&db, folder_id, &manifest.filename, namehash)?;
+        }
+
+        for block in manifest.blocks {
+            match db.query_row(
+                "SELECT hash FROM entries WHERE folder = ?1 AND name = ?2 AND offset = ?3",
+                (folder_id, &manifest.filename, block.offset as i64),
+                |row| row.get::<_, i64>(0),
+            ) {
+                // file block exists already, update
+                Ok(current_block_hash) => {
+                    let current_block_hash = current_block_hash as u64;
+                }
+
+                // file block does not exist, request it
+                // TODO: set a hard limit on filesize so we avoid some sort of DoS
+                //       where you can just invent blocks at huge offsets
+                Err(_) => {
+                    tracing::debug!(
+                        "[file {}] block @ offset {} DNE. requesting.",
+                        manifest.filename,
+                        block.offset,
+                    );
+
+                    stream.send(protocol::Packet {
+                        message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                            metadata: Some(block),
+                            mode: protocol::DataMode::WholeUnspecified as i32,
+                            data: None,
+                        })),
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn create_file_entry(
+        self: &Arc<Self>,
+        db: &PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        name_string: &str,
+        name_hash: i64,
+    ) -> anyhow::Result<()> {
+        db.execute(
+            "INSERT INTO filenames (folder, name, namehash) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
+            (folder_id, name_string, name_hash),
+        )?;
+
+        Ok(())
+    }
+
+    fn delete_file_entry(
+        self: &Arc<Self>,
+        db: &PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        name_hash: i64,
+    ) -> anyhow::Result<()> {
+        db.execute(
+            "DELETE FROM blocks WHERE folder = ?1 AND name = ?2",
+            (folder_id, name_hash),
+        )?;
+
+        tracing::debug!(
+            "deleted all blocks related to file {} in folder {}",
+            name_hash,
+            folder_id
+        );
+
+        db.execute("DELETE FROM filenames WHERE folder = ?1", [folder_id])?;
+
+        tracing::debug!(
+            "deleted filename entry for namehash {} in folder {}",
+            name_hash,
+            folder_id
+        );
+
+        Ok(())
+    }
+
+    async fn handle_event(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        event: protocol::Event,
+    ) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+        let folder_id: i64 = dbg!(db.query_row(
+            "SELECT current_folder FROM users WHERE addr = ?1",
+            [addr.to_string()],
+            |row| row.get(0),
+        ))?;
+
+        let file_namehash: i64 = dbg!(db.query_row(
+            "SELECT hash FROM filenames WHERE folder = ?1 AND name = ?2",
+            (folder_id, &event.filename),
+            |row| row.get::<_, i64>(0),
+        ))?;
+
+        match event.event() {
+            protocol::FileEvent::CreateUnspecified => {
+                self.create_file_entry(&db, folder_id, &event.filename, file_namehash)
+            }
+
+            protocol::FileEvent::Delete => self.delete_file_entry(&db, folder_id, file_namehash),
+        }?;
+
         Ok(())
     }
 }

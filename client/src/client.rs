@@ -39,9 +39,9 @@ pub mod protocol {
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
 const BLOCK_SIZE: usize = 2048;
-const INIT_FILE_TABLE_QUERY: &str =
+const CREATE_FILENAMES_STMT: &str =
     "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER)";
-const INIT_BLOCK_TABLE_QUERY: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, offset INTEGER, hash INTEGER, timestamp INTEGER, UNIQUE(file, offset))";
+const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, offset INTEGER, hash INTEGER, timestamp INTEGER, UNIQUE(file, offset))";
 
 /// to be used with --insecure flag
 #[derive(Debug)]
@@ -136,15 +136,15 @@ impl Client {
         let manager = if let Some(ref db) = config.db {
             SqliteConnectionManager::file(db)
         } else {
-            SqliteConnectionManager::memory()
+            SqliteConnectionManager::file("file:blockstore?mode=memory&cache=shared")
         };
 
         let db_pool = Pool::new(manager)?;
         let mut diff_buffer = [0u8; BLOCK_SIZE];
         {
             let conn = db_pool.get()?;
-            conn.execute(INIT_FILE_TABLE_QUERY, ())?;
-            conn.execute(INIT_BLOCK_TABLE_QUERY, ())?;
+            conn.execute(CREATE_FILENAMES_STMT, ())?;
+            conn.execute(CREATE_BLOCKS_STMT, ())?;
             Self::process_files_into_db(&folder, &mut diff_buffer, &conn)?;
         }
 
@@ -157,9 +157,11 @@ impl Client {
         // TODO: for subfolders we need to abstract out this part into something
         //       you can deploy for any number of folders
         let notify = Inotify::init()?;
-        let wd = notify
-            .watches()
-            .add(folder, WatchMask::all() & !WatchMask::ONESHOT)?;
+        let wd = notify.watches().add(
+            folder,
+            WatchMask::all()
+                & !(WatchMask::ONESHOT | WatchMask::ACCESS | WatchMask::OPEN | WatchMask::CLOSE),
+        )?;
 
         let buf = [0u8; BUF_SIZE];
         let stream = notify.into_event_stream(buf)?;
@@ -283,11 +285,16 @@ impl Client {
         buf: &mut [u8],
         new_timestamp: i64,
         db: &PooledConnection<SqliteConnectionManager>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<(usize, u64, u64)>> {
         let mut file = std::fs::File::open(&path)?;
-        let pathname = path.to_str().ok_or(anyhow::anyhow!("malformed filename"))?;
+        // TODO: adapt this for subfolders when it gets implemented
+        let pathname = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .ok_or(anyhow::anyhow!("malformed filename"))?;
         let hashed_filename = xxhash_rust::xxh3::xxh3_64(pathname.as_bytes()) as i64;
         let mut offset = 0isize;
+        let mut changes: Vec<(usize, u64, u64)> = vec![];
 
         db.execute(
             "INSERT INTO filenames (name, hash) VALUES (?1, ?2)",
@@ -321,17 +328,21 @@ impl Client {
             let _ = stmt.query_one(
                 [hashed_filename, offset as i64, current_hash, new_timestamp],
                 |row| {
+                    let (hash, timestamp) = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
+
                     tracing::debug!(
                         "[file {}] updated block {} (now {}, {})",
                         pathname,
                         offset,
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
+                        hash,
+                        timestamp
                     );
+
+                    changes.push((offset as usize, hash as u64, timestamp as u64));
 
                     Ok(())
                 },
-            );
+            )?;
 
             offset += sz as isize;
 
@@ -340,41 +351,69 @@ impl Client {
             }
         }
 
-        Ok(())
+        Ok(changes)
     }
 
-    fn handle_file_event(
+    async fn handle_file_event(
         &mut self,
         buf: &mut [u8],
         db: &PooledConnection<SqliteConnectionManager>,
         event: Event<OsString>,
     ) -> anyhow::Result<()> {
-        match event.mask {
-            EventMask::CREATE => {}
-            EventMask::DELETE => {}
-            EventMask::MODIFY => {
-                let filename = if let Some(folder) = self.config.folder.clone() {
-                    folder
-                } else {
-                    // in the event that we are not hosting the folder,
-                    // the cwd will serve as the folder in which synced files are put
-                    PathBuf::from(".")
-                }
-                .join(
-                    event
-                        .name
-                        .as_ref()
-                        .ok_or(anyhow::anyhow!("event has no filename"))?
-                        .to_str()
-                        .ok_or(anyhow::anyhow!("malformed filename"))?,
-                );
+        let event_file = event
+            .name
+            .as_ref()
+            .ok_or(anyhow::anyhow!("event has no filename"))?
+            .to_str()
+            .ok_or(anyhow::anyhow!("malformed filename"))?;
 
+        let filename = if let Some(folder) = self.config.folder.clone() {
+            folder
+        } else {
+            // in the event that we are not hosting the folder,
+            // the cwd will serve as the folder in which synced files are put
+            PathBuf::from(".")
+        }
+        .join(event_file);
+
+        // TODO: one of the biggest issues is that this wont support
+        //       files in subfolders. we will fix this eventually.
+        match event.mask {
+            EventMask::CREATE => {
+                let send_ch = self.send_ch.lock().await;
+                send_ch
+                    .as_ref()
+                    .map(|ch| {
+                        ch.send(protocol::Packet {
+                            message: Some(protocol::packet::Message::Event(protocol::Event {
+                                event: protocol::FileEvent::CreateUnspecified as i32,
+                                filename: String::from(event_file),
+                            })),
+                        })
+                    })
+                    .ok_or(anyhow::anyhow!("failed to relay create event"))??;
+            }
+            EventMask::DELETE => {
+                let send_ch = self.send_ch.lock().await;
+                send_ch
+                    .as_ref()
+                    .map(|ch| {
+                        ch.send(protocol::Packet {
+                            message: Some(protocol::packet::Message::Event(protocol::Event {
+                                event: protocol::FileEvent::Delete as i32,
+                                filename: String::from(event_file),
+                            })),
+                        })
+                    })
+                    .ok_or(anyhow::anyhow!("failed to relay delete event"))??;
+            }
+            EventMask::MODIFY => {
                 let new_timestamp = metadata(&filename)?
                     .accessed()?
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_secs() as i64;
 
-                Self::check_diff(&filename, buf, new_timestamp, db)?;
+                let changes = Self::check_diff(&filename, buf, new_timestamp, db)?;
             }
             EventMask::DELETE_SELF | EventMask::IGNORED => {
                 // destroy client because folder is no longer watchable
@@ -388,40 +427,46 @@ impl Client {
 
     /// to be used in tandem with process_files_with_db?
     async fn send_manifest(&mut self) -> anyhow::Result<()> {
-        let db = self.db_pool.get()?;
+        let conn = self.db_pool.get()?;
+
         let mut send_ch = self.send_ch.lock().await;
 
-        let mut query_files = db.prepare("SELECT DISTINCT file FROM blocks")?;
-        let _ = query_files.query_map((), |row| {
-            let file_hash = row.get::<_, i64>(0)?;
+        let mut query_files = conn.prepare("SELECT DISTINCT file FROM blocks")?;
+        let mut files = query_files.query(())?;
+
+        while let Ok(Some(row)) = files.next() {
+            let file_hash = dbg!(row.get::<_, i64>(0))?;
+
+            tracing::debug!("file_hash: {file_hash}");
 
             let mut manifest = protocol::FileManifest::default();
 
-            let mut name_stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
-            name_stmt.query_one([&file_hash], |r| {
+            let mut name_stmt = conn.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
+            let _ = name_stmt.query_one([&file_hash], |r| {
                 manifest.filename = r.get::<_, String>(0)?;
 
                 Ok(())
             })?;
 
-            let mut query_blocks =
-                db.prepare("SELECT offset, hash, timestamp FROM blocks WHERE file = ?1")?;
+            tracing::debug!("name_stmt: {:?}", name_stmt);
 
-            let _ = query_blocks.query_map((), |block| {
+            let mut query_blocks =
+                conn.prepare("SELECT offset, hash, timestamp FROM blocks WHERE file = ?1")?;
+            let mut blocks = query_blocks.query([&file_hash])?;
+
+            while let Ok(Some(block)) = blocks.next() {
                 let (offset, hash, timestamp) = (
                     block.get::<_, i64>(0)? as u64,
                     block.get::<_, i64>(1)? as u64,
                     block.get::<_, i64>(2)? as u64,
                 );
 
-                manifest.blocks.push(protocol::BlockMetadata {
+                manifest.blocks.push(dbg!(protocol::BlockMetadata {
                     offset,
                     hash,
                     timestamp,
-                });
-
-                Ok(())
-            })?;
+                }));
+            }
 
             let _ = send_ch.as_mut().map(|ch| {
                 if let Err(e) = ch.send(protocol::Packet {
@@ -432,9 +477,7 @@ impl Client {
 
                 Ok(())
             });
-
-            Ok(())
-        })?;
+        }
 
         Ok(())
     }
@@ -486,7 +529,7 @@ impl Client {
 
                 // events from inotify
                 Some(Ok(event)) = client.stream.next() => {
-                    client.handle_file_event(&mut diff_buffer, &db, event)?;
+                    client.handle_file_event(&mut diff_buffer, &db, event).await?;
                 },
 
                 // incoming messages from server
