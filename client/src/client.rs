@@ -413,7 +413,24 @@ impl Client {
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_secs() as i64;
 
-                let changes = Self::check_diff(&filename, buf, new_timestamp, db)?;
+                let mut manifest = protocol::FileManifest::default();
+                let send_ch = self.send_ch.lock().await;
+
+                manifest.filename = String::from(event_file);
+
+                for change in Self::check_diff(&filename, buf, new_timestamp, db)? {
+                    manifest.blocks.push(protocol::BlockMetadata {
+                        offset: change.0 as u64,
+                        hash: change.1,
+                        timestamp: change.2,
+                    });
+                }
+
+                send_ch.as_ref().map(|ch| {
+                    ch.send(protocol::Packet {
+                        message: Some(protocol::packet::Message::Manifest(manifest)),
+                    })
+                });
             }
             EventMask::DELETE_SELF | EventMask::IGNORED => {
                 // destroy client because folder is no longer watchable
