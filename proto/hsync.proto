@@ -39,6 +39,8 @@ message Block {
 //
 // server checks if filename exists for folder in database. if none, creates file in folder on database.
 // client checks if filename exists on local filesystem and database. if none, creates file in folder and db
+//
+// in server->client, metadata "hash" field is hash of filename
 message FileManifest {
   string filename = 1;
   repeated BlockMetadata blocks = 2;
@@ -67,13 +69,20 @@ message Event {
   string filename = 2;
 }
 
+enum Return {
+  ERROR_NONE_UNSPECIFIED = 0;
+  ERROR_BLOCK_MISMATCH = 1;
+}
+
 message Packet {
+  Return code = 1;
+
   oneof message {
-    Auth auth = 1;
-    Die die = 2;
-    RoomInfo room_info = 3;
-    FileManifest manifest = 4;
-    Transfer transfer = 5;
-    Event event = 6;
+    Auth auth = 2;
+    Die die = 3;
+    RoomInfo room_info = 4;
+    FileManifest manifest = 5;
+    Transfer transfer = 6;
+    Event event = 7;
   }
 }

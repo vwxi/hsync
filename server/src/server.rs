@@ -256,6 +256,10 @@ impl Server {
 
             protocol::packet::Message::Event(event) => self.handle_event(addr, event).await?,
 
+            protocol::packet::Message::Transfer(transfer) => {
+                self.handle_transfer(addr, transfer).await?
+            }
+
             _ => {}
         }
 
@@ -304,6 +308,7 @@ impl Server {
 
                 stream
                     .send(protocol::Packet {
+                        code: protocol::Return::ErrorNoneUnspecified as i32,
                         message: Some(if digest == folder_pass_hash {
                             if db
                                 .execute(
@@ -334,6 +339,7 @@ impl Server {
         } else {
             // user wants to create a folder and is new
             stream.send(protocol::Packet {
+                code: protocol::Return::ErrorNoneUnspecified as i32,
                 message: Some(
                     if let Ok((folder_code, folder_id)) = {
                         // generate folder and return folder code
@@ -430,6 +436,7 @@ impl Server {
         // reject empty manifests
         if manifest.blocks.is_empty() {
             stream.send(protocol::Packet {
+                code: protocol::Return::ErrorNoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Die(protocol::Die {
                     reason: Some(String::from("failed to authenticate")),
                 })),
@@ -463,7 +470,7 @@ impl Server {
             self.create_file_entry(&db, folder_id, &manifest.filename, namehash)?;
         }
 
-        for block in manifest.blocks {
+        for mut block in manifest.blocks {
             match db.query_row(
                 "SELECT hash FROM entries WHERE folder = ?1 AND name = ?2 AND offset = ?3",
                 (folder_id, &manifest.filename, block.offset as i64),
@@ -484,7 +491,10 @@ impl Server {
                         block.offset,
                     );
 
+                    block.hash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes());
+
                     stream.send(protocol::Packet {
+                        code: protocol::Return::ErrorNoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
                             metadata: Some(block),
                             mode: protocol::DataMode::WholeUnspecified as i32,
@@ -567,6 +577,14 @@ impl Server {
             protocol::FileEvent::Delete => self.delete_file_entry(&db, folder_id, file_namehash),
         }?;
 
+        Ok(())
+    }
+
+    async fn handle_transfer(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        transfer: protocol::Transfer,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }

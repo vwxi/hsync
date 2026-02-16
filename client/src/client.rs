@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::metadata,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     os::unix::ffi::OsStrExt,
     path::PathBuf,
     sync::Arc,
@@ -115,6 +115,7 @@ impl Drop for Client {
 
             send_ch.as_ref().map(|ch| {
                 ch.send(protocol::Packet {
+                    code: protocol::Return::ErrorNoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Die(protocol::Die {
                         reason: Some(String::from("disconnecting")),
                     })),
@@ -213,6 +214,7 @@ impl Client {
 
         {
             let pkt = protocol::Packet {
+                code: protocol::Return::ErrorNoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Auth(protocol::Auth {
                     folder: self.config.code.clone(),
                     password: self.config.password.clone(),
@@ -385,6 +387,7 @@ impl Client {
                     .as_ref()
                     .map(|ch| {
                         ch.send(protocol::Packet {
+                            code: protocol::Return::ErrorNoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Event(protocol::Event {
                                 event: protocol::FileEvent::CreateUnspecified as i32,
                                 filename: String::from(event_file),
@@ -399,6 +402,7 @@ impl Client {
                     .as_ref()
                     .map(|ch| {
                         ch.send(protocol::Packet {
+                            code: protocol::Return::ErrorNoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Event(protocol::Event {
                                 event: protocol::FileEvent::Delete as i32,
                                 filename: String::from(event_file),
@@ -428,6 +432,7 @@ impl Client {
 
                 send_ch.as_ref().map(|ch| {
                     ch.send(protocol::Packet {
+                        code: protocol::Return::ErrorNoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
                     })
                 });
@@ -487,6 +492,7 @@ impl Client {
 
             let _ = send_ch.as_mut().map(|ch| {
                 if let Err(e) = ch.send(protocol::Packet {
+                    code: protocol::Return::ErrorNoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
                 }) {
                     anyhow::bail!("failed to send message: {}", e.to_string());
@@ -494,6 +500,72 @@ impl Client {
 
                 Ok(())
             });
+        }
+
+        Ok(())
+    }
+
+    async fn handle_transfer(&mut self, transfer: protocol::Transfer) -> anyhow::Result<()> {
+        // we are receiving data from the server
+        let db = self.db_pool.get()?;
+        let send_ch = self.send_ch.lock().await;
+        if let Some(data) = transfer.data {
+        } else {
+            // we are sent a request for data from the server
+            let metadata = transfer
+                .metadata
+                .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
+
+            // hash field from server is hash of filename
+            let (offset, namehash) = (metadata.offset as i64, metadata.hash as i64);
+
+            tracing::debug!(
+                "transferring data from filehash {} offset {} to server",
+                namehash,
+                offset
+            );
+
+            let mut stmt =
+                db.prepare("SELECT hash FROM blocks WHERE offset = ?1 AND file = ?2 LIMIT 1")?;
+
+            let stored_hash = stmt.query_row([offset, namehash], |row| row.get::<_, i64>(0))?;
+
+            let mut name_stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1 LIMIT 1")?;
+            let filename = name_stmt.query_row([namehash], |row| row.get::<_, String>(0))?;
+
+            let base_folder = self
+                .config
+                .folder
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."));
+            let path = base_folder.join(filename);
+
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(offset as u64))?;
+
+            let mut chunk = vec![0u8; BLOCK_SIZE];
+            let read_sz = file.read(&mut chunk)?;
+            chunk.truncate(read_sz);
+
+            let transfer = protocol::Transfer {
+                metadata: Some(protocol::BlockMetadata {
+                    offset: offset as u64,
+                    hash: stored_hash as u64,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                        .as_secs(),
+                }),
+                mode: protocol::DataMode::WholeUnspecified as i32,
+                data: Some(chunk),
+            };
+
+            send_ch
+                .as_ref()
+                .ok_or(anyhow::anyhow!("missing outbound channel"))?
+                .send(protocol::Packet {
+                    code: protocol::Return::ErrorNoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Transfer(transfer)),
+                })?;
         }
 
         Ok(())
@@ -517,6 +589,17 @@ impl Client {
                 // get started on syncing
                 self.send_manifest().await?;
             }
+
+            protocol::packet::Message::Event(event) => {
+                tracing::debug!("event: {:?}", event);
+            }
+
+            protocol::packet::Message::Manifest(manifest) => {
+                tracing::debug!("manifest: {:?}", manifest);
+            }
+
+            protocol::packet::Message::Transfer(transfer) => self.handle_transfer(transfer).await?,
+
             _ => {}
         }
 
