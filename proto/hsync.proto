@@ -22,28 +22,37 @@ message Die {
 }
 
 message BlockMetadata {
-  uint64 offset = 1;
-  uint64 hash = 2;
-  uint64 timestamp = 3;
-}
-
-message Block {
-  BlockMetadata metadata = 1;
-  bytes data = 2;
+  uint64 start = 1;
+  uint64 end = 2;
+  optional uint64 namehash = 3;
+  uint64 hash = 4;
 }
 
 // describes a file.
-// a manifest can describe parts of a file, the server will simply process whatever is sent to it
-// blocks that are newer than registered will be requested by the server
-// blocks that are older than registered will make the server send data
-//
-// server checks if filename exists for folder in database. if none, creates file in folder on database.
-// client checks if filename exists on local filesystem and database. if none, creates file in folder and db
-//
-// in server->client, metadata "hash" field is hash of filename
 message FileManifest {
   string filename = 1;
-  repeated BlockMetadata blocks = 2;
+  uint64 timestamp = 2;
+  repeated BlockMetadata blocks = 3;
+}
+
+message Delta {
+  enum OpType {
+    OP_TYPE_EQUAL_UNSPECIFIED = 0;
+    OP_TYPE_MODIFY = 1;
+    OP_TYPE_INSERT = 2;
+    OP_TYPE_DELETE = 3;
+  }
+
+  message Operation {
+    OpType op_type = 1;
+    uint64 hash = 2;
+    uint64 start = 3;
+    uint64 end = 4;
+  }
+
+  uint64 size = 1;
+  uint64 namehash = 2;
+  repeated Operation ops = 3;
 }
 
 enum DataMode {
@@ -84,5 +93,6 @@ message Packet {
     FileManifest manifest = 5;
     Transfer transfer = 6;
     Event event = 7;
+    Delta delta = 8;
   }
 }

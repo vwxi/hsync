@@ -9,7 +9,6 @@
 ///
 mod server;
 
-use anyhow::Context;
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::{Instrument, info_span};

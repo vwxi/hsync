@@ -41,7 +41,7 @@ const BUF_SIZE: usize = 16384;
 const BLOCK_SIZE: usize = 2048;
 const CREATE_FILENAMES_STMT: &str =
     "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER)";
-const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, offset INTEGER, hash INTEGER, timestamp INTEGER, UNIQUE(file, offset))";
+const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, UNIQUE(file, start, end, hash))";
 
 /// to be used with --insecure flag
 #[derive(Debug)]
@@ -141,12 +141,11 @@ impl Client {
         };
 
         let db_pool = Pool::new(manager)?;
-        let mut diff_buffer = [0u8; BLOCK_SIZE];
         {
             let conn = db_pool.get()?;
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
-            Self::process_files_into_db(&folder, &mut diff_buffer, &conn)?;
+            Self::process_files_into_db(&folder, &conn)?;
         }
 
         tracing::info!(
@@ -230,7 +229,6 @@ impl Client {
     /// processes files into entry database
     fn process_files_into_db(
         folder: &PathBuf,
-        buf: &mut [u8],
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<()> {
         let folder_glob = format!(
@@ -243,7 +241,6 @@ impl Client {
                 Ok(path) => {
                     Self::check_diff(
                         &path,
-                        buf,
                         std::time::SystemTime::now()
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                             .as_secs() as i64,
@@ -284,19 +281,17 @@ impl Client {
     // check differences in a single file and report back a diff object
     fn check_diff(
         path: &PathBuf,
-        buf: &mut [u8],
         new_timestamp: i64,
         db: &PooledConnection<SqliteConnectionManager>,
-    ) -> anyhow::Result<Vec<(usize, u64, u64)>> {
-        let mut file = std::fs::File::open(&path)?;
+    ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
+        let file = std::fs::File::open(&path)?;
         // TODO: adapt this for subfolders when it gets implemented
         let pathname = path
             .file_name()
             .and_then(|f| f.to_str())
             .ok_or(anyhow::anyhow!("malformed filename"))?;
         let hashed_filename = xxhash_rust::xxh3::xxh3_64(pathname.as_bytes()) as i64;
-        let mut offset = 0isize;
-        let mut changes: Vec<(usize, u64, u64)> = vec![];
+        let mut changes: Vec<(u64, u64, u64)> = vec![];
 
         db.execute(
             "INSERT INTO filenames (name, hash) VALUES (?1, ?2)",
@@ -307,49 +302,32 @@ impl Client {
         //       if we have files with different filenames but identical content,
         //       there will be redundant storage. in the future, consider loading
         //       whole file, hashing contents then hashing blocks.
-        loop {
-            let sz = file.read(buf)?;
+        let chunker = fastcdc::v2020::StreamCDC::new(file, 4096, 16384, 65535);
 
-            tracing::debug!("[file {}] read {} bytes", pathname, sz);
-
-            let current_hash = xxhash_rust::xxh3::xxh3_64(buf) as i64;
+        for chunk in chunker {
+            let chunk = chunk?;
 
             let mut stmt = db.prepare(
-                "
-                    INSERT INTO blocks (file, offset, hash, timestamp)
-                    VALUES (?1, ?2, ?3, ?4)
-                    ON CONFLICT(file, offset) DO UPDATE SET
-                        hash = excluded.hash,
-                        timestamp = excluded.timestamp
-                    WHERE excluded.timestamp > blocks.timestamp
-                      AND excluded.hash != blocks.hash
-                    RETURNING hash, timestamp
-                    ",
+                "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 LIMIT 1"
             )?;
 
-            let _ = stmt.query_one(
-                [hashed_filename, offset as i64, current_hash, new_timestamp],
-                |row| {
-                    let (hash, timestamp) = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
+            let existing = stmt.query_row(
+                (
+                    hashed_filename,
+                    chunk.offset as i64,
+                    (chunk.offset as usize + chunk.length) as i64,
+                    chunk.hash as i64,
+                ),
+                |row| row.get::<_, i64>(0),
+            );
 
-                    tracing::debug!(
-                        "[file {}] updated block {} (now {}, {})",
-                        pathname,
-                        offset,
-                        hash,
-                        timestamp
-                    );
+            if existing.is_err() {
+                db.execute(
+                    "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                    (hashed_filename, chunk.offset as i64, (chunk.offset + chunk.length as u64) as i64, chunk.hash as i64),
+                )?;
 
-                    changes.push((offset as usize, hash as u64, timestamp as u64));
-
-                    Ok(())
-                },
-            )?;
-
-            offset += sz as isize;
-
-            if sz < BLOCK_SIZE || sz == 0 {
-                break;
+                changes.push((chunk.offset, chunk.offset + chunk.length as u64, chunk.hash));
             }
         }
 
@@ -422,11 +400,12 @@ impl Client {
 
                 manifest.filename = String::from(event_file);
 
-                for change in Self::check_diff(&filename, buf, new_timestamp, db)? {
+                for change in Self::check_diff(&filename, new_timestamp, db)? {
                     manifest.blocks.push(protocol::BlockMetadata {
-                        offset: change.0 as u64,
+                        start: change.0,
+                        end: change.1,
                         hash: change.1,
-                        timestamp: change.2,
+                        namehash: None,
                     });
                 }
 
@@ -473,21 +452,22 @@ impl Client {
             tracing::debug!("name_stmt: {:?}", name_stmt);
 
             let mut query_blocks =
-                conn.prepare("SELECT offset, hash, timestamp FROM blocks WHERE file = ?1")?;
+                conn.prepare("SELECT start, end, hash FROM blocks WHERE file = ?1")?;
             let mut blocks = query_blocks.query([&file_hash])?;
 
             while let Ok(Some(block)) = blocks.next() {
-                let (offset, hash, timestamp) = (
+                let (start, end, hash) = (
                     block.get::<_, i64>(0)? as u64,
                     block.get::<_, i64>(1)? as u64,
                     block.get::<_, i64>(2)? as u64,
                 );
 
-                manifest.blocks.push(dbg!(protocol::BlockMetadata {
-                    offset,
+                manifest.blocks.push(protocol::BlockMetadata {
+                    start,
+                    end,
+                    namehash: None,
                     hash,
-                    timestamp,
-                }));
+                });
             }
 
             let _ = send_ch.as_mut().map(|ch| {
@@ -506,74 +486,67 @@ impl Client {
     }
 
     async fn handle_transfer(&mut self, transfer: protocol::Transfer) -> anyhow::Result<()> {
-        // we are receiving data from the server
         let db = self.db_pool.get()?;
         let send_ch = self.send_ch.lock().await;
+        let metadata = transfer
+            .metadata
+            .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
+
+        // we are receiving data from the server
         if let Some(data) = transfer.data {
         } else {
+            let namehash = metadata
+                .namehash
+                .ok_or(anyhow::anyhow!("malformed transfer request"))?;
+
             // we are sent a request for data from the server
-            let metadata = transfer
-                .metadata
-                .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
-
-            // hash field from server is hash of filename
-            let (offset, namehash) = (metadata.offset as i64, metadata.hash as i64);
-
             tracing::debug!(
-                "transferring data from filehash {} offset {} to server",
+                "satisfying request for namehash {} range [{}, {}]",
                 namehash,
-                offset
+                metadata.start,
+                metadata.end
             );
 
-            let mut stmt =
-                db.prepare("SELECT hash FROM blocks WHERE offset = ?1 AND file = ?2 LIMIT 1")?;
+            let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
+            let filename: String = stmt.query_row([namehash as i64], |row| row.get(0))?;
 
-            let stored_hash = stmt.query_row([offset, namehash], |row| row.get::<_, i64>(0))?;
-
-            let mut name_stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1 LIMIT 1")?;
-            let filename = name_stmt.query_row([namehash], |row| row.get::<_, String>(0))?;
-
-            let base_folder = self
+            let folder = self
                 .config
                 .folder
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("."));
-            let path = base_folder.join(filename);
+            let filepath = folder.join(&filename);
 
-            let mut file = std::fs::File::open(&path)?;
-            file.seek(SeekFrom::Start(offset as u64))?;
+            let mut file = std::fs::File::open(&filepath)?;
+            file.seek(SeekFrom::Start(metadata.start))?;
 
-            let mut chunk = vec![0u8; BLOCK_SIZE];
-            let read_sz = file.read(&mut chunk)?;
-            chunk.truncate(read_sz);
-
-            let transfer = protocol::Transfer {
-                metadata: Some(protocol::BlockMetadata {
-                    offset: offset as u64,
-                    hash: stored_hash as u64,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                        .as_secs(),
-                }),
-                mode: protocol::DataMode::WholeUnspecified as i32,
-                data: Some(chunk),
-            };
+            let length = (metadata.end - metadata.start) as usize;
+            let mut data = vec![0u8; length];
+            file.read_exact(&mut data)?;
 
             send_ch
                 .as_ref()
-                .ok_or(anyhow::anyhow!("missing outbound channel"))?
-                .send(protocol::Packet {
-                    code: protocol::Return::ErrorNoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Transfer(transfer)),
-                })?;
+                .map(|ch| {
+                    ch.send(protocol::Packet {
+                        code: protocol::Return::ErrorNoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                            metadata: Some(metadata),
+                            mode: protocol::DataMode::WholeUnspecified as i32,
+                            data: Some(data),
+                        })),
+                    })
+                })
+                .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
         }
 
         Ok(())
     }
 
-    async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
-        tracing::debug!("recved pkt: {:?}", packet);
+    async fn handle_delta(&mut self, delta: protocol::Delta) -> anyhow::Result<()> {
+        Ok(())
+    }
 
+    async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
         let message = packet
             .message
             .ok_or(anyhow::anyhow!("empty packet from server"))?;
@@ -600,6 +573,8 @@ impl Client {
 
             protocol::packet::Message::Transfer(transfer) => self.handle_transfer(transfer).await?,
 
+            protocol::packet::Message::Delta(delta) => self.handle_delta(delta).await?,
+
             _ => {}
         }
 
@@ -623,7 +598,6 @@ impl Client {
             select! {
                 // outgoing messages to server
                 Some(m) = recv_ch.recv() => {
-                    tracing::debug!("to send: {:?}", m);
                     Self::write_packet(&mut send, &m).await?;
                 },
 
