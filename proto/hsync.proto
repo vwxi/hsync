@@ -13,8 +13,13 @@ message Auth {
 
 // returned after auth works
 message RoomInfo {
+  message File {
+    string name = 1;
+  }
+
   uint64 id = 1;
   string code = 2;
+  repeated File files = 3;
 }
 
 message Die {
@@ -33,6 +38,11 @@ message FileManifest {
   string filename = 1;
   uint64 timestamp = 2;
   repeated BlockMetadata blocks = 3;
+}
+
+// get the manifest for a file
+message WhatIs {
+  string filename = 1;
 }
 
 message Delta {
@@ -79,8 +89,8 @@ message Event {
 }
 
 enum Return {
-  ERROR_NONE_UNSPECIFIED = 0;
-  ERROR_BLOCK_MISMATCH = 1;
+  RETURN_NONE_UNSPECIFIED = 0;
+  RETURN_BLOCK_MISMATCH = 1;
 }
 
 message Packet {
@@ -94,5 +104,6 @@ message Packet {
     Transfer transfer = 6;
     Event event = 7;
     Delta delta = 8;
+    WhatIs whatis = 9;
   }
 }

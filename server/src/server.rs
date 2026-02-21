@@ -14,6 +14,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::prelude::*;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rusqlite::MAIN_DB;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -315,7 +316,7 @@ impl Server {
 
                 stream
                     .send(protocol::Packet {
-                        code: protocol::Return::ErrorNoneUnspecified as i32,
+                        code: protocol::Return::NoneUnspecified as i32,
                         message: Some(if digest == folder_pass_hash {
                             if db
                                 .execute(
@@ -346,7 +347,7 @@ impl Server {
         } else {
             // user wants to create a folder and is new
             stream.send(protocol::Packet {
-                code: protocol::Return::ErrorNoneUnspecified as i32,
+                code: protocol::Return::NoneUnspecified as i32,
                 message: Some(
                     if let Ok((folder_code, folder_id)) = {
                         // generate folder and return folder code
@@ -387,9 +388,21 @@ impl Server {
 
                         Ok::<(String, i64), anyhow::Error>((folder_code, folder_id))
                     } {
+                        let mut stmt =
+                            db.prepare("SELECT name FROM filenames WHERE folder = ?1")?;
+                        let files: Vec<protocol::room_info::File> = stmt
+                            .query_map([folder_id], |row| {
+                                let name = row.get::<_, String>(0)?;
+
+                                Ok(protocol::room_info::File { name })
+                            })?
+                            .filter_map(|r| r.ok())
+                            .collect();
+
                         protocol::packet::Message::RoomInfo(protocol::RoomInfo {
                             id: folder_id as u64,
                             code: folder_code,
+                            files,
                         })
                     } else {
                         protocol::packet::Message::Die(protocol::Die {
@@ -443,7 +456,7 @@ impl Server {
         // reject empty manifests
         if manifest.blocks.is_empty() {
             stream.send(protocol::Packet {
-                code: protocol::Return::ErrorNoneUnspecified as i32,
+                code: protocol::Return::NoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Die(protocol::Die {
                     reason: Some(String::from("failed to authenticate")),
                 })),
@@ -498,7 +511,7 @@ impl Server {
                 block.namehash = Some(namehash as u64);
 
                 stream.send(protocol::Packet {
-                    code: protocol::Return::ErrorNoneUnspecified as i32,
+                    code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
                         metadata: Some(block),
                         mode: protocol::DataMode::WholeUnspecified as i32,
@@ -584,17 +597,17 @@ impl Server {
         event: protocol::Event,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
-        let folder_id: i64 = dbg!(db.query_row(
+        let folder_id: i64 = db.query_row(
             "SELECT current_folder FROM users WHERE addr = ?1",
             [addr.to_string()],
             |row| row.get(0),
-        ))?;
+        )?;
 
-        let file_namehash: i64 = dbg!(db.query_row(
-            "SELECT hash FROM filenames WHERE folder = ?1 AND name = ?2",
-            (folder_id, &event.filename),
+        let file_namehash: i64 = db.query_row(
+            "SELECT namehash FROM filenames WHERE folder = ?1 AND name = ?2",
+            (folder_id, dbg!(&event.filename)),
             |row| row.get::<_, i64>(0),
-        ))?;
+        )?;
 
         match event.event() {
             protocol::FileEvent::CreateUnspecified => {
@@ -626,8 +639,6 @@ impl Server {
             .collect::<Result<Vec<_>, _>>()?
         };
 
-        tracing::debug!("blocks: {:?}", blocks);
-
         let temp_blocks: Vec<(i64, i64, i64)> = {
             let mut stmt = db.prepare(
                 "SELECT hash, start, end FROM temp_blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
@@ -638,8 +649,6 @@ impl Server {
             })?
             .collect::<Result<Vec<_>, _>>()?
         };
-
-        tracing::debug!("temp_blocks: {:?}", temp_blocks);
 
         let largest_end_offset = temp_blocks
             .iter()
@@ -666,8 +675,6 @@ impl Server {
                 })
                 .collect(),
         };
-
-        tracing::debug!("diff: {:?}", diff);
 
         // remove used temp blocks
         db.execute(
@@ -709,21 +716,33 @@ impl Server {
                     metadata.end
                 );
 
-                if let Some(data) = transfer.data {
-                    db.execute(
-                        "INSERT INTO temp_blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        (folder_id, namehash as i64, metadata.hash as i64, metadata.start as i64, metadata.end as i64, &data),
-                    )?;
+                let data = transfer
+                    .data
+                    .ok_or(anyhow::anyhow!("transfer response has no data"))?;
 
-                    tracing::debug!(
-                        "inserted temp block (namehash: {}, hash: {}, start: {}, end: {}) into folder {}",
-                        namehash,
-                        metadata.hash,
-                        metadata.start,
-                        metadata.end,
-                        folder_id
-                    );
+                db.execute(
+                    "INSERT INTO temp_blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (folder_id, namehash as i64, metadata.hash as i64, metadata.start as i64, metadata.end as i64, rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
+                )?;
+
+                let rowid = db.last_insert_rowid();
+                let mut blob =
+                    db.blob_open(rusqlite::MAIN_DB, "temp_blocks", "contents", rowid, false)?;
+
+                if blob.write(&data)? != data.len() {
+                    anyhow::bail!("did not write full temp block to database");
                 }
+
+                blob.close()?;
+
+                tracing::debug!(
+                    "inserted temp block (namehash: {}, hash: {}, start: {}, end: {}) into folder {}",
+                    namehash,
+                    metadata.hash,
+                    metadata.start,
+                    metadata.end,
+                    folder_id
+                );
             }
 
             requests.remove(&(metadata.start, metadata.end));
@@ -739,14 +758,18 @@ impl Server {
                 );
                 let streams = self.streams.lock().await;
 
+                // broadcast to other clients
                 let _ = streams
                     .iter()
                     .map(|(stream_addr, stream)| {
-                        if *stream_addr == addr {
-                            anyhow::bail!("");
-                        }
+                        // if *stream_addr == addr {
+                        //     return Ok(());
+                        // }
 
-                        tracing::debug!("send to {}", *stream_addr);
+                        stream.send(protocol::Packet {
+                            code: protocol::Return::NoneUnspecified as i32,
+                            message: Some(protocol::packet::Message::Delta(delta.clone())),
+                        })?;
 
                         Ok(())
                     })

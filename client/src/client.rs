@@ -115,7 +115,7 @@ impl Drop for Client {
 
             send_ch.as_ref().map(|ch| {
                 ch.send(protocol::Packet {
-                    code: protocol::Return::ErrorNoneUnspecified as i32,
+                    code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Die(protocol::Die {
                         reason: Some(String::from("disconnecting")),
                     })),
@@ -145,7 +145,10 @@ impl Client {
             let conn = db_pool.get()?;
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
-            Self::process_files_into_db(&folder, &conn)?;
+
+            if config.folder.is_some() {
+                Self::process_files_into_db(&folder, &conn)?;
+            }
         }
 
         tracing::info!(
@@ -213,7 +216,7 @@ impl Client {
 
         {
             let pkt = protocol::Packet {
-                code: protocol::Return::ErrorNoneUnspecified as i32,
+                code: protocol::Return::NoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Auth(protocol::Auth {
                     folder: self.config.code.clone(),
                     password: self.config.password.clone(),
@@ -365,7 +368,7 @@ impl Client {
                     .as_ref()
                     .map(|ch| {
                         ch.send(protocol::Packet {
-                            code: protocol::Return::ErrorNoneUnspecified as i32,
+                            code: protocol::Return::NoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Event(protocol::Event {
                                 event: protocol::FileEvent::CreateUnspecified as i32,
                                 filename: String::from(event_file),
@@ -380,7 +383,7 @@ impl Client {
                     .as_ref()
                     .map(|ch| {
                         ch.send(protocol::Packet {
-                            code: protocol::Return::ErrorNoneUnspecified as i32,
+                            code: protocol::Return::NoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Event(protocol::Event {
                                 event: protocol::FileEvent::Delete as i32,
                                 filename: String::from(event_file),
@@ -411,7 +414,7 @@ impl Client {
 
                 send_ch.as_ref().map(|ch| {
                     ch.send(protocol::Packet {
-                        code: protocol::Return::ErrorNoneUnspecified as i32,
+                        code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
                     })
                 });
@@ -426,6 +429,37 @@ impl Client {
         Ok(())
     }
 
+    async fn handle_roominfo(&mut self, room_info: protocol::RoomInfo) -> anyhow::Result<()> {
+        tracing::info!("connect to this room using this code: {}", room_info.code);
+
+        let db = self.db_pool.get()?;
+        let mut send_ch = self.send_ch.lock().await;
+
+        for file in room_info.files {
+            let mut stmt = db.prepare("SELECT COUNT(*) FROM filenames WHERE name = ?1")?;
+
+            // if file does not exist, request manifest
+            if stmt.query_one([file.name], |_| Ok(())).is_err() {
+                send_ch
+                    .as_ref()
+                    .map(|ch| {
+                        ch.send(protocol::Packet {
+                            code: protocol::Return::NoneUnspecified as i32,
+                            message: Some(protocol::packet::Message::WhatIs(protocol::WhatIs {
+                                filename: file.name,
+                            })),
+                        })
+                    })
+                    .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
+            }
+        }
+
+        // get started on syncing
+        self.send_manifest().await?;
+
+        Ok(())
+    }
+
     /// to be used in tandem with process_files_with_db?
     async fn send_manifest(&mut self) -> anyhow::Result<()> {
         let conn = self.db_pool.get()?;
@@ -436,9 +470,7 @@ impl Client {
         let mut files = query_files.query(())?;
 
         while let Ok(Some(row)) = files.next() {
-            let file_hash = dbg!(row.get::<_, i64>(0))?;
-
-            tracing::debug!("file_hash: {file_hash}");
+            let file_hash = row.get::<_, i64>(0)?;
 
             let mut manifest = protocol::FileManifest::default();
 
@@ -448,8 +480,6 @@ impl Client {
 
                 Ok(())
             })?;
-
-            tracing::debug!("name_stmt: {:?}", name_stmt);
 
             let mut query_blocks =
                 conn.prepare("SELECT start, end, hash FROM blocks WHERE file = ?1")?;
@@ -472,7 +502,7 @@ impl Client {
 
             let _ = send_ch.as_mut().map(|ch| {
                 if let Err(e) = ch.send(protocol::Packet {
-                    code: protocol::Return::ErrorNoneUnspecified as i32,
+                    code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
                 }) {
                     anyhow::bail!("failed to send message: {}", e.to_string());
@@ -528,7 +558,7 @@ impl Client {
                 .as_ref()
                 .map(|ch| {
                     ch.send(protocol::Packet {
-                        code: protocol::Return::ErrorNoneUnspecified as i32,
+                        code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
                             metadata: Some(metadata),
                             mode: protocol::DataMode::WholeUnspecified as i32,
@@ -543,6 +573,88 @@ impl Client {
     }
 
     async fn handle_delta(&mut self, delta: protocol::Delta) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+
+        for op in delta.ops {
+            // Check if block hash matches existing hash in database
+            let mut stmt = db.prepare(
+                "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
+            )?;
+
+            let existing_hash: Result<i64, _> = stmt.query_row(
+                (delta.namehash as i64, op.start as i64, op.end as i64),
+                |row| row.get(0),
+            );
+
+            match op.op_type() {
+                protocol::delta::OpType::Insert => {
+                    if let Ok(hash) = existing_hash {
+                        if hash as u64 == op.hash {
+                            tracing::debug!(
+                                "block [{}, {}] hash matches, skipping",
+                                op.start,
+                                op.end
+                            );
+                            continue;
+                        }
+                    } else {
+                        // doesn't exist
+                        db.execute(
+                            "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                            (
+                                delta.namehash as i64,
+                                op.start as i64,
+                                op.end as i64,
+                                op.hash as i64,
+                            ),
+                        )?;
+
+                        tracing::debug!(
+                            "INSERT: block {} ({}, {}) does not exist, requesting from server",
+                            op.hash,
+                            op.start,
+                            op.end
+                        );
+
+                        // request transfer
+                        self.send_ch
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|ch| {
+                                ch.send(protocol::Packet {
+                                    code: protocol::Return::NoneUnspecified as i32,
+                                    message: Some(protocol::packet::Message::Transfer(
+                                        protocol::Transfer {
+                                            metadata: Some(protocol::BlockMetadata {
+                                                start: op.start,
+                                                end: op.end,
+                                                namehash: Some(delta.namehash),
+                                                hash: op.hash,
+                                            }),
+                                            mode: protocol::DataMode::WholeUnspecified as i32,
+                                            data: None,
+                                        },
+                                    )),
+                                })
+                            })
+                            .ok_or(anyhow::anyhow!("could not request data transfer"))??;
+                    }
+                }
+
+                _ => {}
+            }
+
+            // exists
+            if let Ok(hash) = existing_hash {
+                if hash as u64 == op.hash {
+                    tracing::debug!("block [{}, {}] hash matches, skipping", op.start, op.end);
+                    continue;
+                }
+            } else {
+            }
+        }
+
         Ok(())
     }
 
@@ -553,14 +665,7 @@ impl Client {
 
         match message {
             protocol::packet::Message::RoomInfo(room_info) => {
-                tracing::info!("folder has been added to server.");
-                tracing::info!(
-                    "to sync as a client, connect using this code: {}",
-                    room_info.code
-                );
-
-                // get started on syncing
-                self.send_manifest().await?;
+                self.handle_roominfo(room_info).await?;
             }
 
             protocol::packet::Message::Event(event) => {
