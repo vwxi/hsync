@@ -43,7 +43,7 @@ const CREATE_TBLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS temp_blocks (folde
 pub type UserId = u64;
 
 pub struct Server {
-    max_conns: Option<usize>,
+    config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     streams: Mutex<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
@@ -56,7 +56,8 @@ impl Server {
         // INIT QUIC ENDPOINT
 
         // if no path is provided, generate a selfsigned key-cert pair to use
-        let (key, cert_chain) = if let (Some(keypath), Some(certpath)) = (config.key, config.cert) {
+        let (key, cert_chain) = if let (Some(keypath), Some(certpath)) = (&config.key, &config.cert)
+        {
             tracing::info!(
                 "using keyfile {} and certfile {}",
                 keypath.to_string_lossy(),
@@ -121,7 +122,7 @@ impl Server {
         tracing::info!("initialized QUIC endpoint at {}", config.bind);
 
         // INIT SQLITE
-        let manager = if let Some(db) = config.db {
+        let manager = if let Some(db) = &config.db {
             SqliteConnectionManager::file(db)
         } else {
             SqliteConnectionManager::file("file:hsyncdb?mode=memory&cache=shared")
@@ -140,7 +141,7 @@ impl Server {
         tracing::info!("initialized db");
 
         Ok(Server {
-            max_conns: config.max_conns,
+            config,
             endpoint,
             db_pool: pool,
             streams: Mutex::new(HashMap::new()),
@@ -153,6 +154,7 @@ impl Server {
         async move {
             while let Some(conn) = self.endpoint.accept().await {
                 if !self
+                    .config
                     .max_conns
                     .map_or_else(|| true, |max| self.endpoint.open_connections() <= max)
                 {
@@ -254,7 +256,7 @@ impl Server {
             .ok_or(anyhow::anyhow!("why is this happening?"))?;
 
         match message {
-            protocol::packet::Message::Auth(auth) => dbg!(self.handle_auth(addr, auth).await)?,
+            protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth).await?,
 
             protocol::packet::Message::Die(die) => self.handle_die(addr, die).await?,
 
@@ -291,6 +293,21 @@ impl Server {
         segments.join("-")
     }
 
+    fn enum_files_from_folder(
+        db: &PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+    ) -> anyhow::Result<Vec<protocol::room_info::File>> {
+        let mut stmt = db.prepare("SELECT name FROM filenames WHERE folder = ?1")?;
+        Ok(stmt
+            .query_map([folder_id], |r| {
+                let name = r.get::<_, String>(0)?;
+
+                Ok(protocol::room_info::File { name })
+            })?
+            .filter_map(|r| r.ok())
+            .collect::<Vec<protocol::room_info::File>>())
+    }
+
     async fn handle_auth(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -325,10 +342,17 @@ impl Server {
                                 )
                                 .is_ok()
                             {
-                                protocol::packet::Message::RoomInfo(protocol::RoomInfo {
-                                    id: folder_id as u64,
-                                    code: folder_code.clone(),
-                                })
+                                if let Ok(files) = Self::enum_files_from_folder(&db, folder_id) {
+                                    protocol::packet::Message::RoomInfo(protocol::RoomInfo {
+                                        id: folder_id as u64,
+                                        code: folder_code.clone(),
+                                        files,
+                                    })
+                                } else {
+                                    protocol::packet::Message::Die(protocol::Die {
+                                        reason: Some(String::from("failed to enumerate directory")),
+                                    })
+                                }
                             } else {
                                 protocol::packet::Message::Die(protocol::Die {
                                     reason: Some(String::from("could not add user to db")),
@@ -491,6 +515,7 @@ impl Server {
             self.create_file_entry(&db, folder_id, &manifest.filename, namehash)?;
         }
 
+        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
         for mut block in manifest.blocks {
             let existing_block: Option<(i64, i64, i64)> = db
                 .query_row(
@@ -519,24 +544,14 @@ impl Server {
                     })),
                 })?;
 
-                {
-                    let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-                    outgoing_lock
-                        .entry(namehash as u64)
-                        .or_insert_with(|| {
-                            let mut set = HashSet::new();
-                            set.insert((block.start, block.end));
-                            set
-                        })
-                        .insert((block.start, block.end));
-
-                    tracing::debug!(
-                        "added outgoing transfer request for block (hash: {}, start: {}, end: {})",
-                        block.hash,
-                        block.start,
-                        block.end
-                    );
-                }
+                outgoing_lock
+                    .entry(namehash as u64)
+                    .or_insert_with(|| {
+                        let mut set = HashSet::new();
+                        set.insert((block.start, block.end));
+                        set
+                    })
+                    .insert((block.start, block.end));
             }
         }
 
@@ -603,11 +618,17 @@ impl Server {
             |row| row.get(0),
         )?;
 
-        let file_namehash: i64 = db.query_row(
-            "SELECT namehash FROM filenames WHERE folder = ?1 AND name = ?2",
-            (folder_id, dbg!(&event.filename)),
-            |row| row.get::<_, i64>(0),
-        )?;
+        let file_namehash: i64 = db
+            .query_row(
+                "SELECT namehash FROM filenames WHERE folder = ?1 AND name = ?2",
+                (folder_id, &event.filename),
+                |row| row.get::<_, i64>(0),
+            )
+            .or_else(|_| {
+                Ok::<i64, anyhow::Error>(
+                    xxhash_rust::xxh3::xxh3_64(event.filename.as_bytes()) as i64
+                )
+            })?;
 
         match event.event() {
             protocol::FileEvent::CreateUnspecified => {
@@ -639,6 +660,8 @@ impl Server {
             .collect::<Result<Vec<_>, _>>()?
         };
 
+        tracing::debug!("blocks: {:?}", blocks);
+
         let temp_blocks: Vec<(i64, i64, i64)> = {
             let mut stmt = db.prepare(
                 "SELECT hash, start, end FROM temp_blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
@@ -649,6 +672,8 @@ impl Server {
             })?
             .collect::<Result<Vec<_>, _>>()?
         };
+
+        tracing::debug!("temp_blocks: {:?}", temp_blocks);
 
         let largest_end_offset = temp_blocks
             .iter()
@@ -663,24 +688,44 @@ impl Server {
             ops: similar::capture_diff_slices(similar::Algorithm::Myers, &blocks, &temp_blocks)
                 .iter()
                 .flat_map(|x| x.iter_changes(&blocks, &temp_blocks))
-                .map(|x| protocol::delta::Operation {
-                    op_type: match x.tag() {
-                        similar::ChangeTag::Equal => protocol::delta::OpType::EqualUnspecified,
-                        similar::ChangeTag::Insert => protocol::delta::OpType::Insert,
-                        similar::ChangeTag::Delete => protocol::delta::OpType::Delete,
-                    } as i32,
-                    hash: x.value().0 as u64,
-                    start: x.value().1 as u64,
-                    end: x.value().2 as u64,
+                .map(|x| {
+                    dbg!(x);
+                    let (hash, start, end) =
+                        (blocks.get(x.value().0 as usize).ok_or(anyhow::anyhow!("internal delta fail"))?.0, x.value().1 as i64, x.value().2 as i64);
+
+                    match x.tag() {
+                        similar::ChangeTag::Insert => {
+                            tracing::debug!("delta insert block {}:[{}, {}]", hash, start, end);
+                            db.execute("INSERT INTO blocks SELECT * FROM temp_blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
+                                (hash, start, end))?;
+                        }
+                        similar::ChangeTag::Delete => {
+                            tracing::debug!("delta delete block {}:[{}, {}]", hash, start, end);
+                            db.execute("DELETE FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
+                                (hash, start, end))?;
+                        }
+                        _ => {
+                            tracing::debug!("what the fuck");
+                        }
+                    };
+
+                    db.execute("DELETE FROM temp_blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
+                        (hash, start, end))?;
+
+                    Ok::<protocol::delta::Operation, anyhow::Error>(protocol::delta::Operation {
+                        op_type: match x.tag() {
+                            similar::ChangeTag::Equal => protocol::delta::OpType::EqualUnspecified,
+                            similar::ChangeTag::Insert => protocol::delta::OpType::Insert,
+                            similar::ChangeTag::Delete => protocol::delta::OpType::Delete,
+                        } as i32,
+                        hash: hash as u64,
+                        start: start as u64,
+                        end: end as u64,
+                    })
                 })
+                .filter_map(|f| f.ok())
                 .collect(),
         };
-
-        // remove used temp blocks
-        db.execute(
-            "DELETE FROM temp_blocks WHERE folder = ?1 AND name = ?2",
-            (folder_id, name_hash),
-        )?;
 
         Ok(diff)
     }
@@ -709,13 +754,6 @@ impl Server {
         let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
         if let Some(requests) = outgoing_lock.get_mut(&namehash) {
             if requests.contains(&(metadata.start, metadata.end)) {
-                tracing::debug!(
-                    "found matching outgoing transfer request for block (namehash: {}, start: {}, end: {})",
-                    namehash,
-                    metadata.start,
-                    metadata.end
-                );
-
                 let data = transfer
                     .data
                     .ok_or(anyhow::anyhow!("transfer response has no data"))?;
@@ -734,37 +772,25 @@ impl Server {
                 }
 
                 blob.close()?;
-
-                tracing::debug!(
-                    "inserted temp block (namehash: {}, hash: {}, start: {}, end: {}) into folder {}",
-                    namehash,
-                    metadata.hash,
-                    metadata.start,
-                    metadata.end,
-                    folder_id
-                );
             }
 
             requests.remove(&(metadata.start, metadata.end));
             if requests.is_empty() {
                 outgoing_lock.remove(&namehash);
 
-                let delta = self.process_delta(db, folder_id, namehash as i64).await?;
+                tracing::info!("transfer queue satisfied for file {namehash}. broadcasting delta");
 
-                tracing::debug!(
-                    "removed temp blocks for namehash {} in folder {}",
-                    namehash,
-                    folder_id
-                );
+                let delta = dbg!(self.process_delta(db, folder_id, namehash as i64).await?);
+
                 let streams = self.streams.lock().await;
 
                 // broadcast to other clients
                 let _ = streams
                     .iter()
                     .map(|(stream_addr, stream)| {
-                        // if *stream_addr == addr {
-                        //     return Ok(());
-                        // }
+                        if *stream_addr == addr {
+                            return Ok(());
+                        }
 
                         stream.send(protocol::Packet {
                             code: protocol::Return::NoneUnspecified as i32,

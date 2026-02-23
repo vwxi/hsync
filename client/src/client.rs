@@ -433,24 +433,28 @@ impl Client {
         tracing::info!("connect to this room using this code: {}", room_info.code);
 
         let db = self.db_pool.get()?;
-        let mut send_ch = self.send_ch.lock().await;
+        {
+            let send_ch = self.send_ch.lock().await;
 
-        for file in room_info.files {
-            let mut stmt = db.prepare("SELECT COUNT(*) FROM filenames WHERE name = ?1")?;
+            for file in room_info.files {
+                let mut stmt = db.prepare("SELECT COUNT(*) FROM filenames WHERE name = ?1")?;
 
-            // if file does not exist, request manifest
-            if stmt.query_one([file.name], |_| Ok(())).is_err() {
-                send_ch
-                    .as_ref()
-                    .map(|ch| {
-                        ch.send(protocol::Packet {
-                            code: protocol::Return::NoneUnspecified as i32,
-                            message: Some(protocol::packet::Message::WhatIs(protocol::WhatIs {
-                                filename: file.name,
-                            })),
+                // if file does not exist, request manifest
+                if stmt.query_one([file.name.clone()], |_| Ok(())).is_err() {
+                    send_ch
+                        .as_ref()
+                        .map(|ch| {
+                            ch.send(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: Some(protocol::packet::Message::Whatis(
+                                    protocol::WhatIs {
+                                        filename: file.name.clone(),
+                                    },
+                                )),
+                            })
                         })
-                    })
-                    .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
+                        .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
+                }
             }
         }
 
@@ -500,6 +504,8 @@ impl Client {
                 });
             }
 
+            tracing::debug!("sending manifest for file {}", manifest.filename);
+
             let _ = send_ch.as_mut().map(|ch| {
                 if let Err(e) = ch.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
@@ -528,14 +534,6 @@ impl Client {
             let namehash = metadata
                 .namehash
                 .ok_or(anyhow::anyhow!("malformed transfer request"))?;
-
-            // we are sent a request for data from the server
-            tracing::debug!(
-                "satisfying request for namehash {} range [{}, {}]",
-                namehash,
-                metadata.start,
-                metadata.end
-            );
 
             let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
             let filename: String = stmt.query_row([namehash as i64], |row| row.get(0))?;
