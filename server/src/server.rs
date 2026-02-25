@@ -38,7 +38,6 @@ const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGE
 const CREATE_FILENAMES_STMT: &str =
     "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT, namehash INTEGER)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
-const CREATE_TBLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS temp_blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 
 pub type UserId = u64;
 
@@ -47,8 +46,8 @@ pub struct Server {
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     streams: Mutex<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
-    outgoing_transfer_requests: Mutex<HashMap<u64, HashSet<(u64, u64)>>>,
-    pending_manifests: Mutex<HashMap<u64, Vec<protocol::BlockMetadata>>>,
+    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64)>>>,
+    pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
 
 impl Server {
@@ -135,7 +134,6 @@ impl Server {
             conn.execute(CREATE_FOLDERS_STMT, ())?;
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
-            conn.execute(CREATE_TBLOCKS_STMT, ())?;
         }
 
         tracing::info!("initialized db");
@@ -146,7 +144,7 @@ impl Server {
             db_pool: pool,
             streams: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
-            pending_manifests: Mutex::new(HashMap::new()),
+            pending_deltas: Mutex::new(HashMap::new()),
         })
     }
 
@@ -269,6 +267,8 @@ impl Server {
             protocol::packet::Message::Transfer(transfer) => {
                 self.handle_transfer(addr, transfer).await?
             }
+
+            protocol::packet::Message::Whatis(whatis) => self.handle_whatis(addr, whatis).await?,
 
             _ => {}
         }
@@ -515,45 +515,89 @@ impl Server {
             self.create_file_entry(&db, folder_id, &manifest.filename, namehash)?;
         }
 
-        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-        for mut block in manifest.blocks {
-            let existing_block: Option<(i64, i64, i64)> = db
-                .query_row(
-                    "SELECT folder, name, hash FROM blocks WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5",
-                    (folder_id, namehash, block.hash as i64, block.start as i64, block.end as i64),
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .ok();
+        {
+            let mut set: HashSet<(u64, u64)> = HashSet::new();
+            manifest
+                .blocks
+                .iter()
+                .map(|block| {
+                    let mut stmt = db.prepare(
+                        "SELECT * FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
+                    )?;
 
-            if existing_block.is_none() {
-                tracing::debug!(
-                    "block with hash {} for file {} not found in folder {}",
-                    block.hash,
-                    namehash,
-                    folder_id
-                );
+                    tracing::debug!(
+                        "checking for block {}:[{}, {}]",
+                        block.hash,
+                        block.start,
+                        block.end
+                    );
 
-                block.namehash = Some(namehash as u64);
-
-                stream.send(protocol::Packet {
-                    code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
-                        metadata: Some(block),
-                        mode: protocol::DataMode::WholeUnspecified as i32,
-                        data: None,
-                    })),
-                })?;
-
-                outgoing_lock
-                    .entry(namehash as u64)
-                    .or_insert_with(|| {
-                        let mut set = HashSet::new();
+                    if stmt
+                        .query_one(
+                            (block.hash as i64, block.start as i64, block.end as i64),
+                            |_| Ok(()),
+                        )
+                        .is_err()
+                    {
                         set.insert((block.start, block.end));
-                        set
-                    })
-                    .insert((block.start, block.end));
-            }
+
+                        let mut block_with_namehash = block.clone();
+                        block_with_namehash.namehash = Some(namehash as u64);
+
+                        stream.send(protocol::Packet {
+                            code: protocol::Return::NoneUnspecified as i32,
+                            message: Some(protocol::packet::Message::Transfer(
+                                protocol::Transfer {
+                                    metadata: Some(block_with_namehash),
+                                    mode: protocol::DataMode::WholeUnspecified as i32,
+                                    data: None,
+                                },
+                            )),
+                        })?;
+
+                        tracing::debug!(
+                            "requesting block [{}, {}] from client for file {}",
+                            block.start,
+                            block.end,
+                            manifest.filename
+                        );
+                    } else {
+                        tracing::debug!(
+                            "do not need block {}:[{}, {}] in file {}",
+                            block.hash,
+                            block.start,
+                            block.end,
+                            manifest.filename
+                        );
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                })
+                .collect::<anyhow::Result<()>>()?;
+
+            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            outgoing_lock.insert(namehash, set);
         }
+
+        {
+            let new_blocks = manifest
+                .blocks
+                .iter()
+                .map(|m| (m.hash, m.start, m.end))
+                .collect();
+
+            let delta = self
+                .process_delta(db, folder_id, namehash, new_blocks)
+                .await?;
+
+            let mut pending_lock = self.pending_deltas.lock().await;
+            pending_lock.insert(namehash, delta);
+        }
+
+        tracing::debug!(
+            "received manifest for file {}. processed delta and now awaiting data blocks",
+            namehash as u64
+        );
 
         Ok(())
     }
@@ -648,36 +692,29 @@ impl Server {
         db: PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
         name_hash: i64,
+        new_blocks: Vec<(u64, u64, u64)>,
     ) -> anyhow::Result<protocol::Delta> {
-        let blocks: Vec<(i64, i64, i64)> = {
+        let old_blocks: Vec<(u64, u64, u64)> = {
             let mut stmt = db.prepare(
-                "SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
+                "SELECT start, end, hash FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
             )?;
 
             stmt.query_map((folder_id, name_hash), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?
         };
 
-        tracing::debug!("blocks: {:?}", blocks);
+        tracing::debug!("blocks: {:?}", old_blocks);
+        tracing::debug!("new_blocks: {:?}", new_blocks);
 
-        let temp_blocks: Vec<(i64, i64, i64)> = {
-            let mut stmt = db.prepare(
-                "SELECT hash, start, end FROM temp_blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
-            )?;
-
-            stmt.query_map((folder_id, name_hash), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-
-        tracing::debug!("temp_blocks: {:?}", temp_blocks);
-
-        let largest_end_offset = temp_blocks
+        let largest_end_offset = new_blocks
             .iter()
-            .map(|(_, _, end)| *end)
+            .map(|e| e.2)
             .max()
             .ok_or(anyhow::anyhow!("could not get largest size"))?
             as u64;
@@ -685,32 +722,36 @@ impl Server {
         let diff = protocol::Delta {
             size: largest_end_offset,
             namehash: name_hash as u64,
-            ops: similar::capture_diff_slices(similar::Algorithm::Myers, &blocks, &temp_blocks)
+            ops: similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
                 .iter()
-                .flat_map(|x| x.iter_changes(&blocks, &temp_blocks))
+                .flat_map(|x| x.iter_changes(&old_blocks, &new_blocks))
                 .map(|x| {
-                    dbg!(x);
-                    let (hash, start, end) =
-                        (blocks.get(x.value().0 as usize).ok_or(anyhow::anyhow!("internal delta fail"))?.0, x.value().1 as i64, x.value().2 as i64);
+                    let (new_hash, start, end) =
+                        (x.value().0 as i64, x.value().1 as i64, x.value().2 as i64);
 
                     match x.tag() {
                         similar::ChangeTag::Insert => {
-                            tracing::debug!("delta insert block {}:[{}, {}]", hash, start, end);
-                            db.execute("INSERT INTO blocks SELECT * FROM temp_blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
-                                (hash, start, end))?;
+                            tracing::debug!("delta insert block {}:[{}, {}]", new_hash, start, end);
                         }
                         similar::ChangeTag::Delete => {
-                            tracing::debug!("delta delete block {}:[{}, {}]", hash, start, end);
-                            db.execute("DELETE FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
-                                (hash, start, end))?;
+                            let old_hash = old_blocks
+                                .get(
+                                    x.old_index()
+                                        .ok_or(anyhow::anyhow!("internal delta error"))?,
+                                )
+                                .ok_or(anyhow::anyhow!("internal delta fail"))?
+                                .0;
+
+                            tracing::debug!("delta delete block {}:[{}, {}]", old_hash, start, end);
+                            db.execute(
+                                "DELETE FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
+                                (old_hash as i64, start, end),
+                            )?;
                         }
                         _ => {
                             tracing::debug!("what the fuck");
                         }
                     };
-
-                    db.execute("DELETE FROM temp_blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
-                        (hash, start, end))?;
 
                     Ok::<protocol::delta::Operation, anyhow::Error>(protocol::delta::Operation {
                         op_type: match x.tag() {
@@ -718,7 +759,7 @@ impl Server {
                             similar::ChangeTag::Insert => protocol::delta::OpType::Insert,
                             similar::ChangeTag::Delete => protocol::delta::OpType::Delete,
                         } as i32,
-                        hash: hash as u64,
+                        hash: new_hash as u64,
                         start: start as u64,
                         end: end as u64,
                     })
@@ -752,23 +793,23 @@ impl Server {
         )?;
 
         let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-        if let Some(requests) = outgoing_lock.get_mut(&namehash) {
+        if let Some(requests) = outgoing_lock.get_mut(&(namehash as i64)) {
             if requests.contains(&(metadata.start, metadata.end)) {
                 let data = transfer
                     .data
                     .ok_or(anyhow::anyhow!("transfer response has no data"))?;
 
                 db.execute(
-                    "INSERT INTO temp_blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     (folder_id, namehash as i64, metadata.hash as i64, metadata.start as i64, metadata.end as i64, rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
                 )?;
 
                 let rowid = db.last_insert_rowid();
                 let mut blob =
-                    db.blob_open(rusqlite::MAIN_DB, "temp_blocks", "contents", rowid, false)?;
+                    db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, false)?;
 
                 if blob.write(&data)? != data.len() {
-                    anyhow::bail!("did not write full temp block to database");
+                    anyhow::bail!("did not write full block to database");
                 }
 
                 blob.close()?;
@@ -776,32 +817,91 @@ impl Server {
 
             requests.remove(&(metadata.start, metadata.end));
             if requests.is_empty() {
-                outgoing_lock.remove(&namehash);
+                outgoing_lock.remove(&(namehash as i64));
 
-                tracing::info!("transfer queue satisfied for file {namehash}. broadcasting delta");
+                let pending_lock = self.pending_deltas.lock().await;
+                if let Some(delta) = pending_lock.get(&(namehash as i64)) {
+                    tracing::info!(
+                        "transfer queue satisfied for file {namehash}. broadcasting delta"
+                    );
 
-                let delta = dbg!(self.process_delta(db, folder_id, namehash as i64).await?);
+                    let streams_lock = self.streams.lock().await;
+                    streams_lock
+                        .iter()
+                        .map(|s| {
+                            // if *s.0 == addr {
+                            //     return Ok(());
+                            // }
 
-                let streams = self.streams.lock().await;
+                            s.1.send(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: Some(protocol::packet::Message::Delta(delta.clone())),
+                            })?;
 
-                // broadcast to other clients
-                let _ = streams
-                    .iter()
-                    .map(|(stream_addr, stream)| {
-                        if *stream_addr == addr {
-                            return Ok(());
-                        }
-
-                        stream.send(protocol::Packet {
-                            code: protocol::Return::NoneUnspecified as i32,
-                            message: Some(protocol::packet::Message::Delta(delta.clone())),
-                        })?;
-
-                        Ok(())
-                    })
-                    .collect::<Vec<Result<_, anyhow::Error>>>();
+                            Ok(())
+                        })
+                        .collect::<anyhow::Result<()>>()?;
+                }
             }
         }
+
+        Ok(())
+    }
+
+    async fn handle_whatis(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        whatis: protocol::WhatIs,
+    ) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+        let mut streams_lock = self.streams.lock().await;
+        let stream = streams_lock
+            .get_mut(&addr)
+            .ok_or(anyhow::anyhow!("could not find stream for client"))?;
+
+        let folder_id: i64 = db.query_row(
+            "SELECT current_folder FROM users WHERE addr = ?1",
+            [addr.to_string()],
+            |row| row.get(0),
+        )?;
+
+        let mut stmt = db.prepare("SELECT namehash FROM filenames WHERE name = ?1")?;
+
+        stmt.query_one([whatis.filename.clone()], |row| {
+            let filehash = row.get::<_, i64>(0)?;
+
+            let mut blocks_stmt =
+                db.prepare("SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2")?;
+
+            let mut manifest = protocol::FileManifest {
+                filename: whatis.filename,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| rusqlite::Error::UnwindingPanic)?
+                    .as_secs(),
+                blocks: vec![],
+            };
+
+            let _ = blocks_stmt.query_map([folder_id, filehash], |r| {
+                manifest.blocks.push(protocol::BlockMetadata {
+                    hash: r.get::<_, i64>(0)? as u64,
+                    start: r.get::<_, i64>(1)? as u64,
+                    end: r.get::<_, i64>(2)? as u64,
+                    namehash: None,
+                });
+
+                Ok(())
+            })?;
+
+            stream
+                .send(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Manifest(manifest)),
+                })
+                .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+
+            Ok(())
+        })?;
 
         Ok(())
     }

@@ -437,10 +437,12 @@ impl Client {
             let send_ch = self.send_ch.lock().await;
 
             for file in room_info.files {
-                let mut stmt = db.prepare("SELECT COUNT(*) FROM filenames WHERE name = ?1")?;
+                let mut stmt = db.prepare("SELECT * FROM filenames WHERE name = ?1")?;
 
                 // if file does not exist, request manifest
                 if stmt.query_one([file.name.clone()], |_| Ok(())).is_err() {
+                    tracing::debug!("file {} does not exist, requesting manifest", file.name);
+
                     send_ch
                         .as_ref()
                         .map(|ch| {
@@ -650,6 +652,7 @@ impl Client {
                     continue;
                 }
             } else {
+                // TODO: finish this
             }
         }
 
