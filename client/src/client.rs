@@ -533,6 +533,7 @@ impl Client {
         // we are receiving data from the server
         if let Some(data) = transfer.data {
         } else {
+            // otherwise, we are fulfilling a data request
             let namehash = metadata
                 .namehash
                 .ok_or(anyhow::anyhow!("malformed transfer request"))?;
@@ -598,17 +599,6 @@ impl Client {
                             continue;
                         }
                     } else {
-                        // doesn't exist
-                        db.execute(
-                            "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                            (
-                                delta.namehash as i64,
-                                op.start as i64,
-                                op.end as i64,
-                                op.hash as i64,
-                            ),
-                        )?;
-
                         tracing::debug!(
                             "INSERT: block {} ({}, {}) does not exist, requesting from server",
                             op.hash,
@@ -659,6 +649,10 @@ impl Client {
         Ok(())
     }
 
+    async fn handle_manifest(&mut self, manifest: protocol::FileManifest) -> anyhow::Result<()> {
+        manifest.blocks.Ok(())
+    }
+
     async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
         let message = packet
             .message
@@ -673,9 +667,7 @@ impl Client {
                 tracing::debug!("event: {:?}", event);
             }
 
-            protocol::packet::Message::Manifest(manifest) => {
-                tracing::debug!("manifest: {:?}", manifest);
-            }
+            protocol::packet::Message::Manifest(manifest) => self.handle_manifest(manifest).await?,
 
             protocol::packet::Message::Transfer(transfer) => self.handle_transfer(transfer).await?,
 

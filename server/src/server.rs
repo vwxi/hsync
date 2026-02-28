@@ -35,8 +35,7 @@ const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BLOCK_SIZE: usize = 2048;
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
-const CREATE_FILENAMES_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT, namehash INTEGER)";
+const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 
 pub type UserId = u64;
@@ -882,16 +881,15 @@ impl Server {
                 blocks: vec![],
             };
 
-            let _ = blocks_stmt.query_map([folder_id, filehash], |r| {
+            let mut blocks = blocks_stmt.query([folder_id, filehash])?;
+            while let Ok(Some(block)) = blocks.next() {
                 manifest.blocks.push(protocol::BlockMetadata {
-                    hash: r.get::<_, i64>(0)? as u64,
-                    start: r.get::<_, i64>(1)? as u64,
-                    end: r.get::<_, i64>(2)? as u64,
+                    hash: block.get::<_, i64>(0)? as u64,
+                    start: block.get::<_, i64>(1)? as u64,
+                    end: block.get::<_, i64>(2)? as u64,
                     namehash: None,
                 });
-
-                Ok(())
-            })?;
+            }
 
             stream
                 .send(protocol::Packet {
