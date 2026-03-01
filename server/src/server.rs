@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::Write,
+    io::{Read, Seek, Write},
     net::SocketAddr,
     sync::Arc,
 };
@@ -264,7 +264,7 @@ impl Server {
             protocol::packet::Message::Event(event) => self.handle_event(addr, event).await?,
 
             protocol::packet::Message::Transfer(transfer) => {
-                self.handle_transfer(addr, transfer).await?
+                self.clone().handle_transfer(addr, transfer).await?
             }
 
             protocol::packet::Message::Whatis(whatis) => self.handle_whatis(addr, whatis).await?,
@@ -627,18 +627,16 @@ impl Server {
             (folder_id, name_hash),
         )?;
 
-        db.execute(
-            "DELETE FROM temp_blocks WHERE folder = ?1 AND name = ?2",
-            (folder_id, name_hash),
-        )?;
-
         tracing::debug!(
             "deleted all blocks related to file {} in folder {}",
             name_hash,
             folder_id
         );
 
-        db.execute("DELETE FROM filenames WHERE folder = ?1", [folder_id])?;
+        db.execute(
+            "DELETE FROM filenames WHERE folder = ?1 AND namehash = ?2",
+            (folder_id, name_hash),
+        )?;
 
         tracing::debug!(
             "deleted filename entry for namehash {} in folder {}",
@@ -771,7 +769,7 @@ impl Server {
     }
 
     async fn handle_transfer(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         addr: SocketAddr,
         transfer: protocol::Transfer,
     ) -> anyhow::Result<()> {
@@ -791,57 +789,86 @@ impl Server {
             |row| row.get(0),
         )?;
 
-        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-        if let Some(requests) = outgoing_lock.get_mut(&(namehash as i64)) {
-            if requests.contains(&(metadata.start, metadata.end)) {
-                let data = transfer
-                    .data
-                    .ok_or(anyhow::anyhow!("transfer response has no data"))?;
+        let mut streams_lock = self.streams.lock().await;
 
-                db.execute(
-                    "INSERT INTO blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    (folder_id, namehash as i64, metadata.hash as i64, metadata.start as i64, metadata.end as i64, rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
-                )?;
+        // we are getting a response
+        if let Some(data) = transfer.data {
+            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            if let Some(requests) = outgoing_lock.get_mut(&(namehash as i64)) {
+                if requests.contains(&(metadata.start, metadata.end)) {
+                    db.execute(
+                        "INSERT INTO blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        (folder_id, namehash as i64, metadata.hash as i64, metadata.start as i64, metadata.end as i64, rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
+                    )?;
 
-                let rowid = db.last_insert_rowid();
-                let mut blob =
-                    db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, false)?;
+                    let rowid = db.last_insert_rowid();
+                    let mut blob =
+                        db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, false)?;
 
-                if blob.write(&data)? != data.len() {
-                    anyhow::bail!("did not write full block to database");
+                    if blob.write(&data)? != data.len() {
+                        anyhow::bail!("did not write full block to database");
+                    }
+
+                    blob.close()?;
                 }
 
-                blob.close()?;
-            }
+                requests.remove(&(metadata.start, metadata.end));
+                if requests.is_empty() {
+                    outgoing_lock.remove(&(namehash as i64));
 
-            requests.remove(&(metadata.start, metadata.end));
-            if requests.is_empty() {
-                outgoing_lock.remove(&(namehash as i64));
+                    let pending_lock = self.pending_deltas.lock().await;
+                    if let Some(delta) = pending_lock.get(&(namehash as i64)) {
+                        tracing::info!(
+                            "transfer queue satisfied for file {namehash}. broadcasting delta"
+                        );
 
-                let pending_lock = self.pending_deltas.lock().await;
-                if let Some(delta) = pending_lock.get(&(namehash as i64)) {
-                    tracing::info!(
-                        "transfer queue satisfied for file {namehash}. broadcasting delta"
-                    );
+                        streams_lock
+                            .iter()
+                            .map(|s| {
+                                if *s.0 == addr {
+                                    return Ok(());
+                                }
 
-                    let streams_lock = self.streams.lock().await;
-                    streams_lock
-                        .iter()
-                        .map(|s| {
-                            // if *s.0 == addr {
-                            //     return Ok(());
-                            // }
+                                s.1.send(protocol::Packet {
+                                    code: protocol::Return::NoneUnspecified as i32,
+                                    message: Some(protocol::packet::Message::Delta(delta.clone())),
+                                })?;
 
-                            s.1.send(protocol::Packet {
-                                code: protocol::Return::NoneUnspecified as i32,
-                                message: Some(protocol::packet::Message::Delta(delta.clone())),
-                            })?;
-
-                            Ok(())
-                        })
-                        .collect::<anyhow::Result<()>>()?;
+                                Ok(())
+                            })
+                            .collect::<anyhow::Result<()>>()?;
+                    }
                 }
             }
+        } else {
+            // we are getting a request for block data
+            let rowid: i64 = db.query_one(
+                "SELECT ROWID FROM blocks WHERE name = ?1 AND hash = ?2 AND start = ?3 AND end = ?4",
+                [
+                    namehash as i64,
+                    metadata.hash as i64,
+                    metadata.start as i64,
+                    metadata.end as i64
+                ],
+                |r| r.get(0))?;
+
+            let mut data: Vec<u8> = vec![0u8; (metadata.end - metadata.start) as usize];
+            let mut contents =
+                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, true)?;
+            contents.seek(std::io::SeekFrom::Start(metadata.start))?;
+            contents.read_exact(&mut data)?;
+
+            streams_lock
+                .get_mut(&addr)
+                .ok_or(anyhow::anyhow!("could not get client stream"))?
+                .send(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                        metadata: Some(metadata),
+                        mode: protocol::DataMode::WholeUnspecified as i32,
+                        data: Some(data),
+                    })),
+                })?;
         }
 
         Ok(())
@@ -890,6 +917,8 @@ impl Server {
                     namehash: None,
                 });
             }
+
+            tracing::debug!("sending manifest for file {}", manifest.filename);
 
             stream
                 .send(protocol::Packet {

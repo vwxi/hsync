@@ -91,6 +91,7 @@ message Event {
 enum Return {
   RETURN_NONE_UNSPECIFIED = 0;
   RETURN_BLOCK_MISMATCH = 1;
+  RETURN_EMPTY_MANIFEST = 2;
 }
 
 message Packet {

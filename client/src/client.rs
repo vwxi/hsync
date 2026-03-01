@@ -1,7 +1,8 @@
 use std::{
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs::metadata,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::ffi::OsStrExt,
     path::PathBuf,
     sync::Arc,
@@ -105,6 +106,7 @@ pub struct Client {
     db_pool: Pool<SqliteConnectionManager>,
     endpoint: Endpoint,
     send_ch: Mutex<Option<UnboundedSender<protocol::Packet>>>,
+    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64)>>>,
 }
 
 impl Drop for Client {
@@ -201,6 +203,7 @@ impl Client {
             db_pool,
             endpoint,
             send_ch: Mutex::new(None),
+            outgoing_transfer_requests: Mutex::new(HashMap::new()),
         })
     }
 
@@ -288,6 +291,7 @@ impl Client {
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
         let file = std::fs::File::open(&path)?;
+
         // TODO: adapt this for subfolders when it gets implemented
         let pathname = path
             .file_name()
@@ -530,24 +534,76 @@ impl Client {
             .metadata
             .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
 
+        let namehash = metadata
+            .namehash
+            .ok_or(anyhow::anyhow!("malformed transfer request"))? as i64;
+
+        let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
+        let filename: String = stmt.query_row([namehash], |row| row.get(0))?;
+
+        let folder = self
+            .config
+            .folder
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let filepath = folder.join(&filename);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&filepath)?;
+
         // we are receiving data from the server
         if let Some(data) = transfer.data {
+            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            outgoing_lock.entry(namehash).and_modify(|reqs| {
+                if reqs.contains(&(metadata.start, metadata.end)) {
+                    if !reqs.remove(&(metadata.start, metadata.end)) {
+                        tracing::warn!(
+                            "satisfied nonexistent transfer request for {}:[{}, {}]",
+                            namehash,
+                            metadata.start,
+                            metadata.end
+                        );
+                    }
+
+                    let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
+
+                    if let Err(e) = db.execute(
+                        "INSERT INTO blocks (hash, start, end) VALUES (?1, ?2, ?3)",
+                        [datahash, metadata.start as i64, metadata.end as i64],
+                    ) {
+                        tracing::error!(
+                            "failed to update block metadata in database: {}",
+                            e.to_string()
+                        );
+
+                        return;
+                    }
+
+                    if let Err(e) =
+                        Self::expand_and_write(&mut file, metadata.start, data.as_slice())
+                    {
+                        tracing::error!(
+                            "failed to write block [{}, {}] to file {}: {}",
+                            metadata.start,
+                            metadata.end,
+                            filepath.to_string_lossy(),
+                            e.to_string()
+                        );
+
+                        return;
+                    }
+
+                    tracing::debug!(
+                        "applied block [{}, {}] to file {}",
+                        metadata.start,
+                        metadata.end,
+                        filepath.to_string_lossy()
+                    );
+                }
+            });
         } else {
             // otherwise, we are fulfilling a data request
-            let namehash = metadata
-                .namehash
-                .ok_or(anyhow::anyhow!("malformed transfer request"))?;
-
-            let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
-            let filename: String = stmt.query_row([namehash as i64], |row| row.get(0))?;
-
-            let folder = self
-                .config
-                .folder
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("."));
-            let filepath = folder.join(&filename);
-
             let mut file = std::fs::File::open(&filepath)?;
             file.seek(SeekFrom::Start(metadata.start))?;
 
@@ -573,8 +629,109 @@ impl Client {
         Ok(())
     }
 
+    pub fn truncate_range(file: &mut std::fs::File, start: u64, end: u64) -> anyhow::Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+
+        let file_len = file.metadata()?.len();
+
+        if end > file_len {
+            anyhow::bail!("end offset is beyond end of file");
+        }
+
+        let range_len = end - start;
+        let tail_len = file_len - end;
+
+        if tail_len > 0 {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut moved: u64 = 0;
+
+            while moved < tail_len {
+                let to_move = std::cmp::min(buf.len() as u64, tail_len - moved) as usize;
+
+                file.seek(SeekFrom::Start(end + moved))?;
+                file.read_exact(&mut buf[..to_move])?;
+
+                file.seek(SeekFrom::Start(start + moved))?;
+                file.write_all(&buf[..to_move])?;
+
+                moved += to_move as u64;
+            }
+        }
+
+        file.set_len(file_len - range_len)?;
+        file.sync_all()?;
+
+        Ok(())
+    }
+
+    pub fn expand_and_write(
+        file: &mut std::fs::File,
+        offset: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let file_len = file.metadata()?.len();
+
+        if offset > file_len {
+            anyhow::bail!("offset is beyond end of file");
+        }
+
+        let n = data.len() as u64;
+        let tail_len = file_len - offset;
+
+        file.set_len(file_len + n)?;
+
+        if tail_len > 0 {
+            let buf_size: u64 = 64 * 1024;
+            let mut buf = vec![0u8; buf_size as usize];
+
+            let mut remaining = tail_len;
+
+            while remaining > 0 {
+                let chunk = std::cmp::min(remaining, buf_size);
+
+                let src = offset + remaining - chunk;
+                let dst = src + n;
+
+                file.seek(SeekFrom::Start(src))?;
+                file.read_exact(&mut buf[..chunk as usize])?;
+
+                file.seek(SeekFrom::Start(dst))?;
+                file.write_all(&buf[..chunk as usize])?;
+
+                remaining -= chunk;
+            }
+        }
+
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)?;
+
+        file.sync_all()?;
+
+        Ok(())
+    }
+
     async fn handle_delta(&mut self, delta: protocol::Delta) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
+
+        let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
+        let filename: String = stmt.query_row([delta.namehash as i64], |row| row.get(0))?;
+
+        let folder = self
+            .config
+            .folder
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let filepath = folder.join(&filename);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(filepath)?;
 
         for op in delta.ops {
             // Check if block hash matches existing hash in database
@@ -597,6 +754,30 @@ impl Client {
                                 op.end
                             );
                             continue;
+                        } else {
+                            // request transfer
+                            self.send_ch
+                                .lock()
+                                .await
+                                .as_ref()
+                                .map(|ch| {
+                                    ch.send(protocol::Packet {
+                                        code: protocol::Return::NoneUnspecified as i32,
+                                        message: Some(protocol::packet::Message::Transfer(
+                                            protocol::Transfer {
+                                                metadata: Some(protocol::BlockMetadata {
+                                                    start: op.start,
+                                                    end: op.end,
+                                                    namehash: Some(delta.namehash),
+                                                    hash: op.hash,
+                                                }),
+                                                mode: protocol::DataMode::WholeUnspecified as i32,
+                                                data: None,
+                                            },
+                                        )),
+                                    })
+                                })
+                                .ok_or(anyhow::anyhow!("could not request data transfer"))??;
                         }
                     } else {
                         tracing::debug!(
@@ -632,25 +813,177 @@ impl Client {
                     }
                 }
 
-                _ => {}
-            }
+                protocol::delta::OpType::Delete => {
+                    if let Ok(hash) = existing_hash {
+                        // remove block from file and metadata table
+                        db.execute("DELETE FROM blocks WHERE name = ?1 AND hash = ?2 AND start = ?3 AND end = ?$",
+                            [
+                                delta.namehash as i64,
+                                hash,
+                                op.start as i64,
+                                op.end as i64,
+                            ]
+                        )?;
 
-            // exists
-            if let Ok(hash) = existing_hash {
-                if hash as u64 == op.hash {
-                    tracing::debug!("block [{}, {}] hash matches, skipping", op.start, op.end);
-                    continue;
+                        Self::truncate_range(&mut file, op.start, op.end)?;
+
+                        tracing::debug!(
+                            "delta: deleting block [{},{}] for file {}",
+                            op.start,
+                            op.end,
+                            filename
+                        );
+                    }
                 }
-            } else {
-                // TODO: finish this
+
+                _ => {}
             }
         }
 
         Ok(())
     }
 
+    fn create_file_entry(
+        db: &PooledConnection<SqliteConnectionManager>,
+        name_string: &str,
+        name_hash: i64,
+    ) -> anyhow::Result<()> {
+        db.execute(
+            "INSERT INTO filenames (name, hash) SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
+            (name_string, name_hash),
+        )?;
+
+        Ok(())
+    }
+
+    fn delete_file_entry(
+        self: &Arc<Self>,
+        db: &PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        name_hash: i64,
+    ) -> anyhow::Result<()> {
+        db.execute("DELETE FROM blocks WHERE name = ?1", [name_hash])?;
+
+        tracing::debug!(
+            "deleted all blocks related to file {} in folder {}",
+            name_hash,
+            folder_id
+        );
+
+        db.execute("DELETE FROM filenames WHERE hash = ?1", [name_hash])?;
+
+        tracing::debug!(
+            "deleted filename entry for namehash {} in folder {}",
+            name_hash,
+            folder_id
+        );
+
+        Ok(())
+    }
+
     async fn handle_manifest(&mut self, manifest: protocol::FileManifest) -> anyhow::Result<()> {
-        manifest.blocks.Ok(())
+        let send = self.send_ch.lock().await;
+
+        if manifest.blocks.is_empty() {
+            send.as_ref()
+                .map(|ch| {
+                    ch.send(protocol::Packet {
+                        code: protocol::Return::EmptyManifest as i32,
+                        message: Some(protocol::packet::Message::Die(protocol::Die {
+                            reason: Some(String::from("sent empty manifest")),
+                        })),
+                    })
+                })
+                .ok_or(anyhow::anyhow!("could not send manifest fail message"))??;
+
+            return Ok(());
+        }
+
+        let db = self.db_pool.get()?;
+
+        let exists_in_db: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM filenames WHERE name = ?1)",
+            [&manifest.filename],
+            |row| row.get(0),
+        )?;
+
+        let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
+
+        if !exists_in_db {
+            tracing::debug!("file {} is not part of folder, adding", manifest.filename,);
+
+            Self::create_file_entry(&db, &manifest.filename, namehash)?;
+        }
+
+        {
+            let mut set: HashSet<(u64, u64)> = HashSet::new();
+            manifest
+                .blocks
+                .iter()
+                .map(|block| {
+                    let mut stmt = db.prepare(
+                        "SELECT * FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
+                    )?;
+
+                    tracing::debug!(
+                        "checking for block {}:[{}, {}]",
+                        block.hash,
+                        block.start,
+                        block.end
+                    );
+
+                    if stmt
+                        .query_one(
+                            (block.hash as i64, block.start as i64, block.end as i64),
+                            |_| Ok(()),
+                        )
+                        .is_err()
+                    {
+                        set.insert((block.start, block.end));
+
+                        let mut block_with_namehash = block.clone();
+                        block_with_namehash.namehash = Some(namehash as u64);
+
+                        send.as_ref()
+                            .map(|ch| {
+                                ch.send(protocol::Packet {
+                                    code: protocol::Return::NoneUnspecified as i32,
+                                    message: Some(protocol::packet::Message::Transfer(
+                                        protocol::Transfer {
+                                            metadata: Some(block_with_namehash),
+                                            mode: protocol::DataMode::WholeUnspecified as i32,
+                                            data: None,
+                                        },
+                                    )),
+                                })
+                            })
+                            .ok_or(anyhow::anyhow!("could not send transfer request"))??;
+
+                        tracing::debug!(
+                            "requesting block [{}, {}] from client for file {}",
+                            block.start,
+                            block.end,
+                            manifest.filename
+                        );
+                    } else {
+                        tracing::debug!(
+                            "do not need block {}:[{}, {}] in file {}",
+                            block.hash,
+                            block.start,
+                            block.end,
+                            manifest.filename
+                        );
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                })
+                .collect::<anyhow::Result<()>>()?;
+
+            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            outgoing_lock.insert(namehash, set);
+        }
+
+        Ok(())
     }
 
     async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
