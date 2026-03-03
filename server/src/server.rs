@@ -208,6 +208,9 @@ impl Server {
                         Some(msg) => {
                             if let Err(e) = self.handle_packet(conn.remote_address(), msg).await {
                                 tracing::error!("packet handler: {:?}", e);
+                                self.handle_die(conn.remote_address(), protocol::Die::default()).await?;
+
+                                break;
                             }
                         }
                         None => {
@@ -864,7 +867,7 @@ impl Server {
                 .send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
-                        metadata: Some(metadata),
+                        metadata: Some(dbg!(metadata)),
                         mode: protocol::DataMode::WholeUnspecified as i32,
                         data: Some(data),
                     })),

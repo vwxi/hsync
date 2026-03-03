@@ -419,7 +419,7 @@ impl Client {
                 send_ch.as_ref().map(|ch| {
                     ch.send(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
-                        message: Some(protocol::packet::Message::Manifest(manifest)),
+                        message: Some(protocol::packet::Message::Manifest(dbg!(manifest))),
                     })
                 });
             }
@@ -555,8 +555,14 @@ impl Client {
         // we are receiving data from the server
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            outgoing_lock.entry(namehash).and_modify(|reqs| {
-                if reqs.contains(&(metadata.start, metadata.end)) {
+            outgoing_lock.entry(dbg!(namehash)).and_modify(|reqs| {
+                tracing::debug!("banger, {} items", reqs.len());
+                for r in reqs.iter() {
+                    tracing::debug!("\tcurrently waiting: {:?}", r);
+                }
+
+                if reqs.contains(&dbg!((metadata.start, metadata.end))) {
+                    tracing::debug!("fnuckin");
                     if !reqs.remove(&(metadata.start, metadata.end)) {
                         tracing::warn!(
                             "satisfied nonexistent transfer request for {}:[{}, {}]",
@@ -600,6 +606,8 @@ impl Client {
                         metadata.end,
                         filepath.to_string_lossy()
                     );
+                } else {
+                    tracing::error!("damnit");
                 }
             });
         } else {
@@ -756,6 +764,18 @@ impl Client {
                             continue;
                         } else {
                             // request transfer
+                            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                            outgoing_lock
+                                .entry(delta.namehash as i64)
+                                .and_modify(|o| {
+                                    o.insert((op.start, op.end));
+                                })
+                                .or_insert_with(|| {
+                                    let mut set: HashSet<(u64, u64)> = HashSet::new();
+                                    set.insert((op.start, op.end));
+                                    set
+                                });
+
                             self.send_ch
                                 .lock()
                                 .await
@@ -768,7 +788,7 @@ impl Client {
                                                 metadata: Some(protocol::BlockMetadata {
                                                     start: op.start,
                                                     end: op.end,
-                                                    namehash: Some(delta.namehash),
+                                                    namehash: Some(dbg!(delta.namehash)),
                                                     hash: op.hash,
                                                 }),
                                                 mode: protocol::DataMode::WholeUnspecified as i32,
@@ -787,6 +807,18 @@ impl Client {
                             op.end
                         );
 
+                        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                        outgoing_lock
+                            .entry(delta.namehash as i64)
+                            .and_modify(|o| {
+                                o.insert((op.start, op.end));
+                            })
+                            .or_insert_with(|| {
+                                let mut set: HashSet<(u64, u64)> = HashSet::new();
+                                set.insert((op.start, op.end));
+                                set
+                            });
+
                         // request transfer
                         self.send_ch
                             .lock()
@@ -798,9 +830,9 @@ impl Client {
                                     message: Some(protocol::packet::Message::Transfer(
                                         protocol::Transfer {
                                             metadata: Some(protocol::BlockMetadata {
-                                                start: op.start,
-                                                end: op.end,
-                                                namehash: Some(delta.namehash),
+                                                start: dbg!(op.start),
+                                                end: dbg!(op.end),
+                                                namehash: Some(dbg!(delta.namehash)),
                                                 hash: op.hash,
                                             }),
                                             mode: protocol::DataMode::WholeUnspecified as i32,
@@ -846,12 +878,15 @@ impl Client {
     fn create_file_entry(
         db: &PooledConnection<SqliteConnectionManager>,
         name_string: &str,
+        path: &PathBuf,
         name_hash: i64,
     ) -> anyhow::Result<()> {
         db.execute(
             "INSERT INTO filenames (name, hash) SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
             (name_string, name_hash),
         )?;
+
+        std::fs::File::create_new(path)?;
 
         Ok(())
     }
@@ -870,6 +905,12 @@ impl Client {
             folder_id
         );
 
+        let filename: String = db.query_one(
+            "SELECT name FROM filenames WHERE hash = ?1",
+            [name_hash],
+            |r| r.get(0),
+        )?;
+
         db.execute("DELETE FROM filenames WHERE hash = ?1", [name_hash])?;
 
         tracing::debug!(
@@ -877,6 +918,15 @@ impl Client {
             name_hash,
             folder_id
         );
+
+        let folder = self
+            .config
+            .folder
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let filepath = folder.join(&filename);
+
+        std::fs::remove_file(&filepath)?;
 
         Ok(())
     }
@@ -910,9 +960,16 @@ impl Client {
         let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
 
         if !exists_in_db {
-            tracing::debug!("file {} is not part of folder, adding", manifest.filename,);
+            tracing::debug!("file {} is not part of folder, adding", manifest.filename);
 
-            Self::create_file_entry(&db, &manifest.filename, namehash)?;
+            let folder = self
+                .config
+                .folder
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."));
+            let filepath = folder.join(&manifest.filename);
+
+            Self::create_file_entry(&db, &manifest.filename, &filepath, namehash)?;
         }
 
         {
