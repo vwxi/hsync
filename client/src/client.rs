@@ -245,7 +245,7 @@ impl Client {
         for entry in glob(&folder_glob)? {
             match entry {
                 Ok(path) => {
-                    Self::check_diff(
+                    Self::diff_blocks(
                         &path,
                         std::time::SystemTime::now()
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
@@ -285,7 +285,7 @@ impl Client {
     }
 
     // check differences in a single file and report back a diff object
-    fn check_diff(
+    fn diff_blocks(
         path: &PathBuf,
         new_timestamp: i64,
         db: &PooledConnection<SqliteConnectionManager>,
@@ -328,13 +328,36 @@ impl Client {
                 |row| row.get::<_, i64>(0),
             );
 
-            if existing.is_err() {
+            let block_hash = xxhash_rust::xxh3::xxh3_64(chunk.data.as_slice());
+
+            // changes recorded are blocks that change hash
+            // or blocks that do not exist
+            if let Ok(existing_hash) = existing {
+                if existing_hash != block_hash as i64 {
+                    db.execute(
+                        "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                        (
+                            hashed_filename,
+                            chunk.offset as i64,
+                            (chunk.offset + chunk.length as u64) as i64,
+                            block_hash as i64,
+                        ),
+                    )?;
+
+                    changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
+                }
+            } else {
                 db.execute(
-                    "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                    (hashed_filename, chunk.offset as i64, (chunk.offset + chunk.length as u64) as i64, chunk.hash as i64),
+                    "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                    (
+                        hashed_filename,
+                        chunk.offset as i64,
+                        (chunk.offset + chunk.length as u64) as i64,
+                        block_hash as i64,
+                    ),
                 )?;
 
-                changes.push((chunk.offset, chunk.offset + chunk.length as u64, chunk.hash));
+                changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
             }
         }
 
@@ -407,11 +430,11 @@ impl Client {
 
                 manifest.filename = String::from(event_file);
 
-                for change in Self::check_diff(&filename, new_timestamp, db)? {
+                for change in Self::diff_blocks(&filename, new_timestamp, db)? {
                     manifest.blocks.push(protocol::BlockMetadata {
                         start: change.0,
                         end: change.1,
-                        hash: change.1,
+                        hash: change.2,
                         namehash: None,
                     });
                 }
@@ -848,7 +871,7 @@ impl Client {
                 protocol::delta::OpType::Delete => {
                     if let Ok(hash) = existing_hash {
                         // remove block from file and metadata table
-                        db.execute("DELETE FROM blocks WHERE name = ?1 AND hash = ?2 AND start = ?3 AND end = ?$",
+                        db.execute("DELETE FROM blocks WHERE file = ?1 AND hash = ?2 AND start = ?3 AND end = ?4",
                             [
                                 delta.namehash as i64,
                                 hash,
@@ -897,7 +920,7 @@ impl Client {
         folder_id: i64,
         name_hash: i64,
     ) -> anyhow::Result<()> {
-        db.execute("DELETE FROM blocks WHERE name = ?1", [name_hash])?;
+        db.execute("DELETE FROM blocks WHERE file = ?1", [name_hash])?;
 
         tracing::debug!(
             "deleted all blocks related to file {} in folder {}",

@@ -366,7 +366,7 @@ impl Server {
                             })
                         }),
                     })
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
                 Ok(())
             })?;
@@ -696,7 +696,7 @@ impl Server {
     ) -> anyhow::Result<protocol::Delta> {
         let old_blocks: Vec<(u64, u64, u64)> = {
             let mut stmt = db.prepare(
-                "SELECT start, end, hash FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
+                "SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
             )?;
 
             stmt.query_map((folder_id, name_hash), |row| {
@@ -748,9 +748,7 @@ impl Server {
                                 (old_hash as i64, start, end),
                             )?;
                         }
-                        _ => {
-                            tracing::debug!("what the fuck");
-                        }
+                        _ => {}
                     };
 
                     Ok::<protocol::delta::Operation, anyhow::Error>(protocol::delta::Operation {
