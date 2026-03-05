@@ -165,7 +165,10 @@ impl Client {
         let wd = notify.watches().add(
             folder,
             WatchMask::all()
-                & !(WatchMask::ONESHOT | WatchMask::ACCESS | WatchMask::OPEN | WatchMask::CLOSE),
+                & !(WatchMask::ONESHOT
+                    | WatchMask::ACCESS
+                    | WatchMask::OPEN
+                    | WatchMask::CLOSE_NOWRITE),
         )?;
 
         let buf = [0u8; BUF_SIZE];
@@ -334,6 +337,13 @@ impl Client {
             // or blocks that do not exist
             if let Ok(existing_hash) = existing {
                 if existing_hash != block_hash as i64 {
+                    tracing::debug!(
+                        "block exists and conflicts, {}:[{}, {}]",
+                        existing_hash,
+                        chunk.offset,
+                        chunk.offset + chunk.length as u64
+                    );
+
                     db.execute(
                         "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
                         (
@@ -347,6 +357,13 @@ impl Client {
                     changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
                 }
             } else {
+                tracing::debug!(
+                    "block is new, {}:[{}, {}]",
+                    block_hash,
+                    chunk.offset,
+                    chunk.offset + chunk.length as u64
+                );
+
                 db.execute(
                     "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
                     (
@@ -419,7 +436,7 @@ impl Client {
                     })
                     .ok_or(anyhow::anyhow!("failed to relay delete event"))??;
             }
-            EventMask::MODIFY => {
+            EventMask::CLOSE_WRITE => {
                 let new_timestamp = metadata(&filename)?
                     .accessed()?
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
@@ -957,7 +974,7 @@ impl Client {
     async fn handle_manifest(&mut self, manifest: protocol::FileManifest) -> anyhow::Result<()> {
         let send = self.send_ch.lock().await;
 
-        if manifest.blocks.is_empty() {
+        if dbg!(&manifest).blocks.is_empty() {
             send.as_ref()
                 .map(|ch| {
                     ch.send(protocol::Packet {
@@ -974,11 +991,13 @@ impl Client {
 
         let db = self.db_pool.get()?;
 
-        let exists_in_db: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM filenames WHERE name = ?1)",
-            [&manifest.filename],
-            |row| row.get(0),
-        )?;
+        let exists_in_db: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM filenames WHERE name = ?1)",
+                [&manifest.filename],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
 
         let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
 

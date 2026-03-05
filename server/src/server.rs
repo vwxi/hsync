@@ -214,6 +214,8 @@ impl Server {
                             }
                         }
                         None => {
+                            self.handle_die(conn.remote_address(), protocol::Die::default()).await?;
+
                             break
                         },
                     }
@@ -324,7 +326,7 @@ impl Server {
         if let Some(folder_code) = auth.folder {
             // user wants to join a folder and is new
             let mut stmt = db.prepare("SELECT id, password FROM folders WHERE code = ?1")?;
-            stmt.query_one([&folder_code], |row| {
+            dbg!(stmt.query_one([&folder_code], |row| {
                 let (folder_id, folder_pass_hash) =
                     (row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
 
@@ -369,7 +371,7 @@ impl Server {
                     .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
                 Ok(())
-            })?;
+            }))?;
         } else {
             // user wants to create a folder and is new
             stream.send(protocol::Packet {
@@ -466,6 +468,7 @@ impl Server {
         db.execute("DELETE FROM users WHERE addr = ?1", [addr.to_string()])?;
 
         tracing::debug!("peer {} disconnected", addr);
+
         Ok(())
     }
 
@@ -612,7 +615,7 @@ impl Server {
         name_hash: i64,
     ) -> anyhow::Result<()> {
         db.execute(
-            "INSERT INTO filenames (folder, name, namehash) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
+            "INSERT OR REPLACE INTO filenames (folder, name, namehash) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
             (folder_id, name_string, name_hash),
         )?;
 
