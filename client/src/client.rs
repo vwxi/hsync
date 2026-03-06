@@ -15,6 +15,7 @@ use prost::Message;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, crypto::rustls::QuicClientConfig};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::fallible_iterator::FallibleIterator;
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -321,53 +322,77 @@ impl Client {
         new_timestamp: i64,
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
-        let file = std::fs::File::open(&path)?;
-
-        // TODO: adapt this for subfolders when it gets implemented
         let pathname = path
             .file_name()
             .and_then(|f| f.to_str())
             .ok_or(anyhow::anyhow!("malformed filename"))?;
         let hashed_filename = xxhash_rust::xxh3::xxh3_64(pathname.as_bytes()) as i64;
-        let mut changes: Vec<(u64, u64, u64)> = vec![];
 
         db.execute(
             "INSERT OR IGNORE INTO filenames (name, hash) VALUES (?1, ?2)",
             (pathname, hashed_filename),
         )?;
 
-        // NOTE: files are addressed in the block store by hash(filename).
-        //       if we have files with different filenames but identical content,
-        //       there will be redundant storage. in the future, consider loading
-        //       whole file, hashing contents then hashing blocks.
-        let chunker = fastcdc::v2020::StreamCDC::new(file, 4096, 16384, 65535);
+        if let Ok(file) = std::fs::File::open(&pathname) {
+            // TODO: adapt this for subfolders when it gets implemented
+            let mut changes: Vec<(u64, u64, u64)> = vec![];
 
-        for chunk in chunker {
-            let chunk = chunk?;
+            // NOTE: files are addressed in the block store by hash(filename).
+            //       if we have files with different filenames but identical content,
+            //       there will be redundant storage. in the future, consider loading
+            //       whole file, hashing contents then hashing blocks.
+            let chunker = fastcdc::v2020::StreamCDC::new(file, 4096, 16384, 65535);
 
-            let mut stmt = db.prepare(
-                "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 LIMIT 1"
-            )?;
+            for chunk in chunker {
+                let chunk = chunk?;
 
-            let existing = stmt.query_row(
-                (
-                    hashed_filename,
-                    chunk.offset as i64,
-                    (chunk.offset as usize + chunk.length) as i64,
-                    chunk.hash as i64,
-                ),
-                |row| row.get::<_, i64>(0),
-            );
+                let mut stmt = db.prepare(
+                    "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 LIMIT 1"
+                )?;
 
-            let block_hash = xxhash_rust::xxh3::xxh3_64(chunk.data.as_slice());
+                let existing = stmt.query_row(
+                    (
+                        hashed_filename,
+                        chunk.offset as i64,
+                        (chunk.offset as usize + chunk.length) as i64,
+                        chunk.hash as i64,
+                    ),
+                    |row| row.get::<_, i64>(0),
+                );
 
-            // changes recorded are blocks that change hash
-            // or blocks that do not exist
-            if let Ok(existing_hash) = existing {
-                if existing_hash != block_hash as i64 {
+                let block_hash = xxhash_rust::xxh3::xxh3_64(chunk.data.as_slice());
+
+                // changes recorded are blocks that change hash
+                // or blocks that do not exist
+                if let Ok(existing_hash) = existing {
+                    if existing_hash != block_hash as i64 {
+                        tracing::debug!(
+                            "block exists and conflicts, {}:[{}, {}]",
+                            existing_hash,
+                            chunk.offset,
+                            chunk.offset + chunk.length as u64
+                        );
+
+                        db.execute(
+                            "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                            (
+                                hashed_filename,
+                                chunk.offset as i64,
+                                (chunk.offset + chunk.length as u64) as i64,
+                                block_hash as i64,
+                            ),
+                        )?;
+
+                        changes.push((
+                            chunk.offset,
+                            chunk.offset + chunk.length as u64,
+                            block_hash,
+                        ));
+                    }
+                } else {
                     tracing::debug!(
-                        "block exists and conflicts, {}:[{}, {}]",
-                        existing_hash,
+                        "block is new, {}:[{}, {}]",
+                        block_hash,
                         chunk.offset,
                         chunk.offset + chunk.length as u64
                     );
@@ -384,29 +409,23 @@ impl Client {
 
                     changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
                 }
-            } else {
-                tracing::debug!(
-                    "block is new, {}:[{}, {}]",
-                    block_hash,
-                    chunk.offset,
-                    chunk.offset + chunk.length as u64
-                );
-
-                db.execute(
-                    "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                    (
-                        hashed_filename,
-                        chunk.offset as i64,
-                        (chunk.offset + chunk.length as u64) as i64,
-                        block_hash as i64,
-                    ),
-                )?;
-
-                changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
             }
-        }
 
-        Ok(changes)
+            Ok(changes)
+        } else {
+            let mut stmt = db.prepare("SELECT start, end, hash FROM blocks WHERE file = ?1")?;
+
+            Ok(stmt
+                .query([hashed_filename])?
+                .map(|r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u64,
+                    ))
+                })
+                .collect()?)
+        }
     }
 
     async fn handle_file_event(
@@ -465,7 +484,7 @@ impl Client {
                     .ok_or(anyhow::anyhow!("failed to relay delete event"))??;
             }
             EventMask::CLOSE_WRITE => {
-                let new_timestamp = metadata(&filename)?
+                let new_timestamp = metadata(dbg!(&filename))?
                     .accessed()?
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_secs() as i64;
@@ -683,6 +702,7 @@ impl Client {
             });
         } else {
             // otherwise, we are fulfilling a data request
+            tracing::debug!("poop12345 salami");
 
             let mut file = std::fs::File::open(&filepath)?;
             file.seek(SeekFrom::Start(metadata.start))?;
@@ -965,7 +985,7 @@ impl Client {
             (name_string, name_hash),
         )?;
 
-        std::fs::File::create_new(path)?;
+        let _ = std::fs::File::create_new(path);
 
         Ok(())
     }
@@ -1013,7 +1033,7 @@ impl Client {
     async fn handle_manifest(&mut self, manifest: protocol::FileManifest) -> anyhow::Result<()> {
         let send = self.send_ch.lock().await;
 
-        if dbg!(&manifest).blocks.is_empty() {
+        if manifest.blocks.is_empty() {
             send.as_ref()
                 .map(|ch| {
                     ch.send(protocol::Packet {
