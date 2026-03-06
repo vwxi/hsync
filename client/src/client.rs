@@ -41,7 +41,7 @@ const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
 const BLOCK_SIZE: usize = 2048;
 const CREATE_FILENAMES_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER)";
+    "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER, UNIQUE(name, hash))";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, UNIQUE(file, start, end, hash))";
 
 /// to be used with --insecure flag
@@ -287,6 +287,34 @@ impl Client {
         Ok(Some(pkt))
     }
 
+    async fn maybe_request_file_manifest(&mut self, path: &PathBuf) -> anyhow::Result<bool> {
+        let filename = path
+            .file_name()
+            .ok_or(anyhow::anyhow!("cannot request a directory object"))?
+            .to_str()
+            .ok_or(anyhow::anyhow!("cannot re-encode file path"))?;
+
+        Ok(if !path.exists() {
+            self.send_ch
+                .lock()
+                .await
+                .as_ref()
+                .map(|ch| {
+                    ch.send(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
+                            filename: String::from(filename),
+                        })),
+                    })
+                })
+                .ok_or(anyhow::anyhow!("could not request file {}", filename))??;
+
+            false
+        } else {
+            true
+        })
+    }
+
     // check differences in a single file and report back a diff object
     fn diff_blocks(
         path: &PathBuf,
@@ -304,7 +332,7 @@ impl Client {
         let mut changes: Vec<(u64, u64, u64)> = vec![];
 
         db.execute(
-            "INSERT INTO filenames (name, hash) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO filenames (name, hash) VALUES (?1, ?2)",
             (pathname, hashed_filename),
         )?;
 
@@ -345,7 +373,7 @@ impl Client {
                     );
 
                     db.execute(
-                        "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
                         (
                             hashed_filename,
                             chunk.offset as i64,
@@ -365,7 +393,7 @@ impl Client {
                 );
 
                 db.execute(
-                    "INSERT INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
                     (
                         hashed_filename,
                         chunk.offset as i64,
@@ -569,7 +597,6 @@ impl Client {
 
     async fn handle_transfer(&mut self, transfer: protocol::Transfer) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
-        let send_ch = self.send_ch.lock().await;
         let metadata = transfer
             .metadata
             .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
@@ -587,6 +614,16 @@ impl Client {
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
         let filepath = folder.join(&filename);
+
+        // maybe we do not have the file yet, we should not satisfy a transfer for
+        // a file we do not have.
+        if !self.maybe_request_file_manifest(&filepath).await? {
+            tracing::debug!("file {} does not exist yet, asking for manifest", filename);
+            return Ok(());
+        }
+
+        let send_ch = self.send_ch.lock().await;
+
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -596,13 +633,7 @@ impl Client {
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
             outgoing_lock.entry(dbg!(namehash)).and_modify(|reqs| {
-                tracing::debug!("banger, {} items", reqs.len());
-                for r in reqs.iter() {
-                    tracing::debug!("\tcurrently waiting: {:?}", r);
-                }
-
                 if reqs.contains(&dbg!((metadata.start, metadata.end))) {
-                    tracing::debug!("fnuckin");
                     if !reqs.remove(&(metadata.start, metadata.end)) {
                         tracing::warn!(
                             "satisfied nonexistent transfer request for {}:[{}, {}]",
@@ -615,7 +646,7 @@ impl Client {
                     let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
 
                     if let Err(e) = db.execute(
-                        "INSERT INTO blocks (hash, start, end) VALUES (?1, ?2, ?3)",
+                        "INSERT OR IGNORE INTO blocks (hash, start, end) VALUES (?1, ?2, ?3)",
                         [datahash, metadata.start as i64, metadata.end as i64],
                     ) {
                         tracing::error!(
@@ -652,6 +683,7 @@ impl Client {
             });
         } else {
             // otherwise, we are fulfilling a data request
+
             let mut file = std::fs::File::open(&filepath)?;
             file.seek(SeekFrom::Start(metadata.start))?;
 
@@ -776,6 +808,13 @@ impl Client {
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
         let filepath = folder.join(&filename);
+
+        // we don't have this file yet, we should ask for it
+        if !self.maybe_request_file_manifest(&filepath).await? {
+            tracing::debug!("file {} does not exist yet, asking for manifest", filename);
+            return Ok(());
+        }
+
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -922,7 +961,7 @@ impl Client {
         name_hash: i64,
     ) -> anyhow::Result<()> {
         db.execute(
-            "INSERT INTO filenames (name, hash) SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
+            "INSERT OR IGNORE INTO filenames (name, hash) SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
             (name_string, name_hash),
         )?;
 
