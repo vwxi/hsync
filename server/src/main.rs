@@ -48,7 +48,7 @@ fn main() {
     let config = Config::parse();
 
     if let Err(e) = run(config) {
-        tracing::error!("{:?}", e);
+        tracing::error!("server error:\n{}", e.backtrace());
     }
 }
 
