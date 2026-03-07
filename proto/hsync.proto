@@ -61,7 +61,7 @@ message Delta {
   }
 
   uint64 size = 1;
-  uint64 namehash = 2;
+  string filename = 2;
   repeated Operation ops = 3;
 }
 
@@ -93,11 +93,15 @@ enum Return {
   RETURN_BLOCK_MISMATCH = 1;
   RETURN_EMPTY_MANIFEST = 2;
   RETURN_FILE_NOT_FOUND = 3;
+  RETURN_BLOCK_NOT_FOUND = 4;
 }
 
 message Packet {
   Return code = 1;
 
+  // no message is interpreted as a heartbeat
+  // the quic framework we are using has a timeout and this is done
+  // so the connection does not die
   oneof message {
     Auth auth = 2;
     Die die = 3;

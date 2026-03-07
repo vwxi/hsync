@@ -38,6 +38,7 @@ pub mod protocol {
     include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
 }
 
+const HEARTBEAT_INTERVAL: u64 = 5;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
 const BLOCK_SIZE: usize = 2048;
@@ -296,6 +297,8 @@ impl Client {
             .ok_or(anyhow::anyhow!("cannot re-encode file path"))?;
 
         Ok(if !path.exists() {
+            tracing::debug!("sending whatis for file {}", filename);
+
             self.send_ch
                 .lock()
                 .await
@@ -333,7 +336,7 @@ impl Client {
             (pathname, hashed_filename),
         )?;
 
-        if let Ok(file) = std::fs::File::open(&pathname) {
+        if let Ok(file) = std::fs::File::open(&path) {
             // TODO: adapt this for subfolders when it gets implemented
             let mut changes: Vec<(u64, u64, u64)> = vec![];
 
@@ -388,6 +391,13 @@ impl Client {
                             chunk.offset + chunk.length as u64,
                             block_hash,
                         ));
+                    } else {
+                        tracing::debug!(
+                            "block exists and does not conflict, {}:[{}, {}]",
+                            existing_hash,
+                            chunk.offset,
+                            chunk.offset + chunk.length as u64
+                        );
                     }
                 } else {
                     tracing::debug!(
@@ -484,7 +494,9 @@ impl Client {
                     .ok_or(anyhow::anyhow!("failed to relay delete event"))??;
             }
             EventMask::CLOSE_WRITE => {
-                let new_timestamp = metadata(dbg!(&filename))?
+                // if this fails, then we are trying to fetch some sort of
+                // swap file
+                let new_timestamp = metadata(&filename)?
                     .accessed()?
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_secs() as i64;
@@ -506,7 +518,7 @@ impl Client {
                 send_ch.as_ref().map(|ch| {
                     ch.send(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
-                        message: Some(protocol::packet::Message::Manifest(dbg!(manifest))),
+                        message: Some(protocol::packet::Message::Manifest(manifest)),
                     })
                 });
             }
@@ -557,7 +569,6 @@ impl Client {
         Ok(())
     }
 
-    /// to be used in tandem with process_files_with_db?
     async fn send_manifest(&mut self) -> anyhow::Result<()> {
         let conn = self.db_pool.get()?;
 
@@ -651,8 +662,8 @@ impl Client {
         // we are receiving data from the server
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            outgoing_lock.entry(dbg!(namehash)).and_modify(|reqs| {
-                if reqs.contains(&dbg!((metadata.start, metadata.end))) {
+            outgoing_lock.entry(namehash).and_modify(|reqs| {
+                if reqs.contains(&(metadata.start, metadata.end)) {
                     if !reqs.remove(&(metadata.start, metadata.end)) {
                         tracing::warn!(
                             "satisfied nonexistent transfer request for {}:[{}, {}]",
@@ -702,8 +713,6 @@ impl Client {
             });
         } else {
             // otherwise, we are fulfilling a data request
-            tracing::debug!("poop12345 salami");
-
             let mut file = std::fs::File::open(&filepath)?;
             file.seek(SeekFrom::Start(metadata.start))?;
 
@@ -819,21 +828,23 @@ impl Client {
     async fn handle_delta(&mut self, delta: protocol::Delta) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
-        let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
-        let filename: String = stmt.query_row([delta.namehash as i64], |row| row.get(0))?;
-
         let folder = self
             .config
             .folder
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
-        let filepath = folder.join(&filename);
+        let filepath = folder.join(&delta.filename);
 
         // we don't have this file yet, we should ask for it
         if !self.maybe_request_file_manifest(&filepath).await? {
-            tracing::debug!("file {} does not exist yet, asking for manifest", filename);
+            tracing::debug!(
+                "file {} does not exist yet, asking for manifest",
+                delta.filename
+            );
             return Ok(());
         }
+
+        let namehash = xxhash_rust::xxh3::xxh3_64(delta.filename.as_bytes()) as i64;
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -846,10 +857,8 @@ impl Client {
                 "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
             )?;
 
-            let existing_hash: Result<i64, _> = stmt.query_row(
-                (delta.namehash as i64, op.start as i64, op.end as i64),
-                |row| row.get(0),
-            );
+            let existing_hash: Result<i64, _> =
+                stmt.query_row((namehash, op.start as i64, op.end as i64), |row| row.get(0));
 
             match op.op_type() {
                 protocol::delta::OpType::Insert => {
@@ -865,7 +874,7 @@ impl Client {
                             // request transfer
                             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
                             outgoing_lock
-                                .entry(delta.namehash as i64)
+                                .entry(namehash)
                                 .and_modify(|o| {
                                     o.insert((op.start, op.end));
                                 })
@@ -887,7 +896,7 @@ impl Client {
                                                 metadata: Some(protocol::BlockMetadata {
                                                     start: op.start,
                                                     end: op.end,
-                                                    namehash: Some(dbg!(delta.namehash)),
+                                                    namehash: Some(namehash as u64),
                                                     hash: op.hash,
                                                 }),
                                                 mode: protocol::DataMode::WholeUnspecified as i32,
@@ -908,7 +917,7 @@ impl Client {
 
                         let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
                         outgoing_lock
-                            .entry(delta.namehash as i64)
+                            .entry(namehash)
                             .and_modify(|o| {
                                 o.insert((op.start, op.end));
                             })
@@ -929,9 +938,9 @@ impl Client {
                                     message: Some(protocol::packet::Message::Transfer(
                                         protocol::Transfer {
                                             metadata: Some(protocol::BlockMetadata {
-                                                start: dbg!(op.start),
-                                                end: dbg!(op.end),
-                                                namehash: Some(dbg!(delta.namehash)),
+                                                start: op.start,
+                                                end: op.end,
+                                                namehash: Some(namehash as u64),
                                                 hash: op.hash,
                                             }),
                                             mode: protocol::DataMode::WholeUnspecified as i32,
@@ -949,7 +958,7 @@ impl Client {
                         // remove block from file and metadata table
                         db.execute("DELETE FROM blocks WHERE file = ?1 AND hash = ?2 AND start = ?3 AND end = ?4",
                             [
-                                delta.namehash as i64,
+                                namehash,
                                 hash,
                                 op.start as i64,
                                 op.end as i64,
@@ -962,7 +971,7 @@ impl Client {
                             "delta: deleting block [{},{}] for file {}",
                             op.start,
                             op.end,
-                            filename
+                            delta.filename
                         );
                     }
                 }
@@ -1145,9 +1154,12 @@ impl Client {
     }
 
     async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
-        let message = packet
-            .message
-            .ok_or(anyhow::anyhow!("empty packet from server"))?;
+        // responded to our heartbeat
+        if packet.message.is_none() {
+            return Ok(());
+        }
+
+        let message = packet.message.unwrap();
 
         match message {
             protocol::packet::Message::RoomInfo(room_info) => {
@@ -1185,6 +1197,14 @@ impl Client {
 
         loop {
             select! {
+                // heartbeat timer
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL)) => {
+                    Self::write_packet(&mut send, &protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: None,
+                    }).await?;
+                },
+
                 // outgoing messages to server
                 Some(m) = recv_ch.recv() => {
                     Self::write_packet(&mut send, &m).await?;
@@ -1192,7 +1212,9 @@ impl Client {
 
                 // events from inotify
                 Some(Ok(event)) = client.stream.next() => {
-                    client.handle_file_event(&mut diff_buffer, &db, event).await?;
+                    if let Err(e) = client.handle_file_event(&mut diff_buffer, &db, event).await {
+                        tracing::error!("inotify event error: {}", e.to_string());
+                    }
                 },
 
                 // incoming messages from server
@@ -1201,7 +1223,11 @@ impl Client {
                 //       or maybe keep a map of (filename, num of ignores) and decrement until 0 and remove
                 pkt = Self::read_packet(&mut recv) => {
                     match pkt? {
-                        Some(pkt) => client.handle_server_event(pkt).await?,
+                        Some(pkt) => {
+                            if let Err(e) = client.handle_server_event(pkt).await {
+                                tracing::error!("server event error: {}", e.backtrace());
+                            }
+                        },
                         None => break,
                     }
                 }

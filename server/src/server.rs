@@ -112,6 +112,10 @@ impl Server {
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(0_u8.into());
 
+        if cfg!(debug_assertions) {
+            transport_config.max_idle_timeout(None);
+        }
+
         // TODO: WE NEED TO ADD HEARTBEATS! ADDING INFINITE TIMEOUT MEANS FUTURES
         //       CAN HOLD SO WE NEED TO ADD A HEARTBEAT MECHANISM
 
@@ -253,6 +257,20 @@ impl Server {
         addr: SocketAddr,
         pkt: protocol::Packet,
     ) -> anyhow::Result<()> {
+        // respond to a heartbeat
+        if pkt.message.is_none() {
+            let streams_lock = self.streams.lock().await;
+            streams_lock
+                .get(&addr)
+                .ok_or(anyhow::anyhow!("could not find stream"))?
+                .send(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: None,
+                })?;
+
+            return Ok(());
+        }
+
         let message = pkt
             .message
             .ok_or(anyhow::anyhow!("why is this happening?"))?;
@@ -280,6 +298,7 @@ impl Server {
         Ok(())
     }
 
+    #[cfg(not(debug_assertions))]
     fn generate_folder_code() -> String {
         let mut rng = rand::rng();
         let mut segments: Vec<String> = Vec::with_capacity(5);
@@ -295,6 +314,11 @@ impl Server {
         }
 
         segments.join("-")
+    }
+
+    #[cfg(debug_assertions)]
+    fn generate_folder_code() -> String {
+        String::from("code")
     }
 
     fn enum_files_from_folder(
@@ -326,7 +350,7 @@ impl Server {
         if let Some(folder_code) = auth.folder {
             // user wants to join a folder and is new
             let mut stmt = db.prepare("SELECT id, password FROM folders WHERE code = ?1")?;
-            dbg!(stmt.query_one([&folder_code], |row| {
+            stmt.query_one([&folder_code], |row| {
                 let (folder_id, folder_pass_hash) =
                     (row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
 
@@ -371,7 +395,7 @@ impl Server {
                     .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
                 Ok(())
-            }))?;
+            })?;
         } else {
             // user wants to create a folder and is new
             stream.send(protocol::Packet {
@@ -697,6 +721,12 @@ impl Server {
         name_hash: i64,
         new_blocks: Vec<(u64, u64, u64)>,
     ) -> anyhow::Result<protocol::Delta> {
+        let filename: String = db.query_one(
+            "SELECT name FROM filenames WHERE folder = ?1 AND namehash = ?2",
+            [folder_id, name_hash],
+            |r| r.get(0),
+        )?;
+
         let old_blocks: Vec<(u64, u64, u64)> = {
             let mut stmt = db.prepare(
                 "SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
@@ -724,7 +754,7 @@ impl Server {
 
         let diff = protocol::Delta {
             size: largest_end_offset,
-            namehash: name_hash as u64,
+            filename,
             ops: similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
                 .iter()
                 .flat_map(|x| x.iter_changes(&old_blocks, &new_blocks))
@@ -833,10 +863,12 @@ impl Server {
                                     return Ok(());
                                 }
 
-                                s.1.send(protocol::Packet {
+                                if let Err(e) = s.1.send(protocol::Packet {
                                     code: protocol::Return::NoneUnspecified as i32,
                                     message: Some(protocol::packet::Message::Delta(delta.clone())),
-                                })?;
+                                }) {
+                                    tracing::error!("delta broadcast error: {}", e.to_string());
+                                }
 
                                 Ok(())
                             })
@@ -868,7 +900,7 @@ impl Server {
                 .send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
-                        metadata: Some(dbg!(metadata)),
+                        metadata: Some(metadata),
                         mode: protocol::DataMode::WholeUnspecified as i32,
                         data: Some(data),
                     })),
