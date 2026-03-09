@@ -37,7 +37,8 @@ message BlockMetadata {
 message FileManifest {
   string filename = 1;
   uint64 timestamp = 2;
-  repeated BlockMetadata blocks = 3;
+  uint64 size = 3;
+  repeated BlockMetadata blocks = 4;
 }
 
 // get the manifest for a file

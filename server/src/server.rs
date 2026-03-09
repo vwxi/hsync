@@ -211,7 +211,7 @@ impl Server {
                     match pkt? {
                         Some(msg) => {
                             if let Err(e) = self.handle_packet(conn.remote_address(), msg).await {
-                                tracing::error!("packet handler: {:?}", e);
+                                tracing::error!("packet handler:\n{}", e.backtrace());
                                 self.handle_die(conn.remote_address(), protocol::Die::default()).await?;
 
                                 break;
@@ -274,6 +274,8 @@ impl Server {
         let message = pkt
             .message
             .ok_or(anyhow::anyhow!("why is this happening?"))?;
+
+        tracing::debug!("p: {:?}", message);
 
         match message {
             protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth).await?,
@@ -490,6 +492,11 @@ impl Server {
         )?;
 
         db.execute("DELETE FROM users WHERE addr = ?1", [addr.to_string()])?;
+
+        let mut streams_lock = self.streams.lock().await;
+        streams_lock
+            .remove(&addr)
+            .ok_or(anyhow::anyhow!("tried to remove non-existant stream"))?;
 
         tracing::debug!("peer {} disconnected", addr);
 
@@ -844,9 +851,16 @@ impl Server {
                     }
 
                     blob.close()?;
+
+                    tracing::debug!(
+                        "got back data for {}:[{}, {}]",
+                        namehash,
+                        metadata.start,
+                        metadata.end
+                    );
                 }
 
-                requests.remove(&(metadata.start, metadata.end));
+                dbg!(requests.remove(&(metadata.start, metadata.end)));
                 if requests.is_empty() {
                     outgoing_lock.remove(&(namehash as i64));
 
@@ -888,23 +902,32 @@ impl Server {
                 ],
                 |r| r.get(0))?;
 
-            let mut data: Vec<u8> = vec![0u8; (metadata.end - metadata.start) as usize];
+            let size_to_read = (metadata.end - metadata.start) as usize;
+            let mut data: Vec<u8> = vec![0u8; size_to_read];
             let mut contents =
                 db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, true)?;
-            contents.seek(std::io::SeekFrom::Start(metadata.start))?;
             contents.read_exact(&mut data)?;
 
-            streams_lock
-                .get_mut(&addr)
-                .ok_or(anyhow::anyhow!("could not get client stream"))?
-                .send(protocol::Packet {
-                    code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
-                        metadata: Some(metadata),
-                        mode: protocol::DataMode::WholeUnspecified as i32,
-                        data: Some(data),
-                    })),
-                })?;
+            dbg!(
+                streams_lock
+                    .get_mut(&addr)
+                    .ok_or(anyhow::anyhow!("could not get client stream"))?
+                    .send(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                            metadata: Some(metadata),
+                            mode: protocol::DataMode::WholeUnspecified as i32,
+                            data: Some(data),
+                        })),
+                    })
+            )?;
+
+            tracing::debug!(
+                "satisfied transfer request for {}:[{}, {}]",
+                namehash,
+                metadata.start,
+                metadata.end
+            );
         }
 
         Ok(())
@@ -915,6 +938,8 @@ impl Server {
         addr: SocketAddr,
         whatis: protocol::WhatIs,
     ) -> anyhow::Result<()> {
+        tracing::debug!("here");
+
         let db = self.db_pool.get()?;
         let mut streams_lock = self.streams.lock().await;
         let stream = streams_lock
@@ -935,12 +960,19 @@ impl Server {
             let mut blocks_stmt =
                 db.prepare("SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2")?;
 
+            let largest_end_offset = db.query_one(
+                "SELECT MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
+                [folder_id, filehash],
+                |r| r.get::<_, i64>(0),
+            )? as u64;
+
             let mut manifest = protocol::FileManifest {
                 filename: whatis.filename,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| rusqlite::Error::UnwindingPanic)?
                     .as_secs(),
+                size: largest_end_offset,
                 blocks: vec![],
             };
 

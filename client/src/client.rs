@@ -39,11 +39,11 @@ pub mod protocol {
 }
 
 const HEARTBEAT_INTERVAL: u64 = 5;
+const CHANGE_TIME_DELTA_THRESHOLD: i64 = 5;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
 const BLOCK_SIZE: usize = 2048;
-const CREATE_FILENAMES_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER, UNIQUE(name, hash))";
+const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER, timestamp INTEGER, UNIQUE(name, hash))";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, UNIQUE(file, start, end, hash))";
 
 /// to be used with --insecure flag
@@ -109,6 +109,7 @@ pub struct Client {
     endpoint: Endpoint,
     send_ch: Mutex<Option<UnboundedSender<protocol::Packet>>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64)>>>,
+    outgoing_manifest_requests: Mutex<HashSet<i64>>,
 }
 
 impl Drop for Client {
@@ -150,9 +151,7 @@ impl Client {
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
 
-            if config.folder.is_some() {
-                Self::process_files_into_db(&folder, &conn)?;
-            }
+            Self::process_files_into_db(&folder, &conn)?;
         }
 
         tracing::info!(
@@ -167,10 +166,7 @@ impl Client {
         let wd = notify.watches().add(
             folder,
             WatchMask::all()
-                & !(WatchMask::ONESHOT
-                    | WatchMask::ACCESS
-                    | WatchMask::OPEN
-                    | WatchMask::CLOSE_NOWRITE),
+                & !(WatchMask::ONESHOT | WatchMask::ACCESS | WatchMask::OPEN | WatchMask::CLOSE),
         )?;
 
         let buf = [0u8; BUF_SIZE];
@@ -209,6 +205,7 @@ impl Client {
             endpoint,
             send_ch: Mutex::new(None),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
+            outgoing_manifest_requests: Mutex::new(HashSet::new()),
         })
     }
 
@@ -250,13 +247,13 @@ impl Client {
         for entry in glob(&folder_glob)? {
             match entry {
                 Ok(path) => {
-                    Self::diff_blocks(
+                    dbg!(Self::check_blocks(
                         &path,
                         std::time::SystemTime::now()
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                             .as_secs() as i64,
                         db,
-                    )?;
+                    ))?;
 
                     tracing::debug!("parsed blocks for file {}", path.to_string_lossy());
                 }
@@ -280,7 +277,7 @@ impl Client {
         let len = match stream.read_u32().await {
             Ok(len) => len,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(dbg!(e.into())),
         };
 
         let mut buf = vec![0u8; len as usize];
@@ -298,6 +295,13 @@ impl Client {
 
         Ok(if !path.exists() {
             tracing::debug!("sending whatis for file {}", filename);
+
+            let hash = xxhash_rust::xxh3::xxh3_64(filename.as_bytes()) as i64;
+
+            if !self.outgoing_manifest_requests.lock().await.insert(hash) {
+                tracing::debug!("we already asked for this manifest");
+                return Ok(false);
+            }
 
             self.send_ch
                 .lock()
@@ -319,8 +323,8 @@ impl Client {
         })
     }
 
-    // check differences in a single file and report back a diff object
-    fn diff_blocks(
+    // check differences in a single file and report back the list of blocks
+    fn check_blocks(
         path: &PathBuf,
         new_timestamp: i64,
         db: &PooledConnection<SqliteConnectionManager>,
@@ -331,12 +335,39 @@ impl Client {
             .ok_or(anyhow::anyhow!("malformed filename"))?;
         let hashed_filename = xxhash_rust::xxh3::xxh3_64(pathname.as_bytes()) as i64;
 
-        db.execute(
-            "INSERT OR IGNORE INTO filenames (name, hash) VALUES (?1, ?2)",
+        tracing::debug!("begin checking blocks for {}", pathname);
+
+        if let Ok(old_timestamp) = db.query_one(
+            "SELECT timestamp FROM filenames WHERE name = ?1 AND hash = ?2",
             (pathname, hashed_filename),
+            |r| r.get::<_, i64>(0),
+        ) {
+            // since inotify does not differentiate between us and any other process
+            // we have to check if the change is older than some threshold because
+            // otherwise it could just be us writing to a file.
+            if dbg!(new_timestamp - old_timestamp) < CHANGE_TIME_DELTA_THRESHOLD {
+                tracing::debug!("change time delta does not exceed threshold, skipping");
+
+                return Ok(vec![]);
+            }
+        }
+
+        db.execute(
+            "INSERT OR IGNORE INTO filenames (name, hash, timestamp) VALUES (?1, ?2, ?3)",
+            (
+                pathname,
+                hashed_filename,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                    .as_secs() as i64,
+            ),
         )?;
 
-        if let Ok(file) = std::fs::File::open(&path) {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(&path)
+        {
             // TODO: adapt this for subfolders when it gets implemented
             let mut changes: Vec<(u64, u64, u64)> = vec![];
 
@@ -349,25 +380,21 @@ impl Client {
             for chunk in chunker {
                 let chunk = chunk?;
 
-                let mut stmt = db.prepare(
-                    "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 LIMIT 1"
-                )?;
+                let block_hash = xxhash_rust::xxh3::xxh3_64(chunk.data.as_slice());
 
-                let existing = stmt.query_row(
+                let ex: Result<i64, _> = db.query_one(
+                    "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 LIMIT 1",
                     (
                         hashed_filename,
                         chunk.offset as i64,
                         (chunk.offset as usize + chunk.length) as i64,
-                        chunk.hash as i64,
+                        block_hash as i64,
                     ),
-                    |row| row.get::<_, i64>(0),
-                );
-
-                let block_hash = xxhash_rust::xxh3::xxh3_64(chunk.data.as_slice());
+                    |r| r.get(0));
 
                 // changes recorded are blocks that change hash
                 // or blocks that do not exist
-                if let Ok(existing_hash) = existing {
+                if let Ok(existing_hash) = dbg!(ex) {
                     if existing_hash != block_hash as i64 {
                         tracing::debug!(
                             "block exists and conflicts, {}:[{}, {}]",
@@ -385,12 +412,6 @@ impl Client {
                                 block_hash as i64,
                             ),
                         )?;
-
-                        changes.push((
-                            chunk.offset,
-                            chunk.offset + chunk.length as u64,
-                            block_hash,
-                        ));
                     } else {
                         tracing::debug!(
                             "block exists and does not conflict, {}:[{}, {}]",
@@ -416,9 +437,9 @@ impl Client {
                             block_hash as i64,
                         ),
                     )?;
-
-                    changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
                 }
+
+                changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
             }
 
             Ok(changes)
@@ -478,7 +499,7 @@ impl Client {
                     })
                     .ok_or(anyhow::anyhow!("failed to relay create event"))??;
             }
-            EventMask::DELETE => {
+            EventMask::DELETE | EventMask::MOVED_TO => {
                 let send_ch = self.send_ch.lock().await;
                 send_ch
                     .as_ref()
@@ -493,20 +514,25 @@ impl Client {
                     })
                     .ok_or(anyhow::anyhow!("failed to relay delete event"))??;
             }
-            EventMask::CLOSE_WRITE => {
-                // if this fails, then we are trying to fetch some sort of
-                // swap file
-                let new_timestamp = metadata(&filename)?
+            EventMask::MODIFY | EventMask::MOVED_FROM => {
+                // if this fails, then we are trying to fetch some sort of swap file
+                let metadata = metadata(&filename)?;
+
+                let new_timestamp = metadata
                     .accessed()?
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_secs() as i64;
 
-                let mut manifest = protocol::FileManifest::default();
                 let send_ch = self.send_ch.lock().await;
 
-                manifest.filename = String::from(event_file);
+                let mut manifest = protocol::FileManifest {
+                    filename: String::from(event_file),
+                    timestamp: new_timestamp as u64,
+                    size: metadata.len(),
+                    blocks: vec![],
+                };
 
-                for change in Self::diff_blocks(&filename, new_timestamp, db)? {
+                for change in dbg!(Self::check_blocks(&filename, new_timestamp, db))? {
                     manifest.blocks.push(protocol::BlockMetadata {
                         start: change.0,
                         end: change.1,
@@ -516,10 +542,10 @@ impl Client {
                 }
 
                 send_ch.as_ref().map(|ch| {
-                    ch.send(protocol::Packet {
+                    dbg!(ch.send(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
-                    })
+                    }))
                 });
             }
             EventMask::DELETE_SELF | EventMask::IGNORED => {
@@ -626,6 +652,8 @@ impl Client {
     }
 
     async fn handle_transfer(&mut self, transfer: protocol::Transfer) -> anyhow::Result<()> {
+        tracing::debug!("handling a transfer!!! handling a transfer!!! ");
+
         let db = self.db_pool.get()?;
         let metadata = transfer
             .metadata
@@ -662,6 +690,8 @@ impl Client {
         // we are receiving data from the server
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            tracing::debug!("contains? {}", outgoing_lock.contains_key(&namehash));
+
             outgoing_lock.entry(namehash).and_modify(|reqs| {
                 if reqs.contains(&(metadata.start, metadata.end)) {
                     if !reqs.remove(&(metadata.start, metadata.end)) {
@@ -671,6 +701,8 @@ impl Client {
                             metadata.start,
                             metadata.end
                         );
+                    } else {
+                        tracing::warn!("bingors");
                     }
 
                     let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
@@ -688,7 +720,7 @@ impl Client {
                     }
 
                     if let Err(e) =
-                        Self::expand_and_write(&mut file, metadata.start, data.as_slice())
+                        Self::expand_and_write(&mut file, dbg!(metadata.start), data.as_slice())
                     {
                         tracing::error!(
                             "failed to write block [{}, {}] to file {}: {}",
@@ -733,6 +765,14 @@ impl Client {
                     })
                 })
                 .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
+
+            tracing::debug!(
+                "fulfilling transfer request for {}:[{}, {}] size {}",
+                metadata.hash,
+                metadata.start,
+                metadata.end,
+                length
+            );
         }
 
         Ok(())
@@ -775,52 +815,20 @@ impl Client {
         Ok(())
     }
 
-    pub fn expand_and_write(
-        file: &mut std::fs::File,
-        offset: u64,
-        data: &[u8],
-    ) -> anyhow::Result<()> {
+    fn expand_and_write(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
 
         let file_len = file.metadata()?.len();
+        let data_len = data.len() as u64;
 
         if offset > file_len {
-            anyhow::bail!("offset is beyond end of file");
-        }
-
-        let n = data.len() as u64;
-        let tail_len = file_len - offset;
-
-        file.set_len(file_len + n)?;
-
-        if tail_len > 0 {
-            let buf_size: u64 = 64 * 1024;
-            let mut buf = vec![0u8; buf_size as usize];
-
-            let mut remaining = tail_len;
-
-            while remaining > 0 {
-                let chunk = std::cmp::min(remaining, buf_size);
-
-                let src = offset + remaining - chunk;
-                let dst = src + n;
-
-                file.seek(SeekFrom::Start(src))?;
-                file.read_exact(&mut buf[..chunk as usize])?;
-
-                file.seek(SeekFrom::Start(dst))?;
-                file.write_all(&buf[..chunk as usize])?;
-
-                remaining -= chunk;
-            }
+            file.set_len(offset + data_len)?;
         }
 
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
-
-        file.sync_all()?;
 
         Ok(())
     }
@@ -1042,6 +1050,8 @@ impl Client {
     async fn handle_manifest(&mut self, manifest: protocol::FileManifest) -> anyhow::Result<()> {
         let send = self.send_ch.lock().await;
 
+        // TODO: SET A HARD LIMIT ON FILE SIZES
+
         if manifest.blocks.is_empty() {
             send.as_ref()
                 .map(|ch| {
@@ -1195,6 +1205,7 @@ impl Client {
             *lock = Some(send_ch);
         }
 
+        // you need to find a way to get this into separate tasks
         loop {
             select! {
                 // heartbeat timer
@@ -1222,8 +1233,10 @@ impl Client {
                 //       maybe increment (stream.next) until we are done updating
                 //       or maybe keep a map of (filename, num of ignores) and decrement until 0 and remove
                 pkt = Self::read_packet(&mut recv) => {
-                    match pkt? {
+                    match dbg!(pkt)? {
                         Some(pkt) => {
+                            tracing::debug!("p: {:?}", pkt);
+
                             if let Err(e) = client.handle_server_event(pkt).await {
                                 tracing::error!("server event error: {}", e.backtrace());
                             }
