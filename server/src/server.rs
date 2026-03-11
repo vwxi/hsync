@@ -32,7 +32,6 @@ pub mod protocol {
 
 const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
-const BLOCK_SIZE: usize = 2048;
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
@@ -274,8 +273,6 @@ impl Server {
         let message = pkt
             .message
             .ok_or(anyhow::anyhow!("why is this happening?"))?;
-
-        tracing::debug!("p: {:?}", message);
 
         match message {
             protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth).await?,
@@ -708,6 +705,17 @@ impl Server {
                 )
             })?;
 
+        let streams_lock = self.streams.lock().await;
+        streams_lock
+            .iter()
+            .map(|s| {
+                s.1.send(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Event(event.clone())),
+                })
+            })
+            .collect::<Result<(), _>>()?;
+
         match event.event() {
             protocol::FileEvent::CreateUnspecified => {
                 self.create_file_entry(&db, folder_id, &event.filename, file_namehash)
@@ -860,7 +868,7 @@ impl Server {
                     );
                 }
 
-                dbg!(requests.remove(&(metadata.start, metadata.end)));
+                requests.remove(&(metadata.start, metadata.end));
                 if requests.is_empty() {
                     outgoing_lock.remove(&(namehash as i64));
 
@@ -888,6 +896,8 @@ impl Server {
                             })
                             .collect::<anyhow::Result<()>>()?;
                     }
+                } else {
+                    tracing::debug!("requests left for {}: {:?}", namehash, requests);
                 }
             }
         } else {
@@ -908,19 +918,17 @@ impl Server {
                 db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, true)?;
             contents.read_exact(&mut data)?;
 
-            dbg!(
-                streams_lock
-                    .get_mut(&addr)
-                    .ok_or(anyhow::anyhow!("could not get client stream"))?
-                    .send(protocol::Packet {
-                        code: protocol::Return::NoneUnspecified as i32,
-                        message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
-                            metadata: Some(metadata),
-                            mode: protocol::DataMode::WholeUnspecified as i32,
-                            data: Some(data),
-                        })),
-                    })
-            )?;
+            streams_lock
+                .get_mut(&addr)
+                .ok_or(anyhow::anyhow!("could not get client stream"))?
+                .send(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                        metadata: Some(metadata),
+                        mode: protocol::DataMode::WholeUnspecified as i32,
+                        data: Some(data),
+                    })),
+                })?;
 
             tracing::debug!(
                 "satisfied transfer request for {}:[{}, {}]",

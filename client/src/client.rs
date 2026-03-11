@@ -24,10 +24,7 @@ use rustls::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
-    sync::{
-        Mutex, MutexGuard,
-        mpsc::{UnboundedSender, unbounded_channel},
-    },
+    sync::{Mutex, MutexGuard, broadcast},
 };
 use tracing::instrument;
 use xxhash_rust;
@@ -42,7 +39,7 @@ const HEARTBEAT_INTERVAL: u64 = 5;
 const CHANGE_TIME_DELTA_THRESHOLD: i64 = 5;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
-const BLOCK_SIZE: usize = 2048;
+const CHAN_SIZE: usize = 1024;
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER, timestamp INTEGER, UNIQUE(name, hash))";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, UNIQUE(file, start, end, hash))";
 
@@ -101,13 +98,19 @@ impl ServerCertVerifier for SkipServerVerification {
     }
 }
 
+#[derive(Debug, Clone)]
+enum Ch {
+    InPacket(protocol::Packet),
+    OutPacket(protocol::Packet),
+    Event(Event<OsString>),
+}
+
 pub struct Client {
     config: Config,
-    stream: EventStream<[u8; BUF_SIZE]>,
     wd: WatchDescriptor,
-    db_pool: Pool<SqliteConnectionManager>,
+    db_pool: Arc<Pool<SqliteConnectionManager>>,
     endpoint: Endpoint,
-    send_ch: Mutex<Option<UnboundedSender<protocol::Packet>>>,
+    send_ch: Option<broadcast::Sender<Ch>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64)>>>,
     outgoing_manifest_requests: Mutex<HashSet<i64>>,
 }
@@ -115,17 +118,15 @@ pub struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         // disconnect from server
-        tokio::task::block_in_place(|| {
-            let send_ch = self.send_ch.blocking_lock();
+        tracing::info!("disconnecting from server");
 
-            send_ch.as_ref().map(|ch| {
-                ch.send(protocol::Packet {
-                    code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Die(protocol::Die {
-                        reason: Some(String::from("disconnecting")),
-                    })),
-                })
-            })
+        self.send_ch.as_ref().map(|ch| {
+            ch.send(Ch::OutPacket(protocol::Packet {
+                code: protocol::Return::NoneUnspecified as i32,
+                message: Some(protocol::packet::Message::Die(protocol::Die {
+                    reason: Some(String::from("disconnecting")),
+                })),
+            }))
         });
 
         self.endpoint
@@ -134,7 +135,7 @@ impl Drop for Client {
 }
 
 impl Client {
-    pub fn new(config: Config) -> anyhow::Result<Client> {
+    pub fn new(config: Config) -> anyhow::Result<(Client, EventStream<[u8; BUF_SIZE]>)> {
         // process all files currently in folder
         let current_folder = PathBuf::from(".");
 
@@ -197,16 +198,18 @@ impl Client {
             quinn::ClientConfig::try_with_platform_verifier()?
         });
 
-        Ok(Client {
-            config,
+        Ok((
+            Client {
+                config,
+                wd,
+                db_pool: Arc::new(db_pool),
+                endpoint,
+                send_ch: None,
+                outgoing_transfer_requests: Mutex::new(HashMap::new()),
+                outgoing_manifest_requests: Mutex::new(HashSet::new()),
+            },
             stream,
-            wd,
-            db_pool,
-            endpoint,
-            send_ch: Mutex::new(None),
-            outgoing_transfer_requests: Mutex::new(HashMap::new()),
-            outgoing_manifest_requests: Mutex::new(HashSet::new()),
-        })
+        ))
     }
 
     /// this function will init the connection
@@ -218,18 +221,6 @@ impl Client {
             .await?;
 
         let (mut send, recv) = conn.open_bi().await?;
-
-        {
-            let pkt = protocol::Packet {
-                code: protocol::Return::NoneUnspecified as i32,
-                message: Some(protocol::packet::Message::Auth(protocol::Auth {
-                    folder: self.config.code.clone(),
-                    password: self.config.password.clone(),
-                })),
-            };
-
-            Self::write_packet(&mut send, &pkt).await?;
-        }
 
         Ok((conn, send, recv))
     }
@@ -247,13 +238,13 @@ impl Client {
         for entry in glob(&folder_glob)? {
             match entry {
                 Ok(path) => {
-                    dbg!(Self::check_blocks(
+                    Self::check_blocks(
                         &path,
                         std::time::SystemTime::now()
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                             .as_secs() as i64,
                         db,
-                    ))?;
+                    )?;
 
                     tracing::debug!("parsed blocks for file {}", path.to_string_lossy());
                 }
@@ -277,7 +268,7 @@ impl Client {
         let len = match stream.read_u32().await {
             Ok(len) => len,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(dbg!(e.into())),
+            Err(e) => return Err(e.into()),
         };
 
         let mut buf = vec![0u8; len as usize];
@@ -286,7 +277,7 @@ impl Client {
         Ok(Some(pkt))
     }
 
-    async fn maybe_request_file_manifest(&mut self, path: &PathBuf) -> anyhow::Result<bool> {
+    async fn maybe_request_file_manifest(&self, path: &PathBuf) -> anyhow::Result<bool> {
         let filename = path
             .file_name()
             .ok_or(anyhow::anyhow!("cannot request a directory object"))?
@@ -304,16 +295,14 @@ impl Client {
             }
 
             self.send_ch
-                .lock()
-                .await
                 .as_ref()
                 .map(|ch| {
-                    ch.send(protocol::Packet {
+                    ch.send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
                             filename: String::from(filename),
                         })),
-                    })
+                    }))
                 })
                 .ok_or(anyhow::anyhow!("could not request file {}", filename))??;
 
@@ -345,10 +334,10 @@ impl Client {
             // since inotify does not differentiate between us and any other process
             // we have to check if the change is older than some threshold because
             // otherwise it could just be us writing to a file.
-            if dbg!(new_timestamp - old_timestamp) < CHANGE_TIME_DELTA_THRESHOLD {
+            if new_timestamp - old_timestamp < CHANGE_TIME_DELTA_THRESHOLD {
                 tracing::debug!("change time delta does not exceed threshold, skipping");
 
-                return Ok(vec![]);
+                anyhow::bail!("change time delta does not exceed threshold, skipping");
             }
         }
 
@@ -357,9 +346,11 @@ impl Client {
             (
                 pathname,
                 hashed_filename,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                    .as_secs() as i64,
+                dbg!(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                        .as_secs() as i64
+                ),
             ),
         )?;
 
@@ -394,14 +385,14 @@ impl Client {
 
                 // changes recorded are blocks that change hash
                 // or blocks that do not exist
-                if let Ok(existing_hash) = dbg!(ex) {
+                if let Ok(existing_hash) = ex {
                     if existing_hash != block_hash as i64 {
-                        tracing::debug!(
-                            "block exists and conflicts, {}:[{}, {}]",
-                            existing_hash,
-                            chunk.offset,
-                            chunk.offset + chunk.length as u64
-                        );
+                        // tracing::debug!(
+                        //     "block exists and conflicts, {}:[{}, {}]",
+                        //     existing_hash,
+                        //     chunk.offset,
+                        //     chunk.offset + chunk.length as u64
+                        // );
 
                         db.execute(
                             "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
@@ -413,12 +404,12 @@ impl Client {
                             ),
                         )?;
                     } else {
-                        tracing::debug!(
-                            "block exists and does not conflict, {}:[{}, {}]",
-                            existing_hash,
-                            chunk.offset,
-                            chunk.offset + chunk.length as u64
-                        );
+                        // tracing::debug!(
+                        //     "block exists and does not conflict, {}:[{}, {}]",
+                        //     existing_hash,
+                        //     chunk.offset,
+                        //     chunk.offset + chunk.length as u64
+                        // );
                     }
                 } else {
                     tracing::debug!(
@@ -459,12 +450,9 @@ impl Client {
         }
     }
 
-    async fn handle_file_event(
-        &mut self,
-        buf: &mut [u8],
-        db: &PooledConnection<SqliteConnectionManager>,
-        event: Event<OsString>,
-    ) -> anyhow::Result<()> {
+    async fn handle_file_event(&mut self, event: Event<OsString>) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+
         let event_file = event
             .name
             .as_ref()
@@ -485,32 +473,30 @@ impl Client {
         //       files in subfolders. we will fix this eventually.
         match event.mask {
             EventMask::CREATE => {
-                let send_ch = self.send_ch.lock().await;
-                send_ch
+                self.send_ch
                     .as_ref()
                     .map(|ch| {
-                        ch.send(protocol::Packet {
+                        ch.send(Ch::OutPacket(protocol::Packet {
                             code: protocol::Return::NoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Event(protocol::Event {
                                 event: protocol::FileEvent::CreateUnspecified as i32,
                                 filename: String::from(event_file),
                             })),
-                        })
+                        }))
                     })
                     .ok_or(anyhow::anyhow!("failed to relay create event"))??;
             }
             EventMask::DELETE | EventMask::MOVED_TO => {
-                let send_ch = self.send_ch.lock().await;
-                send_ch
+                self.send_ch
                     .as_ref()
                     .map(|ch| {
-                        ch.send(protocol::Packet {
+                        ch.send(Ch::OutPacket(protocol::Packet {
                             code: protocol::Return::NoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Event(protocol::Event {
                                 event: protocol::FileEvent::Delete as i32,
                                 filename: String::from(event_file),
                             })),
-                        })
+                        }))
                     })
                     .ok_or(anyhow::anyhow!("failed to relay delete event"))??;
             }
@@ -518,12 +504,9 @@ impl Client {
                 // if this fails, then we are trying to fetch some sort of swap file
                 let metadata = metadata(&filename)?;
 
-                let new_timestamp = metadata
-                    .accessed()?
+                let new_timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?
                     .as_secs() as i64;
-
-                let send_ch = self.send_ch.lock().await;
 
                 let mut manifest = protocol::FileManifest {
                     filename: String::from(event_file),
@@ -532,7 +515,7 @@ impl Client {
                     blocks: vec![],
                 };
 
-                for change in dbg!(Self::check_blocks(&filename, new_timestamp, db))? {
+                for change in Self::check_blocks(&filename, new_timestamp, &db)? {
                     manifest.blocks.push(protocol::BlockMetadata {
                         start: change.0,
                         end: change.1,
@@ -541,8 +524,8 @@ impl Client {
                     });
                 }
 
-                send_ch.as_ref().map(|ch| {
-                    dbg!(ch.send(protocol::Packet {
+                self.send_ch.as_ref().map(|ch| {
+                    ch.send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
                     }))
@@ -563,8 +546,6 @@ impl Client {
 
         let db = self.db_pool.get()?;
         {
-            let send_ch = self.send_ch.lock().await;
-
             for file in room_info.files {
                 let mut stmt = db.prepare("SELECT * FROM filenames WHERE name = ?1")?;
 
@@ -572,24 +553,24 @@ impl Client {
                 if stmt.query_one([file.name.clone()], |_| Ok(())).is_err() {
                     tracing::debug!("file {} does not exist, requesting manifest", file.name);
 
-                    send_ch
+                    self.send_ch
                         .as_ref()
                         .map(|ch| {
-                            ch.send(protocol::Packet {
+                            ch.send(Ch::OutPacket(protocol::Packet {
                                 code: protocol::Return::NoneUnspecified as i32,
                                 message: Some(protocol::packet::Message::Whatis(
                                     protocol::WhatIs {
                                         filename: file.name.clone(),
                                     },
                                 )),
-                            })
+                            }))
                         })
                         .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
                 }
             }
         }
 
-        // get started on syncing
+        // get starting on syncing
         self.send_manifest().await?;
 
         Ok(())
@@ -597,8 +578,6 @@ impl Client {
 
     async fn send_manifest(&mut self) -> anyhow::Result<()> {
         let conn = self.db_pool.get()?;
-
-        let mut send_ch = self.send_ch.lock().await;
 
         let mut query_files = conn.prepare("SELECT DISTINCT file FROM blocks")?;
         let mut files = query_files.query(())?;
@@ -636,11 +615,11 @@ impl Client {
 
             tracing::debug!("sending manifest for file {}", manifest.filename);
 
-            let _ = send_ch.as_mut().map(|ch| {
-                if let Err(e) = ch.send(protocol::Packet {
+            let _ = self.send_ch.as_mut().map(|ch| {
+                if let Err(e) = ch.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
-                }) {
+                })) {
                     anyhow::bail!("failed to send message: {}", e.to_string());
                 }
 
@@ -652,9 +631,8 @@ impl Client {
     }
 
     async fn handle_transfer(&mut self, transfer: protocol::Transfer) -> anyhow::Result<()> {
-        tracing::debug!("handling a transfer!!! handling a transfer!!! ");
-
         let db = self.db_pool.get()?;
+
         let metadata = transfer
             .metadata
             .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
@@ -663,8 +641,10 @@ impl Client {
             .namehash
             .ok_or(anyhow::anyhow!("malformed transfer request"))? as i64;
 
-        let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
-        let filename: String = stmt.query_row([namehash], |row| row.get(0))?;
+        let filename: String = {
+            let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
+            stmt.query_row([namehash], |row| row.get(0))?
+        };
 
         let folder = self
             .config
@@ -680,8 +660,6 @@ impl Client {
             return Ok(());
         }
 
-        let send_ch = self.send_ch.lock().await;
-
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -690,7 +668,6 @@ impl Client {
         // we are receiving data from the server
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            tracing::debug!("contains? {}", outgoing_lock.contains_key(&namehash));
 
             outgoing_lock.entry(namehash).and_modify(|reqs| {
                 if reqs.contains(&(metadata.start, metadata.end)) {
@@ -701,8 +678,6 @@ impl Client {
                             metadata.start,
                             metadata.end
                         );
-                    } else {
-                        tracing::warn!("bingors");
                     }
 
                     let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
@@ -720,7 +695,7 @@ impl Client {
                     }
 
                     if let Err(e) =
-                        Self::expand_and_write(&mut file, dbg!(metadata.start), data.as_slice())
+                        Self::expand_and_write(&mut file, metadata.start, data.as_slice())
                     {
                         tracing::error!(
                             "failed to write block [{}, {}] to file {}: {}",
@@ -752,17 +727,17 @@ impl Client {
             let mut data = vec![0u8; length];
             file.read_exact(&mut data)?;
 
-            send_ch
+            self.send_ch
                 .as_ref()
                 .map(|ch| {
-                    ch.send(protocol::Packet {
+                    ch.send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
                             metadata: Some(metadata),
                             mode: protocol::DataMode::WholeUnspecified as i32,
                             data: Some(data),
                         })),
-                    })
+                    }))
                 })
                 .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
 
@@ -860,13 +835,13 @@ impl Client {
             .open(filepath)?;
 
         for op in delta.ops {
-            // Check if block hash matches existing hash in database
-            let mut stmt = db.prepare(
-                "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
-            )?;
+            let existing_hash: Result<i64, _> = {
+                let mut stmt = db.prepare(
+                    "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
+                )?;
 
-            let existing_hash: Result<i64, _> =
-                stmt.query_row((namehash, op.start as i64, op.end as i64), |row| row.get(0));
+                stmt.query_row((namehash, op.start as i64, op.end as i64), |row| row.get(0))
+            };
 
             match op.op_type() {
                 protocol::delta::OpType::Insert => {
@@ -893,11 +868,9 @@ impl Client {
                                 });
 
                             self.send_ch
-                                .lock()
-                                .await
                                 .as_ref()
                                 .map(|ch| {
-                                    ch.send(protocol::Packet {
+                                    ch.send(Ch::OutPacket(protocol::Packet {
                                         code: protocol::Return::NoneUnspecified as i32,
                                         message: Some(protocol::packet::Message::Transfer(
                                             protocol::Transfer {
@@ -911,7 +884,7 @@ impl Client {
                                                 data: None,
                                             },
                                         )),
-                                    })
+                                    }))
                                 })
                                 .ok_or(anyhow::anyhow!("could not request data transfer"))??;
                         }
@@ -937,11 +910,9 @@ impl Client {
 
                         // request transfer
                         self.send_ch
-                            .lock()
-                            .await
                             .as_ref()
                             .map(|ch| {
-                                ch.send(protocol::Packet {
+                                ch.send(Ch::OutPacket(protocol::Packet {
                                     code: protocol::Return::NoneUnspecified as i32,
                                     message: Some(protocol::packet::Message::Transfer(
                                         protocol::Transfer {
@@ -955,7 +926,7 @@ impl Client {
                                             data: None,
                                         },
                                     )),
-                                })
+                                }))
                             })
                             .ok_or(anyhow::anyhow!("could not request data transfer"))??;
                     }
@@ -998,8 +969,10 @@ impl Client {
         name_hash: i64,
     ) -> anyhow::Result<()> {
         db.execute(
-            "INSERT OR IGNORE INTO filenames (name, hash) SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
-            (name_string, name_hash),
+            "INSERT OR IGNORE INTO filenames (name, hash, timestamp) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
+            (name_string, name_hash, std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                .as_secs() as i64),
         )?;
 
         let _ = std::fs::File::create_new(path);
@@ -1048,19 +1021,18 @@ impl Client {
     }
 
     async fn handle_manifest(&mut self, manifest: protocol::FileManifest) -> anyhow::Result<()> {
-        let send = self.send_ch.lock().await;
-
         // TODO: SET A HARD LIMIT ON FILE SIZES
 
         if manifest.blocks.is_empty() {
-            send.as_ref()
+            self.send_ch
+                .as_ref()
                 .map(|ch| {
-                    ch.send(protocol::Packet {
+                    ch.send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::EmptyManifest as i32,
                         message: Some(protocol::packet::Message::Die(protocol::Die {
                             reason: Some(String::from("sent empty manifest")),
                         })),
-                    })
+                    }))
                 })
                 .ok_or(anyhow::anyhow!("could not send manifest fail message"))??;
 
@@ -1121,9 +1093,10 @@ impl Client {
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
 
-                        send.as_ref()
+                        self.send_ch
+                            .as_ref()
                             .map(|ch| {
-                                ch.send(protocol::Packet {
+                                ch.send(Ch::OutPacket(protocol::Packet {
                                     code: protocol::Return::NoneUnspecified as i32,
                                     message: Some(protocol::packet::Message::Transfer(
                                         protocol::Transfer {
@@ -1132,7 +1105,7 @@ impl Client {
                                             data: None,
                                         },
                                     )),
-                                })
+                                }))
                             })
                             .ok_or(anyhow::anyhow!("could not send transfer request"))??;
 
@@ -1194,58 +1167,110 @@ impl Client {
 
     #[tokio::main]
     pub async fn client_main(config: Config) -> anyhow::Result<()> {
-        let mut client = Self::new(config)?;
-        let (_conn, mut send, mut recv) = client.connect().await?;
-        let (send_ch, mut recv_ch) = unbounded_channel::<protocol::Packet>();
-        let db = client.db_pool.get()?;
-        let mut diff_buffer = [0u8; BLOCK_SIZE];
+        let (mut client_, mut inotify_stream) = Self::new(config)?;
+        let (_, mut send, mut recv) = client_.connect().await?;
 
-        {
-            let mut lock = client.send_ch.lock().await;
-            *lock = Some(send_ch);
-        }
+        let (send_ch, mut recv_ch) = broadcast::channel::<Ch>(CHAN_SIZE);
 
-        // you need to find a way to get this into separate tasks
-        loop {
-            select! {
-                // heartbeat timer
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL)) => {
-                    Self::write_packet(&mut send, &protocol::Packet {
+        client_.send_ch = Some(send_ch.clone());
+
+        let hb_send_ch = send_ch.clone();
+        let in_send_ch = send_ch.clone();
+        let se_send_ch = send_ch.clone();
+
+        let futs = vec![
+            // handle channel thread
+            tokio::spawn(async move {
+                let mut client = client_;
+
+                tracing::debug!("starting channel handler thread");
+
+                // send initial auth packet
+                {
+                    let pkt = protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
-                        message: None,
-                    }).await?;
-                },
+                        message: Some(protocol::packet::Message::Auth(protocol::Auth {
+                            folder: client.config.code.clone(),
+                            password: client.config.password.clone(),
+                        })),
+                    };
 
-                // outgoing messages to server
-                Some(m) = recv_ch.recv() => {
-                    Self::write_packet(&mut send, &m).await?;
-                },
-
-                // events from inotify
-                Some(Ok(event)) = client.stream.next() => {
-                    if let Err(e) = client.handle_file_event(&mut diff_buffer, &db, event).await {
-                        tracing::error!("inotify event error: {}", e.to_string());
+                    if let Err(e) = Self::write_packet(&mut send, &pkt).await {
+                        tracing::error!("could not send auth packet: {}", e.to_string());
+                        return;
                     }
-                },
+                }
 
-                // incoming messages from server
-                // TODO: how do we stop inotify from renotifying us
-                //       maybe increment (stream.next) until we are done updating
-                //       or maybe keep a map of (filename, num of ignores) and decrement until 0 and remove
-                pkt = Self::read_packet(&mut recv) => {
-                    match dbg!(pkt)? {
-                        Some(pkt) => {
-                            tracing::debug!("p: {:?}", pkt);
-
+                loop {
+                    match recv_ch.recv().await {
+                        // packet coming in from the wire
+                        Ok(Ch::InPacket(pkt)) => {
                             if let Err(e) = client.handle_server_event(pkt).await {
                                 tracing::error!("server event error: {}", e.backtrace());
                             }
-                        },
-                        None => break,
+                        }
+
+                        // we have to send this over the wire
+                        Ok(Ch::OutPacket(pkt)) => {
+                            if let Err(e) = Self::write_packet(&mut send, &pkt).await {
+                                tracing::error!("write packet error: {}", e.to_string());
+                            }
+                        }
+
+                        Ok(Ch::Event(ev)) => {
+                            if let Err(e) = client.handle_file_event(ev).await {
+                                tracing::error!("handle event error: {}", e.to_string());
+                            }
+                        }
+
+                        Err(e) => {
+                            tracing::error!("recv queue error: {}", e.to_string());
+                        }
                     }
                 }
-            }
-        }
+            }),
+            // heartbeat thread
+            tokio::spawn(async move {
+                tracing::debug!("starting heartbeat thread");
+
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL)).await;
+
+                    if let Err(e) = hb_send_ch.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: None,
+                    })) {
+                        tracing::error!("heartbeat send error: {}", e.to_string());
+                    }
+                }
+            }),
+            // inotify stream thread
+            tokio::spawn(async move {
+                tracing::debug!("starting inotify stream thread");
+
+                loop {
+                    if let Some(Ok(event)) = inotify_stream.next().await {
+                        if let Err(e) = in_send_ch.send(Ch::Event(event)) {
+                            tracing::error!("inotify send error: {}", e.to_string());
+                        }
+                    }
+                }
+            }),
+            // server event thread
+            tokio::spawn(async move {
+                tracing::debug!("starting server event thread");
+
+                loop {
+                    if let Ok(Some(pkt)) = Self::read_packet(&mut recv).await {
+                        if let Err(e) = se_send_ch.send(Ch::InPacket(pkt)) {
+                            tracing::error!("server event read error: {}", e.to_string());
+                        }
+                    }
+                }
+            }),
+        ];
+
+        futures::future::join_all(futs).await;
 
         Ok(())
     }
