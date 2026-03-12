@@ -24,7 +24,7 @@ use rustls::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
-    sync::{Mutex, MutexGuard, broadcast},
+    sync::{Mutex, MutexGuard, mpsc},
 };
 use tracing::instrument;
 use xxhash_rust;
@@ -39,7 +39,6 @@ const HEARTBEAT_INTERVAL: u64 = 5;
 const CHANGE_TIME_DELTA_THRESHOLD: i64 = 5;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
-const CHAN_SIZE: usize = 1024;
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (name TEXT, hash INTEGER, timestamp INTEGER, UNIQUE(name, hash))";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, UNIQUE(file, start, end, hash))";
 
@@ -110,7 +109,8 @@ pub struct Client {
     wd: WatchDescriptor,
     db_pool: Arc<Pool<SqliteConnectionManager>>,
     endpoint: Endpoint,
-    send_ch: Option<broadcast::Sender<Ch>>,
+    send_ch: Option<mpsc::UnboundedSender<Ch>>,
+    current_accesses: Mutex<HashSet<i64>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64)>>>,
     outgoing_manifest_requests: Mutex<HashSet<i64>>,
 }
@@ -167,7 +167,10 @@ impl Client {
         let wd = notify.watches().add(
             folder,
             WatchMask::all()
-                & !(WatchMask::ONESHOT | WatchMask::ACCESS | WatchMask::OPEN | WatchMask::CLOSE),
+                & !(WatchMask::ONESHOT
+                    | WatchMask::ACCESS
+                    | WatchMask::OPEN
+                    | WatchMask::CLOSE_NOWRITE),
         )?;
 
         let buf = [0u8; BUF_SIZE];
@@ -205,6 +208,7 @@ impl Client {
                 db_pool: Arc::new(db_pool),
                 endpoint,
                 send_ch: None,
+                current_accesses: Mutex::new(HashSet::new()),
                 outgoing_transfer_requests: Mutex::new(HashMap::new()),
                 outgoing_manifest_requests: Mutex::new(HashSet::new()),
             },
@@ -220,7 +224,7 @@ impl Client {
             .connect(self.config.addr, "localhost")?
             .await?;
 
-        let (mut send, recv) = conn.open_bi().await?;
+        let (send, recv) = conn.open_bi().await?;
 
         Ok((conn, send, recv))
     }
@@ -238,13 +242,7 @@ impl Client {
         for entry in glob(&folder_glob)? {
             match entry {
                 Ok(path) => {
-                    Self::check_blocks(
-                        &path,
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                            .as_secs() as i64,
-                        db,
-                    )?;
+                    Self::check_blocks(&path, db)?;
 
                     tracing::debug!("parsed blocks for file {}", path.to_string_lossy());
                 }
@@ -315,7 +313,6 @@ impl Client {
     // check differences in a single file and report back the list of blocks
     fn check_blocks(
         path: &PathBuf,
-        new_timestamp: i64,
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
         let pathname = path
@@ -326,31 +323,14 @@ impl Client {
 
         tracing::debug!("begin checking blocks for {}", pathname);
 
-        if let Ok(old_timestamp) = db.query_one(
-            "SELECT timestamp FROM filenames WHERE name = ?1 AND hash = ?2",
-            (pathname, hashed_filename),
-            |r| r.get::<_, i64>(0),
-        ) {
-            // since inotify does not differentiate between us and any other process
-            // we have to check if the change is older than some threshold because
-            // otherwise it could just be us writing to a file.
-            if new_timestamp - old_timestamp < CHANGE_TIME_DELTA_THRESHOLD {
-                tracing::debug!("change time delta does not exceed threshold, skipping");
-
-                anyhow::bail!("change time delta does not exceed threshold, skipping");
-            }
-        }
-
         db.execute(
             "INSERT OR IGNORE INTO filenames (name, hash, timestamp) VALUES (?1, ?2, ?3)",
             (
                 pathname,
                 hashed_filename,
-                dbg!(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-                        .as_secs() as i64
-                ),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                    .as_secs() as i64,
             ),
         )?;
 
@@ -500,7 +480,24 @@ impl Client {
                     })
                     .ok_or(anyhow::anyhow!("failed to relay delete event"))??;
             }
-            EventMask::MODIFY | EventMask::MOVED_FROM => {
+            EventMask::CLOSE_WRITE => {
+                // if we are currently accessing this, skip
+                let namehash = xxhash_rust::xxh3::xxh3_64(event_file.as_bytes()) as i64;
+                {
+                    let mut accesses_lock = self.current_accesses.lock().await;
+                    let outgoing_lock = self.outgoing_transfer_requests.lock().await;
+
+                    if accesses_lock.contains(&namehash) {
+                        return Ok(());
+                    }
+
+                    if outgoing_lock.contains_key(&namehash) {
+                        return Ok(());
+                    }
+
+                    accesses_lock.insert(namehash);
+                }
+
                 // if this fails, then we are trying to fetch some sort of swap file
                 let metadata = metadata(&filename)?;
 
@@ -515,7 +512,7 @@ impl Client {
                     blocks: vec![],
                 };
 
-                for change in Self::check_blocks(&filename, new_timestamp, &db)? {
+                for change in Self::check_blocks(&filename, &db)? {
                     manifest.blocks.push(protocol::BlockMetadata {
                         start: change.0,
                         end: change.1,
@@ -530,10 +527,17 @@ impl Client {
                         message: Some(protocol::packet::Message::Manifest(manifest)),
                     }))
                 });
+
+                {
+                    let mut accesses_lock = self.current_accesses.lock().await;
+                    accesses_lock.remove(&namehash);
+                }
+
+                tracing::debug!("sending manifest for file {}", event_file);
             }
             EventMask::DELETE_SELF | EventMask::IGNORED => {
                 // destroy client because folder is no longer watchable
-                return Err(anyhow::anyhow!("folder is no longer watchable"));
+                anyhow::bail!("folder is no longer watchable");
             }
             _ => {}
         }
@@ -660,16 +664,11 @@ impl Client {
             return Ok(());
         }
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&filepath)?;
-
         // we are receiving data from the server
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
 
-            outgoing_lock.entry(namehash).and_modify(|reqs| {
+            if let Some(reqs) = outgoing_lock.get_mut(&namehash) {
                 if reqs.contains(&(metadata.start, metadata.end)) {
                     if !reqs.remove(&(metadata.start, metadata.end)) {
                         tracing::warn!(
@@ -683,29 +682,34 @@ impl Client {
                     let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
 
                     if let Err(e) = db.execute(
-                        "INSERT OR IGNORE INTO blocks (hash, start, end) VALUES (?1, ?2, ?3)",
+                        "INSERT INTO blocks (hash, start, end) VALUES (?1, ?2, ?3)",
                         [datahash, metadata.start as i64, metadata.end as i64],
                     ) {
-                        tracing::error!(
+                        anyhow::bail!(
                             "failed to update block metadata in database: {}",
                             e.to_string()
                         );
-
-                        return;
                     }
 
-                    if let Err(e) =
-                        Self::expand_and_write(&mut file, metadata.start, data.as_slice())
+                    // add access to set
                     {
-                        tracing::error!(
+                        let mut accesses_lock = self.current_accesses.lock().await;
+                        accesses_lock.insert(namehash);
+                    }
+
+                    let mut file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&filepath)?;
+
+                    if let Err(e) = Self::apply_block(&mut file, metadata.start, data.as_slice()) {
+                        anyhow::bail!(
                             "failed to write block [{}, {}] to file {}: {}",
                             metadata.start,
                             metadata.end,
                             filepath.to_string_lossy(),
                             e.to_string()
                         );
-
-                        return;
                     }
 
                     tracing::debug!(
@@ -714,13 +718,23 @@ impl Client {
                         metadata.end,
                         filepath.to_string_lossy()
                     );
-                } else {
-                    tracing::error!("damnit");
+
+                    {
+                        let mut accesses_lock = self.current_accesses.lock().await;
+                        accesses_lock.remove(&namehash);
+                    }
+
+                    if reqs.is_empty() {
+                        outgoing_lock.remove(&namehash);
+                    }
                 }
-            });
+            }
         } else {
             // otherwise, we are fulfilling a data request
-            let mut file = std::fs::File::open(&filepath)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(false)
+                .open(&filepath)?;
             file.seek(SeekFrom::Start(metadata.start))?;
 
             let length = (metadata.end - metadata.start) as usize;
@@ -741,13 +755,13 @@ impl Client {
                 })
                 .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
 
-            tracing::debug!(
-                "fulfilling transfer request for {}:[{}, {}] size {}",
-                metadata.hash,
-                metadata.start,
-                metadata.end,
-                length
-            );
+            // tracing::debug!(
+            //     "sending data for {}:[{}, {}] size {}",
+            //     metadata.hash,
+            //     metadata.start,
+            //     metadata.end,
+            //     length
+            // );
         }
 
         Ok(())
@@ -790,7 +804,7 @@ impl Client {
         Ok(())
     }
 
-    fn expand_and_write(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    fn apply_block(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -944,6 +958,11 @@ impl Client {
                             ]
                         )?;
 
+                        {
+                            let mut accesses_lock = self.current_accesses.lock().await;
+                            accesses_lock.insert(namehash);
+                        }
+
                         Self::truncate_range(&mut file, op.start, op.end)?;
 
                         tracing::debug!(
@@ -1074,13 +1093,6 @@ impl Client {
                         "SELECT * FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
                     )?;
 
-                    tracing::debug!(
-                        "checking for block {}:[{}, {}]",
-                        block.hash,
-                        block.start,
-                        block.end
-                    );
-
                     if stmt
                         .query_one(
                             (block.hash as i64, block.start as i64, block.end as i64),
@@ -1170,7 +1182,7 @@ impl Client {
         let (mut client_, mut inotify_stream) = Self::new(config)?;
         let (_, mut send, mut recv) = client_.connect().await?;
 
-        let (send_ch, mut recv_ch) = broadcast::channel::<Ch>(CHAN_SIZE);
+        let (send_ch, mut recv_ch) = mpsc::unbounded_channel::<Ch>();
 
         client_.send_ch = Some(send_ch.clone());
 
@@ -1204,27 +1216,27 @@ impl Client {
                 loop {
                     match recv_ch.recv().await {
                         // packet coming in from the wire
-                        Ok(Ch::InPacket(pkt)) => {
+                        Some(Ch::InPacket(pkt)) => {
                             if let Err(e) = client.handle_server_event(pkt).await {
                                 tracing::error!("server event error: {}", e.backtrace());
                             }
                         }
 
                         // we have to send this over the wire
-                        Ok(Ch::OutPacket(pkt)) => {
+                        Some(Ch::OutPacket(pkt)) => {
                             if let Err(e) = Self::write_packet(&mut send, &pkt).await {
                                 tracing::error!("write packet error: {}", e.to_string());
                             }
                         }
 
-                        Ok(Ch::Event(ev)) => {
+                        Some(Ch::Event(ev)) => {
                             if let Err(e) = client.handle_file_event(ev).await {
                                 tracing::error!("handle event error: {}", e.to_string());
                             }
                         }
 
-                        Err(e) => {
-                            tracing::error!("recv queue error: {}", e.to_string());
+                        None => {
+                            tracing::error!("recv queue error");
                         }
                     }
                 }

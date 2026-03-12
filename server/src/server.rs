@@ -558,13 +558,6 @@ impl Server {
                         "SELECT * FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
                     )?;
 
-                    tracing::debug!(
-                        "checking for block {}:[{}, {}]",
-                        block.hash,
-                        block.start,
-                        block.end
-                    );
-
                     if stmt
                         .query_one(
                             (block.hash as i64, block.start as i64, block.end as i64),
@@ -757,9 +750,6 @@ impl Server {
             .collect::<Result<Vec<_>, _>>()?
         };
 
-        tracing::debug!("blocks: {:?}", old_blocks);
-        tracing::debug!("new_blocks: {:?}", new_blocks);
-
         let largest_end_offset = new_blocks
             .iter()
             .map(|e| e.2)
@@ -778,9 +768,6 @@ impl Server {
                         (x.value().0 as i64, x.value().1 as i64, x.value().2 as i64);
 
                     match x.tag() {
-                        similar::ChangeTag::Insert => {
-                            tracing::debug!("delta insert block {}:[{}, {}]", new_hash, start, end);
-                        }
                         similar::ChangeTag::Delete => {
                             let old_hash = old_blocks
                                 .get(
@@ -790,7 +777,6 @@ impl Server {
                                 .ok_or(anyhow::anyhow!("internal delta fail"))?
                                 .0;
 
-                            tracing::debug!("delta delete block {}:[{}, {}]", old_hash, start, end);
                             db.execute(
                                 "DELETE FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
                                 (old_hash as i64, start, end),
@@ -896,8 +882,6 @@ impl Server {
                             })
                             .collect::<anyhow::Result<()>>()?;
                     }
-                } else {
-                    tracing::debug!("requests left for {}: {:?}", namehash, requests);
                 }
             }
         } else {
@@ -946,8 +930,6 @@ impl Server {
         addr: SocketAddr,
         whatis: protocol::WhatIs,
     ) -> anyhow::Result<()> {
-        tracing::debug!("here");
-
         let db = self.db_pool.get()?;
         let mut streams_lock = self.streams.lock().await;
         let stream = streams_lock
