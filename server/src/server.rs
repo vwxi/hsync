@@ -14,7 +14,6 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::prelude::*;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use rusqlite::MAIN_DB;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -31,20 +30,19 @@ pub mod protocol {
 }
 
 const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+const REFRESH_INTERVAL: u64 = 2;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 
-pub type UserId = u64;
-
 pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     streams: Mutex<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
-    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64)>>>,
+    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64)>>>,
     pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
 
@@ -148,6 +146,12 @@ impl Server {
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
             pending_deltas: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn timestamp() -> anyhow::Result<u64> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+            .as_secs())
     }
 
     pub async fn run(self: &Arc<Self>, span: Span) -> anyhow::Result<()> {
@@ -549,7 +553,9 @@ impl Server {
         }
 
         {
-            let mut set: HashSet<(u64, u64)> = HashSet::new();
+            let mut set: HashSet<(u64, u64, u64)> = HashSet::new();
+            let timestamp = Self::timestamp()?;
+
             manifest
                 .blocks
                 .iter()
@@ -565,7 +571,7 @@ impl Server {
                         )
                         .is_err()
                     {
-                        set.insert((block.start, block.end));
+                        set.insert((block.start, block.end, timestamp));
 
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
@@ -583,14 +589,6 @@ impl Server {
 
                         tracing::debug!(
                             "requesting block [{}, {}] from client for file {}",
-                            block.start,
-                            block.end,
-                            manifest.filename
-                        );
-                    } else {
-                        tracing::debug!(
-                            "do not need block {}:[{}, {}] in file {}",
-                            block.hash,
                             block.start,
                             block.end,
                             manifest.filename
@@ -617,7 +615,7 @@ impl Server {
                 .await?;
 
             let mut pending_lock = self.pending_deltas.lock().await;
-            pending_lock.insert(namehash, delta);
+            pending_lock.insert(namehash, dbg!(delta));
         }
 
         tracing::debug!(
@@ -810,7 +808,7 @@ impl Server {
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
-        let metadata = transfer
+        let mut metadata = transfer
             .metadata
             .ok_or(anyhow::anyhow!("cannot handle transfer with no metadata"))?;
 
@@ -830,7 +828,11 @@ impl Server {
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
             if let Some(requests) = outgoing_lock.get_mut(&(namehash as i64)) {
-                if requests.contains(&(metadata.start, metadata.end)) {
+                if requests
+                    .iter()
+                    .find(|e| e.0 == metadata.start && e.1 == metadata.end)
+                    .is_some()
+                {
                     db.execute(
                         "INSERT INTO blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         (folder_id, namehash as i64, metadata.hash as i64, metadata.start as i64, metadata.end as i64, rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
@@ -854,7 +856,7 @@ impl Server {
                     );
                 }
 
-                requests.remove(&(metadata.start, metadata.end));
+                requests.retain(|e| !(e.0 == metadata.start && e.1 == metadata.end));
                 if requests.is_empty() {
                     outgoing_lock.remove(&(namehash as i64));
 
@@ -886,21 +888,27 @@ impl Server {
             }
         } else {
             // we are getting a request for block data
-            let rowid: i64 = db.query_one(
-                "SELECT ROWID FROM blocks WHERE name = ?1 AND hash = ?2 AND start = ?3 AND end = ?4",
-                [
-                    namehash as i64,
-                    metadata.hash as i64,
-                    metadata.start as i64,
-                    metadata.end as i64
-                ],
-                |r| r.get(0))?;
+            // tracing::debug!(
+            //     "client wants block {}:{}:[{}, {}]",
+            //     namehash,
+            //     metadata.hash,
+            //     metadata.start,
+            //     metadata.end
+            // );
+
+            let res: (i64, i64) = db.query_one(
+                "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3",
+                [namehash as i64, metadata.start as i64, metadata.end as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )?;
 
             let size_to_read = (metadata.end - metadata.start) as usize;
             let mut data: Vec<u8> = vec![0u8; size_to_read];
             let mut contents =
-                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, true)?;
+                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
             contents.read_exact(&mut data)?;
+
+            metadata.hash = res.1 as u64;
 
             streams_lock
                 .get_mut(&addr)
@@ -914,12 +922,12 @@ impl Server {
                     })),
                 })?;
 
-            tracing::debug!(
-                "satisfied transfer request for {}:[{}, {}]",
-                namehash,
-                metadata.start,
-                metadata.end
-            );
+            // tracing::debug!(
+            //     "satisfied transfer request for {}:[{}, {}]",
+            //     namehash,
+            //     metadata.start,
+            //     metadata.end
+            // );
         }
 
         Ok(())
@@ -958,10 +966,7 @@ impl Server {
 
             let mut manifest = protocol::FileManifest {
                 filename: whatis.filename,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| rusqlite::Error::UnwindingPanic)?
-                    .as_secs(),
+                timestamp: Self::timestamp().map_err(|_| rusqlite::Error::UnwindingPanic)?,
                 size: largest_end_offset,
                 blocks: vec![],
             };
@@ -987,6 +992,61 @@ impl Server {
 
             Ok(())
         })?;
+
+        Ok(())
+    }
+
+    async fn check_outgoing_transfers(&mut self) -> anyhow::Result<()> {
+        let current_timestamp = Self::timestamp()?;
+
+        for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
+            let late_requests: Vec<(u64, u64, u64)> = item
+                .extract_if(|e| current_timestamp - e.2 >= REFRESH_INTERVAL)
+                .collect();
+
+            late_requests
+                .iter()
+                .map(|req| {
+                    let metadata = protocol::BlockMetadata {
+                        namehash: Some(*namehash as u64),
+                        start: req.0,
+                        end: req.1,
+                        hash: 0,
+                    };
+
+                    // TODO: this is terrible, fix this
+                    self.streams
+                        .blocking_lock()
+                        .iter()
+                        .map(|stream| {
+                            stream.1.send(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: Some(protocol::packet::Message::Transfer(
+                                    protocol::Transfer {
+                                        metadata: Some(metadata),
+                                        mode: protocol::DataMode::WholeUnspecified as i32,
+                                        data: None,
+                                    },
+                                )),
+                            })?;
+
+                            anyhow::Ok(())
+                        })
+                        .collect::<anyhow::Result<()>>()?;
+
+                    item.insert((req.0, req.1, current_timestamp));
+
+                    tracing::debug!(
+                        "resending transfer request: {}:[{}, {}]",
+                        namehash,
+                        req.0,
+                        req.1
+                    );
+
+                    anyhow::Ok(())
+                })
+                .collect::<anyhow::Result<()>>()?;
+        }
 
         Ok(())
     }
