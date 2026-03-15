@@ -505,18 +505,17 @@ impl Client {
                                 .len()
                         );
                         return Ok(());
+                    } else if let Ok(last_timestamp) = db.query_one(
+                        "SELECT timestamp FROM filenames WHERE hash = ?1",
+                        [namehash],
+                        |r| r.get::<_, i64>(0),
+                    ) {
+                        // don't check blocks if we did this the instant before
+                        if current_timestamp - last_timestamp <= 1 {
+                            tracing::debug!("loop heuristic triggered, skipping check_blocks");
+                            return Ok(());
+                        }
                     }
-                    // else if let Ok(last_timestamp) = db.query_one(
-                    //     "SELECT timestamp FROM filenames WHERE hash = ?1",
-                    //     [namehash],
-                    //     |r| r.get::<_, i64>(0),
-                    // ) {
-                    //     // don't check blocks if we did this the instant before
-                    //     if current_timestamp - last_timestamp <= 1 {
-                    //         tracing::debug!("loop heuristic triggered, skipping check_blocks");
-                    //         return Ok(());
-                    //     }
-                    // }
                 }
 
                 // if this fails, then we are trying to fetch some sort of swap file
@@ -602,24 +601,20 @@ impl Client {
     async fn send_manifest(&mut self) -> anyhow::Result<()> {
         let conn = self.db_pool.get()?;
 
-        let mut query_files = conn.prepare("SELECT DISTINCT file FROM blocks")?;
+        let mut query_files = conn.prepare("SELECT name, hash FROM filenames")?;
         let mut files = query_files.query(())?;
 
         while let Ok(Some(row)) = files.next() {
-            let file_hash = row.get::<_, i64>(0)?;
+            let filename = row.get::<_, String>(0)?;
+            let filehash = row.get::<_, i64>(1)?;
 
             let mut manifest = protocol::FileManifest::default();
 
-            let mut name_stmt = conn.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
-            let _ = name_stmt.query_one([&file_hash], |r| {
-                manifest.filename = r.get::<_, String>(0)?;
-
-                Ok(())
-            })?;
+            manifest.filename = filename;
 
             let mut query_blocks =
                 conn.prepare("SELECT start, end, hash FROM blocks WHERE file = ?1")?;
-            let mut blocks = query_blocks.query([&file_hash])?;
+            let mut blocks = query_blocks.query([&filehash])?;
 
             while let Ok(Some(block)) = blocks.next() {
                 let (start, end, hash) = (
@@ -772,13 +767,13 @@ impl Client {
                 })
                 .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
 
-            // tracing::debug!(
-            //     "sending data for {}:[{}, {}] size {}",
-            //     metadata.hash,
-            //     metadata.start,
-            //     metadata.end,
-            //     length
-            // );
+            tracing::debug!(
+                "sending data for {}:[{}, {}] size {}",
+                metadata.hash,
+                metadata.start,
+                metadata.end,
+                length
+            );
         }
 
         Ok(())
@@ -1320,7 +1315,7 @@ impl Client {
                         // packet coming in from the wire
                         Some(Ch::InPacket(pkt)) => {
                             if let Err(e) = client.handle_server_event(pkt).await {
-                                tracing::error!("server event error: {}", e.to_string());
+                                tracing::error!("server event error: {}", e.backtrace());
                             }
                         }
 

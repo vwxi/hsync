@@ -19,7 +19,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
     sync::{
-        Mutex,
+        Mutex, RwLock,
         mpsc::{UnboundedSender, unbounded_channel},
     },
 };
@@ -48,7 +48,7 @@ pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
-    streams: Mutex<HashMap<SocketAddr, UnboundedSender<Ch>>>,
+    streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64)>>>,
     pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
@@ -120,9 +120,6 @@ impl Server {
             transport_config.max_idle_timeout(None);
         }
 
-        // TODO: WE NEED TO ADD HEARTBEATS! ADDING INFINITE TIMEOUT MEANS FUTURES
-        //       CAN HOLD SO WE NEED TO ADD A HEARTBEAT MECHANISM
-
         let endpoint = quinn::Endpoint::server(server_config, config.bind)?;
 
         tracing::info!("initialized QUIC endpoint at {}", config.bind);
@@ -149,7 +146,7 @@ impl Server {
             config,
             endpoint,
             db_pool: pool,
-            streams: Mutex::new(HashMap::new()),
+            streams: RwLock::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
             pending_deltas: Mutex::new(HashMap::new()),
         })
@@ -209,7 +206,7 @@ impl Server {
         let self_ = self.clone();
 
         {
-            let mut lock = self.streams.lock().await;
+            let mut lock = self.streams.write().await;
             lock.insert(conn.remote_address(), send);
         }
 
@@ -222,16 +219,7 @@ impl Server {
                     match recv.recv().await {
                         Some(Ch::InPacket(pkt)) => {
                             if let Err(e) = self.handle_packet(conn.remote_address(), pkt).await {
-                                tracing::error!("packet handler:\n{}", e.backtrace());
-
-                                if let Err(e) = self
-                                    .handle_die(conn.remote_address(), protocol::Die::default())
-                                    .await
-                                {
-                                    tracing::error!("die error: {}", e.to_string());
-                                }
-
-                                break;
+                                tracing::error!("packet handler: {}", e.to_string());
                             }
                         }
                         Some(Ch::OutPacket(pkt)) => {
@@ -310,7 +298,7 @@ impl Server {
     ) -> anyhow::Result<()> {
         // respond to a heartbeat
         if pkt.message.is_none() {
-            let streams_lock = self.streams.lock().await;
+            let streams_lock = self.streams.read().await;
             streams_lock
                 .get(&addr)
                 .ok_or(anyhow::anyhow!("could not find stream"))?
@@ -393,9 +381,9 @@ impl Server {
         auth: protocol::Auth,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
-        let mut streams_lock = self.streams.lock().await;
+        let streams_lock = self.streams.read().await;
         let stream = streams_lock
-            .get_mut(&addr)
+            .get(&addr)
             .ok_or(anyhow::anyhow!("could not find stream for client"))?;
 
         if let Some(folder_code) = auth.folder {
@@ -542,7 +530,7 @@ impl Server {
 
         db.execute("DELETE FROM users WHERE addr = ?1", [addr.to_string()])?;
 
-        let mut streams_lock = self.streams.lock().await;
+        let mut streams_lock = self.streams.write().await;
         streams_lock
             .remove(&addr)
             .ok_or(anyhow::anyhow!("tried to remove non-existant stream"))?;
@@ -557,9 +545,9 @@ impl Server {
         addr: SocketAddr,
         manifest: protocol::FileManifest,
     ) -> anyhow::Result<()> {
-        let mut streams_lock = self.streams.lock().await;
+        let streams_lock = self.streams.read().await;
         let stream = streams_lock
-            .get_mut(&addr)
+            .get(&addr)
             .ok_or(anyhow::anyhow!("could not find stream for peer"))?;
 
         // reject empty manifests
@@ -597,7 +585,8 @@ impl Server {
                 folder_id
             );
 
-            self.create_file_entry(&db, folder_id, &manifest.filename, namehash)?;
+            self.create_file_entry(folder_id, &manifest.filename, namehash)
+                .await?;
         }
 
         {
@@ -674,27 +663,47 @@ impl Server {
         Ok(())
     }
 
-    fn create_file_entry(
+    async fn create_file_entry(
         self: &Arc<Self>,
-        db: &PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
         name_string: &str,
         name_hash: i64,
     ) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+
         db.execute(
             "INSERT OR REPLACE INTO filenames (folder, name, namehash) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
             (folder_id, name_string, name_hash),
         )?;
 
+        tracing::debug!("propagating create file {}", name_string);
+
+        self.streams
+            .read()
+            .await
+            .iter()
+            .map(|s| {
+                s.1.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Event(protocol::Event {
+                        event: protocol::FileEvent::CreateUnspecified as i32,
+                        filename: String::from(name_string),
+                    })),
+                }))?;
+                anyhow::Ok(())
+            })
+            .collect::<anyhow::Result<()>>()?;
+
         Ok(())
     }
 
-    fn delete_file_entry(
+    async fn delete_file_entry(
         self: &Arc<Self>,
-        db: &PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
         name_hash: i64,
     ) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+
         db.execute(
             "DELETE FROM blocks WHERE folder = ?1 AND name = ?2",
             (folder_id, name_hash),
@@ -706,9 +715,10 @@ impl Server {
             folder_id
         );
 
-        db.execute(
-            "DELETE FROM filenames WHERE folder = ?1 AND namehash = ?2",
+        let filename = db.query_one(
+            "DELETE FROM filenames WHERE folder = ?1 AND namehash = ?2 RETURNING name",
             (folder_id, name_hash),
+            |r| r.get::<_, String>(0),
         )?;
 
         tracing::debug!(
@@ -716,6 +726,24 @@ impl Server {
             name_hash,
             folder_id
         );
+
+        tracing::debug!("propagating delete file {}", filename);
+
+        self.streams
+            .read()
+            .await
+            .iter()
+            .map(|s| {
+                s.1.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Event(protocol::Event {
+                        event: protocol::FileEvent::CreateUnspecified as i32,
+                        filename: filename.clone(),
+                    })),
+                }))?;
+                anyhow::Ok(())
+            })
+            .collect::<anyhow::Result<()>>()?;
 
         Ok(())
     }
@@ -744,7 +772,7 @@ impl Server {
                 )
             })?;
 
-        let streams_lock = self.streams.lock().await;
+        let streams_lock = self.streams.read().await;
         streams_lock
             .iter()
             .map(|s| {
@@ -757,10 +785,11 @@ impl Server {
 
         match event.event() {
             protocol::FileEvent::CreateUnspecified => {
-                self.create_file_entry(&db, folder_id, &event.filename, file_namehash)
+                self.create_file_entry(folder_id, &event.filename, file_namehash)
+                    .await
             }
 
-            protocol::FileEvent::Delete => self.delete_file_entry(&db, folder_id, file_namehash),
+            protocol::FileEvent::Delete => self.delete_file_entry(folder_id, file_namehash).await,
         }?;
 
         Ok(())
@@ -809,6 +838,7 @@ impl Server {
             ops: similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
                 .iter()
                 .flat_map(|x| x.iter_changes(&old_blocks, &new_blocks))
+                .filter(|x| x.tag() != similar::ChangeTag::Equal)
                 .map(|x| {
                     let (new_hash, start, end) =
                         (x.value().0 as i64, x.value().1 as i64, x.value().2 as i64);
@@ -870,7 +900,7 @@ impl Server {
             |row| row.get(0),
         )?;
 
-        let mut streams_lock = self.streams.lock().await;
+        let streams_lock = self.streams.read().await;
 
         // we are getting a response
         if let Some(data) = transfer.data {
@@ -936,13 +966,13 @@ impl Server {
             }
         } else {
             // we are getting a request for block data
-            // tracing::debug!(
-            //     "client wants block {}:{}:[{}, {}]",
-            //     namehash,
-            //     metadata.hash,
-            //     metadata.start,
-            //     metadata.end
-            // );
+            tracing::debug!(
+                "client wants block {}:{}:[{}, {}]",
+                namehash,
+                metadata.hash,
+                metadata.start,
+                metadata.end
+            );
 
             let res: (i64, i64) = db.query_one(
                 "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3",
@@ -959,7 +989,7 @@ impl Server {
             metadata.hash = res.1 as u64;
 
             streams_lock
-                .get_mut(&addr)
+                .get(&addr)
                 .ok_or(anyhow::anyhow!("could not get client stream"))?
                 .send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
@@ -987,9 +1017,9 @@ impl Server {
         whatis: protocol::WhatIs,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
-        let mut streams_lock = self.streams.lock().await;
+        let streams_lock = self.streams.read().await;
         let stream = streams_lock
-            .get_mut(&addr)
+            .get(&addr)
             .ok_or(anyhow::anyhow!("could not find stream for client"))?;
 
         let folder_id: i64 = db.query_row(
@@ -1047,12 +1077,14 @@ impl Server {
     async fn check_outgoing_transfers(self: &Arc<Self>) -> anyhow::Result<()> {
         let current_timestamp = Self::timestamp()?;
 
+        tracing::debug!("checking outgoing transfers...");
+
         for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
             let late_requests: Vec<(u64, u64, u64)> = item
                 .extract_if(|e| current_timestamp - e.2 >= REFRESH_INTERVAL)
                 .collect();
 
-            late_requests
+            dbg!(late_requests)
                 .iter()
                 .map(|req| {
                     let metadata = protocol::BlockMetadata {
@@ -1063,24 +1095,26 @@ impl Server {
                     };
 
                     // TODO: this is terrible, fix this
-                    self.streams
-                        .blocking_lock()
-                        .iter()
-                        .map(|stream| {
-                            stream.1.send(Ch::OutPacket(protocol::Packet {
-                                code: protocol::Return::NoneUnspecified as i32,
-                                message: Some(protocol::packet::Message::Transfer(
-                                    protocol::Transfer {
-                                        metadata: Some(metadata),
-                                        mode: protocol::DataMode::WholeUnspecified as i32,
-                                        data: None,
-                                    },
-                                )),
-                            }))?;
+                    dbg!(tokio::task::block_in_place(|| {
+                        self.streams
+                            .blocking_read()
+                            .iter()
+                            .map(|stream| {
+                                stream.1.send(Ch::OutPacket(protocol::Packet {
+                                    code: protocol::Return::NoneUnspecified as i32,
+                                    message: Some(protocol::packet::Message::Transfer(
+                                        protocol::Transfer {
+                                            metadata: Some(metadata),
+                                            mode: protocol::DataMode::WholeUnspecified as i32,
+                                            data: None,
+                                        },
+                                    )),
+                                }))?;
 
-                            anyhow::Ok(())
-                        })
-                        .collect::<anyhow::Result<()>>()?;
+                                anyhow::Ok(())
+                            })
+                            .collect::<anyhow::Result<()>>()
+                    }))?;
 
                     item.insert((req.0, req.1, current_timestamp));
 
