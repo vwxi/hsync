@@ -37,11 +37,18 @@ const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGE
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 
+#[derive(Debug, Clone)]
+enum Ch {
+    InPacket(protocol::Packet),
+    OutPacket(protocol::Packet),
+    Refresh,
+}
+
 pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
-    streams: Mutex<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
+    streams: Mutex<HashMap<SocketAddr, UnboundedSender<Ch>>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64)>>>,
     pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
@@ -187,7 +194,7 @@ impl Server {
     async fn handle_conn(self: Arc<Self>, conn: quinn::Incoming) -> anyhow::Result<()> {
         let conn = conn.await?;
 
-        let mut stream = match conn.accept_bi().await {
+        let (mut conn_send, mut conn_recv) = match conn.accept_bi().await {
             Ok(s) => {
                 tracing::debug!("accepted bidi stream");
                 s
@@ -195,40 +202,81 @@ impl Server {
             Err(_) => anyhow::bail!("bidi stream could not be accepted"),
         };
 
-        let (send, mut recv) = unbounded_channel::<protocol::Packet>();
+        let (send, mut recv) = unbounded_channel::<Ch>();
+
+        let se_send_ch = send.clone();
+        let rf_send_ch = send.clone();
+        let self_ = self.clone();
 
         {
             let mut lock = self.streams.lock().await;
             lock.insert(conn.remote_address(), send);
         }
 
-        loop {
-            select! {
-                // outgoing messages to client
-                Some(m) = recv.recv() => {
-                    Self::write_packet(&mut stream.0, &m).await?;
-                }
+        let futs = vec![
+            // handle channel thread
+            tokio::spawn(async move {
+                tracing::debug!("starting channel handler thread");
 
-                // incoming from client
-                pkt = Self::read_packet(&mut stream.1) => {
-                    match pkt? {
-                        Some(msg) => {
-                            if let Err(e) = self.handle_packet(conn.remote_address(), msg).await {
+                loop {
+                    match recv.recv().await {
+                        Some(Ch::InPacket(pkt)) => {
+                            if let Err(e) = self.handle_packet(conn.remote_address(), pkt).await {
                                 tracing::error!("packet handler:\n{}", e.backtrace());
-                                self.handle_die(conn.remote_address(), protocol::Die::default()).await?;
+
+                                if let Err(e) = self
+                                    .handle_die(conn.remote_address(), protocol::Die::default())
+                                    .await
+                                {
+                                    tracing::error!("die error: {}", e.to_string());
+                                }
 
                                 break;
                             }
                         }
+                        Some(Ch::OutPacket(pkt)) => {
+                            if let Err(e) = Self::write_packet(&mut conn_send, &pkt).await {
+                                tracing::error!("write to client error: {}", e.to_string());
+                            }
+                        }
+                        Some(Ch::Refresh) => {
+                            if let Err(e) = self_.check_outgoing_transfers().await {
+                                tracing::error!("outgoing transfer check error: {}", e.to_string());
+                            }
+                        }
                         None => {
-                            self.handle_die(conn.remote_address(), protocol::Die::default()).await?;
-
-                            break
-                        },
+                            tracing::error!("recv queue error");
+                        }
                     }
                 }
-            }
-        }
+            }),
+            // client event thread
+            tokio::spawn(async move {
+                tracing::debug!("starting client event thread");
+
+                loop {
+                    if let Ok(Some(pkt)) = Self::read_packet(&mut conn_recv).await {
+                        if let Err(e) = se_send_ch.send(Ch::InPacket(pkt)) {
+                            tracing::error!("client event read error: {}", e.to_string());
+                        }
+                    }
+                }
+            }),
+            // refresh thread
+            tokio::spawn(async move {
+                tracing::debug!("starting refresh thread");
+
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(REFRESH_INTERVAL)).await;
+
+                    if let Err(e) = rf_send_ch.send(Ch::Refresh) {
+                        tracing::error!("refresh error: {}", e.to_string());
+                    }
+                }
+            }),
+        ];
+
+        futures::future::join_all(futs).await;
 
         Ok(())
     }
@@ -266,10 +314,10 @@ impl Server {
             streams_lock
                 .get(&addr)
                 .ok_or(anyhow::anyhow!("could not find stream"))?
-                .send(protocol::Packet {
+                .send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: None,
-                })?;
+                }))?;
 
             return Ok(());
         }
@@ -363,7 +411,7 @@ impl Server {
                 let digest = base16ct::lower::encode_string(&final_hash);
 
                 stream
-                    .send(protocol::Packet {
+                    .send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(if digest == folder_pass_hash {
                             if db
@@ -394,14 +442,14 @@ impl Server {
                                 reason: Some(String::from("auth failure")),
                             })
                         }),
-                    })
+                    }))
                     .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
                 Ok(())
             })?;
         } else {
             // user wants to create a folder and is new
-            stream.send(protocol::Packet {
+            stream.send(Ch::OutPacket(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
                 message: Some(
                     if let Ok((folder_code, folder_id)) = {
@@ -465,7 +513,7 @@ impl Server {
                         })
                     },
                 ),
-            })?;
+            }))?;
         }
         Ok(())
     }
@@ -516,12 +564,12 @@ impl Server {
 
         // reject empty manifests
         if manifest.blocks.is_empty() {
-            stream.send(protocol::Packet {
+            stream.send(Ch::OutPacket(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Die(protocol::Die {
                     reason: Some(String::from("failed to authenticate")),
                 })),
-            })?;
+            }))?;
 
             return Ok(());
         }
@@ -576,7 +624,7 @@ impl Server {
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
 
-                        stream.send(protocol::Packet {
+                        stream.send(Ch::OutPacket(protocol::Packet {
                             code: protocol::Return::NoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Transfer(
                                 protocol::Transfer {
@@ -585,7 +633,7 @@ impl Server {
                                     data: None,
                                 },
                             )),
-                        })?;
+                        }))?;
 
                         tracing::debug!(
                             "requesting block [{}, {}] from client for file {}",
@@ -615,7 +663,7 @@ impl Server {
                 .await?;
 
             let mut pending_lock = self.pending_deltas.lock().await;
-            pending_lock.insert(namehash, dbg!(delta));
+            pending_lock.insert(namehash, delta);
         }
 
         tracing::debug!(
@@ -700,10 +748,10 @@ impl Server {
         streams_lock
             .iter()
             .map(|s| {
-                s.1.send(protocol::Packet {
+                s.1.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(event.clone())),
-                })
+                }))
             })
             .collect::<Result<(), _>>()?;
 
@@ -873,10 +921,10 @@ impl Server {
                                     return Ok(());
                                 }
 
-                                if let Err(e) = s.1.send(protocol::Packet {
+                                if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
                                     code: protocol::Return::NoneUnspecified as i32,
                                     message: Some(protocol::packet::Message::Delta(delta.clone())),
-                                }) {
+                                })) {
                                     tracing::error!("delta broadcast error: {}", e.to_string());
                                 }
 
@@ -913,14 +961,14 @@ impl Server {
             streams_lock
                 .get_mut(&addr)
                 .ok_or(anyhow::anyhow!("could not get client stream"))?
-                .send(protocol::Packet {
+                .send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
                         metadata: Some(metadata),
                         mode: protocol::DataMode::WholeUnspecified as i32,
                         data: Some(data),
                     })),
-                })?;
+                }))?;
 
             // tracing::debug!(
             //     "satisfied transfer request for {}:[{}, {}]",
@@ -984,10 +1032,10 @@ impl Server {
             tracing::debug!("sending manifest for file {}", manifest.filename);
 
             stream
-                .send(protocol::Packet {
+                .send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
-                })
+                }))
                 .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
             Ok(())
@@ -996,7 +1044,7 @@ impl Server {
         Ok(())
     }
 
-    async fn check_outgoing_transfers(&mut self) -> anyhow::Result<()> {
+    async fn check_outgoing_transfers(self: &Arc<Self>) -> anyhow::Result<()> {
         let current_timestamp = Self::timestamp()?;
 
         for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
@@ -1019,7 +1067,7 @@ impl Server {
                         .blocking_lock()
                         .iter()
                         .map(|stream| {
-                            stream.1.send(protocol::Packet {
+                            stream.1.send(Ch::OutPacket(protocol::Packet {
                                 code: protocol::Return::NoneUnspecified as i32,
                                 message: Some(protocol::packet::Message::Transfer(
                                     protocol::Transfer {
@@ -1028,7 +1076,7 @@ impl Server {
                                         data: None,
                                     },
                                 )),
-                            })?;
+                            }))?;
 
                             anyhow::Ok(())
                         })

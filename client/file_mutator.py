@@ -6,7 +6,7 @@ This script randomly mutates files by:
 - Modifying bytes at random offsets
 - Inserting new data at random positions
 - Removing data ranges
-- Adding pauses between operations for realistic synchronization testing
+- Adding constant pauses between operations for realistic synchronization testing
 """
 
 import argparse
@@ -29,7 +29,7 @@ def mutate_byte_range(
         file_path: Path to the file to mutate
         offset: Starting offset in bytes
         length: Number of bytes to mutate
-        pause_between: Pause duration in seconds after mutation
+        pause_between: Constant pause duration in seconds after mutation
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -73,7 +73,7 @@ def insert_data(
         file_path: Path to the file to mutate
         offset: Position to insert data at
         size: Number of bytes to insert
-        pause_between: Pause duration in seconds after insertion
+        pause_between: Constant pause duration in seconds after insertion
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -113,7 +113,7 @@ def remove_data(
         file_path: Path to the file to mutate
         offset: Starting position of data to remove
         size: Number of bytes to remove
-        pause_between: Pause duration in seconds after removal
+        pause_between: Constant pause duration in seconds after removal
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -146,7 +146,7 @@ def remove_data(
 def random_mutations(
     file_path: str,
     num_mutations: int = 10,
-    pause_range: tuple = (0.1, 0.5),
+    pause_between: float = 0.1,
     operation_mix: Optional[dict] = None
 ) -> None:
     """
@@ -155,7 +155,7 @@ def random_mutations(
     Args:
         file_path: Path to the file to mutate
         num_mutations: Number of mutation operations to perform
-        pause_range: Tuple of (min_pause, max_pause) in seconds
+        pause_between: Constant pause duration in seconds between operations
         operation_mix: Dict with 'mutate', 'insert', 'remove' probabilities
                       (defaults to equal distribution)
     """
@@ -178,22 +178,19 @@ def random_mutations(
         # Randomly choose operation
         operation = random.choices(operations, weights=weights, k=1)[0]
         
-        # Random pause between mutations
-        pause = random.uniform(pause_range[0], pause_range[1])
-        
         if operation == 'mutate':
             # Random offset and length
             offset = random.randint(0, file_size - 1)
             length = random.randint(1, min(512, file_size - offset))
             print(f"\n[{i+1}/{num_mutations}] Mutation operation")
-            mutate_byte_range(file_path, offset, length, pause)
+            mutate_byte_range(file_path, offset, length, pause_between)
         
         elif operation == 'insert':
             # Random offset and size
             offset = random.randint(0, file_size)
             size = random.randint(1, 256)
             print(f"\n[{i+1}/{num_mutations}] Insert operation")
-            insert_data(file_path, offset, size, pause)
+            insert_data(file_path, offset, size, pause_between)
         
         elif operation == 'remove':
             # Random offset and size
@@ -202,7 +199,7 @@ def random_mutations(
                 max_remove = file_size - offset
                 size = random.randint(1, min(256, max_remove))
                 print(f"\n[{i+1}/{num_mutations}] Remove operation")
-                remove_data(file_path, offset, size, pause)
+                remove_data(file_path, offset, size, pause_between)
 
 
 def main():
@@ -220,16 +217,10 @@ def main():
         help="Number of mutation operations (default: 10)"
     )
     parser.add_argument(
-        "-m", "--min-pause",
+        "-p", "--pause",
         type=float,
         default=0.1,
-        help="Minimum pause between mutations in seconds (default: 0.1)"
-    )
-    parser.add_argument(
-        "-M", "--max-pause",
-        type=float,
-        default=0.5,
-        help="Maximum pause between mutations in seconds (default: 0.5)"
+        help="Constant pause between mutations in seconds (default: 0.1)"
     )
     parser.add_argument(
         "-s", "--seed",
@@ -272,13 +263,13 @@ def main():
     
     try:
         print(f"Starting {args.mutations} mutations on: {args.file}")
-        print(f"Pause range: {args.min_pause}s - {args.max_pause}s")
+        print(f"Constant pause: {args.pause}s between operations")
         print(f"Operation distribution: {operation_mix}\n")
         
         random_mutations(
             args.file,
             num_mutations=args.mutations,
-            pause_range=(args.min_pause, args.max_pause),
+            pause_between=args.pause,
             operation_mix=operation_mix
         )
         

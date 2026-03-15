@@ -505,17 +505,18 @@ impl Client {
                                 .len()
                         );
                         return Ok(());
-                    } else if let Ok(last_timestamp) = db.query_one(
-                        "SELECT timestamp FROM filenames WHERE hash = ?1",
-                        [namehash],
-                        |r| r.get::<_, i64>(0),
-                    ) {
-                        // don't check blocks if we did this the instant before
-                        if current_timestamp - last_timestamp <= 1 {
-                            tracing::debug!("loop heuristic triggered, skipping check_blocks");
-                            return Ok(());
-                        }
                     }
+                    // else if let Ok(last_timestamp) = db.query_one(
+                    //     "SELECT timestamp FROM filenames WHERE hash = ?1",
+                    //     [namehash],
+                    //     |r| r.get::<_, i64>(0),
+                    // ) {
+                    //     // don't check blocks if we did this the instant before
+                    //     if current_timestamp - last_timestamp <= 1 {
+                    //         tracing::debug!("loop heuristic triggered, skipping check_blocks");
+                    //         return Ok(());
+                    //     }
+                    // }
                 }
 
                 // if this fails, then we are trying to fetch some sort of swap file
