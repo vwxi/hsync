@@ -31,6 +31,7 @@ pub mod protocol {
 
 const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 const REFRESH_INTERVAL: u64 = 2;
+const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
@@ -44,12 +45,18 @@ enum Ch {
     Refresh,
 }
 
+#[derive(Debug)]
+struct IncompleteTransfer {
+    pub transfers: HashSet<(u64, u64, u64, u64)>,
+    pub who: SocketAddr,
+}
+
 pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
-    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64)>>>,
+    outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
     pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
 
@@ -562,6 +569,32 @@ impl Server {
             return Ok(());
         }
 
+        let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
+
+        // if there are transfers from another manifest still pending,
+        // tell the client that they should send back later when it is done
+        {
+            let mut transfers_lock = self.outgoing_transfer_requests.lock().await;
+            if let Some(entry) = transfers_lock.get(&namehash) {
+                if entry.transfers.is_empty() {
+                    transfers_lock.remove(&namehash);
+                } else {
+                    tracing::debug!(
+                        "{} transfers pending on {}, notifying",
+                        entry.transfers.len(),
+                        namehash as u64
+                    );
+
+                    stream.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::TransfersPending as i32,
+                        message: Some(protocol::packet::Message::Manifest(manifest)),
+                    }))?;
+
+                    return Ok(());
+                }
+            }
+        }
+
         let db = self.db_pool.get()?;
 
         let folder_id: i64 = db.query_row(
@@ -576,8 +609,6 @@ impl Server {
             |row| row.get(0),
         )?;
 
-        let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
-
         if !exists_in_db {
             tracing::debug!(
                 "file {} is not part of folder {}, adding",
@@ -590,7 +621,7 @@ impl Server {
         }
 
         {
-            let mut set: HashSet<(u64, u64, u64)> = HashSet::new();
+            let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
             let timestamp = Self::timestamp()?;
 
             manifest
@@ -608,7 +639,7 @@ impl Server {
                         )
                         .is_err()
                     {
-                        set.insert((block.start, block.end, timestamp));
+                        set.insert((block.start, block.end, timestamp, 0));
 
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
@@ -637,7 +668,13 @@ impl Server {
                 .collect::<anyhow::Result<()>>()?;
 
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            outgoing_lock.insert(namehash, set);
+            outgoing_lock.insert(
+                namehash,
+                IncompleteTransfer {
+                    transfers: set,
+                    who: addr,
+                },
+            );
         }
 
         {
@@ -905,8 +942,9 @@ impl Server {
         // we are getting a response
         if let Some(data) = transfer.data {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            if let Some(requests) = outgoing_lock.get_mut(&(namehash as i64)) {
-                if requests
+            if let Some(entry) = outgoing_lock.get_mut(&(namehash as i64)) {
+                if entry
+                    .transfers
                     .iter()
                     .find(|e| e.0 == metadata.start && e.1 == metadata.end)
                     .is_some()
@@ -926,17 +964,40 @@ impl Server {
 
                     blob.close()?;
 
-                    tracing::debug!(
-                        "got back data for {}:[{}, {}]",
-                        namehash,
-                        metadata.start,
-                        metadata.end
-                    );
+                    // tracing::debug!(
+                    //     "got back data for {}:[{}, {}]",
+                    //     namehash,
+                    //     metadata.start,
+                    //     metadata.end
+                    // );
                 }
 
-                requests.retain(|e| !(e.0 == metadata.start && e.1 == metadata.end));
-                if requests.is_empty() {
-                    outgoing_lock.remove(&(namehash as i64));
+                entry
+                    .transfers
+                    .retain(|e| !(e.0 == metadata.start && e.1 == metadata.end));
+                if entry.transfers.is_empty() {
+                    let who = entry.who;
+
+                    let _ = entry;
+
+                    dbg!(
+                        outgoing_lock
+                            .remove(&(namehash as i64))
+                            .ok_or(anyhow::anyhow!("what?"))
+                    )?;
+
+                    // tell peer to send queued manifest again if necessary
+                    streams_lock
+                        .get(&who)
+                        .map(|s| {
+                            s.send(Ch::OutPacket(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: Some(protocol::packet::Message::SendAgain(
+                                    protocol::SendAgain { namehash },
+                                )),
+                            }))
+                        })
+                        .ok_or(anyhow::anyhow!("failed to send sendagain"))??;
 
                     let pending_lock = self.pending_deltas.lock().await;
                     if let Some(delta) = pending_lock.get(&(namehash as i64)) {
@@ -947,7 +1008,7 @@ impl Server {
                         streams_lock
                             .iter()
                             .map(|s| {
-                                if *s.0 == addr {
+                                if *s.0 == who {
                                     return Ok(());
                                 }
 
@@ -966,13 +1027,13 @@ impl Server {
             }
         } else {
             // we are getting a request for block data
-            tracing::debug!(
-                "client wants block {}:{}:[{}, {}]",
-                namehash,
-                metadata.hash,
-                metadata.start,
-                metadata.end
-            );
+            // tracing::debug!(
+            //     "client wants block {}:{}:[{}, {}]",
+            //     namehash,
+            //     metadata.hash,
+            //     metadata.start,
+            //     metadata.end
+            // );
 
             let res: (i64, i64) = db.query_one(
                 "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3",
@@ -1077,16 +1138,26 @@ impl Server {
     async fn check_outgoing_transfers(self: &Arc<Self>) -> anyhow::Result<()> {
         let current_timestamp = Self::timestamp()?;
 
-        tracing::debug!("checking outgoing transfers...");
-
         for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
-            let late_requests: Vec<(u64, u64, u64)> = item
+            let late_requests: Vec<(u64, u64, u64, u64)> = item
+                .transfers
                 .extract_if(|e| current_timestamp - e.2 >= REFRESH_INTERVAL)
                 .collect();
 
-            dbg!(late_requests)
+            late_requests
                 .iter()
                 .map(|req| {
+                    if req.3 + 1 >= REFRESH_ATTEMPTS {
+                        tracing::debug!(
+                            "request for {}:[{}, {}] max attempts reached",
+                            req.0,
+                            req.1,
+                            req.2
+                        );
+
+                        return Ok(());
+                    }
+
                     let metadata = protocol::BlockMetadata {
                         namehash: Some(*namehash as u64),
                         start: req.0,
@@ -1094,13 +1165,12 @@ impl Server {
                         hash: 0,
                     };
 
-                    // TODO: this is terrible, fix this
-                    dbg!(tokio::task::block_in_place(|| {
+                    tokio::task::block_in_place(|| {
                         self.streams
                             .blocking_read()
-                            .iter()
+                            .get(&item.who)
                             .map(|stream| {
-                                stream.1.send(Ch::OutPacket(protocol::Packet {
+                                stream.send(Ch::OutPacket(protocol::Packet {
                                     code: protocol::Return::NoneUnspecified as i32,
                                     message: Some(protocol::packet::Message::Transfer(
                                         protocol::Transfer {
@@ -1113,10 +1183,11 @@ impl Server {
 
                                 anyhow::Ok(())
                             })
-                            .collect::<anyhow::Result<()>>()
-                    }))?;
+                            .ok_or(anyhow::anyhow!("failed to send transfer request"))
+                    })??;
 
-                    item.insert((req.0, req.1, current_timestamp));
+                    item.transfers
+                        .insert((req.0, req.1, current_timestamp, req.3 + 1));
 
                     tracing::debug!(
                         "resending transfer request: {}:[{}, {}]",

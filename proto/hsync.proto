@@ -89,12 +89,17 @@ message Event {
   string filename = 2;
 }
 
+message SendAgain {
+  uint64 namehash = 1;
+}
+
 enum Return {
   RETURN_NONE_UNSPECIFIED = 0;
   RETURN_BLOCK_MISMATCH = 1;
   RETURN_EMPTY_MANIFEST = 2;
   RETURN_FILE_NOT_FOUND = 3;
   RETURN_BLOCK_NOT_FOUND = 4;
+  RETURN_TRANSFERS_PENDING = 5;
 }
 
 message Packet {
@@ -112,5 +117,6 @@ message Packet {
     Event event = 7;
     Delta delta = 8;
     WhatIs whatis = 9;
+    SendAgain send_again = 10;
   }
 }

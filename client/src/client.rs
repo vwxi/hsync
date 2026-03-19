@@ -114,6 +114,7 @@ pub struct Client {
     current_accesses: Mutex<HashSet<i64>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64)>>>,
     outgoing_manifest_requests: Mutex<HashSet<i64>>,
+    queued_manifests: Mutex<HashMap<i64, protocol::FileManifest>>,
 }
 
 impl Drop for Client {
@@ -213,6 +214,7 @@ impl Client {
                 current_accesses: Mutex::new(HashSet::new()),
                 outgoing_transfer_requests: Mutex::new(HashMap::new()),
                 outgoing_manifest_requests: Mutex::new(HashSet::new()),
+                queued_manifests: Mutex::new(HashMap::new()),
             },
             stream,
         ))
@@ -1089,8 +1091,24 @@ impl Client {
         Ok(())
     }
 
-    async fn handle_manifest(&mut self, manifest: protocol::FileManifest) -> anyhow::Result<()> {
+    async fn handle_manifest(
+        &mut self,
+        code: protocol::Return,
+        manifest: protocol::FileManifest,
+    ) -> anyhow::Result<()> {
         // TODO: SET A HARD LIMIT ON FILE SIZES
+
+        let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
+
+        // queue this for later
+        if code == protocol::Return::TransfersPending {
+            tracing::debug!("transfer pending, delay");
+
+            let mut queue_lock = self.queued_manifests.lock().await;
+            queue_lock.insert(namehash, manifest);
+
+            return Ok(());
+        }
 
         if manifest.blocks.is_empty() {
             self.send_ch
@@ -1117,8 +1135,6 @@ impl Client {
                 |row| row.get(0),
             )
             .unwrap_or(false);
-
-        let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
 
         if !exists_in_db {
             tracing::debug!("file {} is not part of folder, adding", manifest.filename);
@@ -1193,12 +1209,30 @@ impl Client {
         Ok(())
     }
 
+    async fn handle_sendagain(&mut self, sendagain: protocol::SendAgain) -> anyhow::Result<()> {
+        // if there's a queued manifest, send it over now
+        let mut queue_lock = self.queued_manifests.lock().await;
+        if let Some(next_manifest) = queue_lock.remove(&(sendagain.namehash as i64)) {
+            tracing::debug!("sending queued manifest for {}", sendagain.namehash);
+
+            self.send_ch.as_ref().map(|ch| {
+                ch.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Manifest(next_manifest)),
+                }))
+            });
+        }
+
+        Ok(())
+    }
+
     async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
         // responded to our heartbeat
         if packet.message.is_none() {
             return Ok(());
         }
 
+        let code = packet.code();
         let message = packet.message.unwrap();
 
         match message {
@@ -1210,11 +1244,17 @@ impl Client {
                 self.handle_ext_file_event(event).await?;
             }
 
-            protocol::packet::Message::Manifest(manifest) => self.handle_manifest(manifest).await?,
+            protocol::packet::Message::Manifest(manifest) => {
+                self.handle_manifest(code, manifest).await?
+            }
 
             protocol::packet::Message::Transfer(transfer) => self.handle_transfer(transfer).await?,
 
             protocol::packet::Message::Delta(delta) => self.handle_delta(delta).await?,
+
+            protocol::packet::Message::SendAgain(sendagain) => {
+                self.handle_sendagain(sendagain).await?
+            }
 
             _ => {}
         }
