@@ -30,7 +30,7 @@ pub mod protocol {
 }
 
 const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-const REFRESH_INTERVAL: u64 = 2;
+const REFRESH_INTERVAL: u64 = 5;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
@@ -40,7 +40,6 @@ const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTE
 
 #[derive(Debug, Clone)]
 enum Ch {
-    InPacket(protocol::Packet),
     OutPacket(protocol::Packet),
     Refresh,
 }
@@ -51,11 +50,18 @@ struct IncompleteTransfer {
     pub who: SocketAddr,
 }
 
+#[derive(Debug)]
+struct Process {
+    pub waiting: HashSet<SocketAddr>,
+    pub origin: SocketAddr,
+}
+
 pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
+    processes: Mutex<HashMap<i64, Process>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
     pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
@@ -154,6 +160,7 @@ impl Server {
             endpoint,
             db_pool: pool,
             streams: RwLock::new(HashMap::new()),
+            processes: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
             pending_deltas: Mutex::new(HashMap::new()),
         })
@@ -208,9 +215,9 @@ impl Server {
 
         let (send, mut recv) = unbounded_channel::<Ch>();
 
-        let se_send_ch = send.clone();
         let rf_send_ch = send.clone();
         let self_ = self.clone();
+        let self2_ = self.clone();
 
         {
             let mut lock = self.streams.write().await;
@@ -224,11 +231,6 @@ impl Server {
 
                 loop {
                     match recv.recv().await {
-                        Some(Ch::InPacket(pkt)) => {
-                            if let Err(e) = self.handle_packet(conn.remote_address(), pkt).await {
-                                tracing::error!("packet handler: {}", e.to_string());
-                            }
-                        }
                         Some(Ch::OutPacket(pkt)) => {
                             if let Err(e) = Self::write_packet(&mut conn_send, &pkt).await {
                                 tracing::error!("write to client error: {}", e.to_string());
@@ -251,8 +253,8 @@ impl Server {
 
                 loop {
                     if let Ok(Some(pkt)) = Self::read_packet(&mut conn_recv).await {
-                        if let Err(e) = se_send_ch.send(Ch::InPacket(pkt)) {
-                            tracing::error!("client event read error: {}", e.to_string());
+                        if let Err(e) = self2_.handle_packet(conn.remote_address(), pkt).await {
+                            tracing::error!("packet handler: {}", e.to_string());
                         }
                     }
                 }
@@ -338,6 +340,8 @@ impl Server {
 
             protocol::packet::Message::Whatis(whatis) => self.handle_whatis(addr, whatis).await?,
 
+            protocol::packet::Message::Done(done) => self.handle_done(addr, done).await?,
+
             _ => {}
         }
 
@@ -380,6 +384,26 @@ impl Server {
             })?
             .filter_map(|r| r.ok())
             .collect::<Vec<protocol::room_info::File>>())
+    }
+
+    async fn handle_done(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        done: protocol::TransferDone,
+    ) -> anyhow::Result<()> {
+        let mut processes_lock = self.processes.lock().await;
+
+        if let Some(p) = processes_lock.get_mut(&(done.namehash as i64)) {
+            tracing::debug!("complete: {} is done with {}", addr, done.namehash);
+            p.waiting.remove(&addr);
+
+            if p.waiting.is_empty() {
+                tracing::info!("file {} is done being processed", done.namehash);
+                processes_lock.remove(&(done.namehash as i64));
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_auth(
@@ -574,24 +598,17 @@ impl Server {
         // if there are transfers from another manifest still pending,
         // tell the client that they should send back later when it is done
         {
-            let mut transfers_lock = self.outgoing_transfer_requests.lock().await;
-            if let Some(entry) = transfers_lock.get(&namehash) {
-                if entry.transfers.is_empty() {
-                    transfers_lock.remove(&namehash);
-                } else {
-                    tracing::debug!(
-                        "{} transfers pending on {}, notifying",
-                        entry.transfers.len(),
-                        namehash as u64
-                    );
+            let deltas_lock = self.pending_deltas.lock().await;
+            if deltas_lock.contains_key(&namehash) {
+                tracing::warn!("already processing {}, notifying", manifest.filename);
+                stream.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::TransfersPending as i32,
+                    message: Some(protocol::packet::Message::Manifest(manifest)),
+                }))?;
 
-                    stream.send(Ch::OutPacket(protocol::Packet {
-                        code: protocol::Return::TransfersPending as i32,
-                        message: Some(protocol::packet::Message::Manifest(manifest)),
-                    }))?;
-
-                    return Ok(());
-                }
+                return Ok(());
+            } else {
+                tracing::warn!("not processing {}, chug on!", manifest.filename);
             }
         }
 
@@ -618,6 +635,54 @@ impl Server {
 
             self.create_file_entry(folder_id, &manifest.filename, namehash)
                 .await?;
+        }
+
+        // are other clients done transferring etc
+        {
+            let mut processes_lock = self.processes.lock().await;
+            if let Some(process) = processes_lock.get_mut(&namehash) {
+                // process is done?
+                if !process.waiting.is_empty() {
+                    tracing::debug!("still processing {}, delay", manifest.filename);
+                    stream.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::TransfersPending as i32,
+                        message: Some(protocol::packet::Message::Manifest(manifest)),
+                    }))?;
+
+                    return Ok(());
+                }
+
+                if process.origin != addr {
+                    tracing::debug!("origin mismatch on {}, delay", manifest.filename);
+                    stream.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::TransfersPending as i32,
+                        message: Some(protocol::packet::Message::Manifest(manifest)),
+                    }))?;
+
+                    return Ok(());
+                }
+            } else {
+                let mut set: HashSet<SocketAddr> = HashSet::new();
+                for a in self.streams.read().await.keys() {
+                    if *a != addr {
+                        set.insert(*a);
+                    }
+                }
+
+                processes_lock.insert(
+                    namehash,
+                    Process {
+                        origin: addr,
+                        waiting: set,
+                    },
+                );
+
+                tracing::debug!(
+                    "start: begin processing {} from {}",
+                    manifest.filename,
+                    addr
+                );
+            }
         }
 
         {
@@ -655,12 +720,12 @@ impl Server {
                             )),
                         }))?;
 
-                        tracing::debug!(
-                            "requesting block [{}, {}] from client for file {}",
-                            block.start,
-                            block.end,
-                            manifest.filename
-                        );
+                        // tracing::debug!(
+                        //     "requesting block [{}, {}] from client for file {}",
+                        //     block.start,
+                        //     block.end,
+                        //     manifest.filename
+                        // );
                     }
 
                     Ok::<(), anyhow::Error>(())
@@ -688,14 +753,11 @@ impl Server {
                 .process_delta(db, folder_id, namehash, new_blocks)
                 .await?;
 
-            let mut pending_lock = self.pending_deltas.lock().await;
-            pending_lock.insert(namehash, delta);
+            let mut deltas_lock = self.pending_deltas.lock().await;
+            deltas_lock.insert(namehash, delta);
         }
 
-        tracing::debug!(
-            "received manifest for file {}. processed delta and now awaiting data blocks",
-            namehash as u64
-        );
+        tracing::debug!("received manifest for file {}", manifest.filename);
 
         Ok(())
     }
@@ -941,6 +1003,14 @@ impl Server {
 
         // we are getting a response
         if let Some(data) = transfer.data {
+            {
+                let hash = xxhash_rust::xxh3::xxh3_64(&data);
+                if hash != metadata.hash {
+                    tracing::debug!("hash mismatch on transfer. skipping");
+                    return Ok(());
+                }
+            }
+
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
             if let Some(entry) = outgoing_lock.get_mut(&(namehash as i64)) {
                 if entry
@@ -975,16 +1045,15 @@ impl Server {
                 entry
                     .transfers
                     .retain(|e| !(e.0 == metadata.start && e.1 == metadata.end));
+
                 if entry.transfers.is_empty() {
                     let who = entry.who;
 
                     let _ = entry;
 
-                    dbg!(
-                        outgoing_lock
-                            .remove(&(namehash as i64))
-                            .ok_or(anyhow::anyhow!("what?"))
-                    )?;
+                    outgoing_lock
+                        .remove(&(namehash as i64))
+                        .ok_or(anyhow::anyhow!("what?"))?;
 
                     // tell peer to send queued manifest again if necessary
                     streams_lock
@@ -999,8 +1068,10 @@ impl Server {
                         })
                         .ok_or(anyhow::anyhow!("failed to send sendagain"))??;
 
-                    let pending_lock = self.pending_deltas.lock().await;
-                    if let Some(delta) = pending_lock.get(&(namehash as i64)) {
+                    tracing::debug!("asking {} to send {} again", who, namehash);
+
+                    let mut deltas_lock = self.pending_deltas.lock().await;
+                    if let Some(delta) = deltas_lock.get(&(namehash as i64)) {
                         tracing::info!(
                             "transfer queue satisfied for file {namehash}. broadcasting delta"
                         );
@@ -1022,6 +1093,8 @@ impl Server {
                                 Ok(())
                             })
                             .collect::<anyhow::Result<()>>()?;
+
+                        deltas_lock.remove(&(namehash as i64));
                     }
                 }
             }
@@ -1035,11 +1108,30 @@ impl Server {
             //     metadata.end
             // );
 
-            let res: (i64, i64) = db.query_one(
+            let res: (i64, i64) = match db.query_one(
                 "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3",
                 [namehash as i64, metadata.start as i64, metadata.end as i64],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )?;
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    streams_lock
+                        .get(&addr)
+                        .ok_or(anyhow::anyhow!("could not get client stream"))?
+                        .send(Ch::OutPacket(protocol::Packet {
+                            code: protocol::Return::BlockNotFound as i32,
+                            message: Some(protocol::packet::Message::Transfer(
+                                protocol::Transfer {
+                                    metadata: Some(metadata),
+                                    mode: protocol::DataMode::WholeUnspecified as i32,
+                                    data: None,
+                                },
+                            )),
+                        }))?;
+
+                    anyhow::bail!("could not find block, {}", e.to_string());
+                }
+            };
 
             let size_to_read = (metadata.end - metadata.start) as usize;
             let mut data: Vec<u8> = vec![0u8; size_to_read];
@@ -1148,12 +1240,12 @@ impl Server {
                 .iter()
                 .map(|req| {
                     if req.3 + 1 >= REFRESH_ATTEMPTS {
-                        tracing::debug!(
-                            "request for {}:[{}, {}] max attempts reached",
-                            req.0,
-                            req.1,
-                            req.2
-                        );
+                        // tracing::debug!(
+                        //     "request for {}:[{}, {}] max attempts reached",
+                        //     req.0,
+                        //     req.1,
+                        //     req.2
+                        // );
 
                         return Ok(());
                     }
@@ -1189,12 +1281,12 @@ impl Server {
                     item.transfers
                         .insert((req.0, req.1, current_timestamp, req.3 + 1));
 
-                    tracing::debug!(
-                        "resending transfer request: {}:[{}, {}]",
-                        namehash,
-                        req.0,
-                        req.1
-                    );
+                    // tracing::debug!(
+                    //     "resending transfer request: {}:[{}, {}]",
+                    //     namehash,
+                    //     req.0,
+                    //     req.1
+                    // );
 
                     anyhow::Ok(())
                 })

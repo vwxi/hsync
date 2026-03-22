@@ -93,6 +93,10 @@ message SendAgain {
   uint64 namehash = 1;
 }
 
+message TransferDone {
+  uint64 namehash = 1;
+}
+
 enum Return {
   RETURN_NONE_UNSPECIFIED = 0;
   RETURN_BLOCK_MISMATCH = 1;
@@ -118,5 +122,6 @@ message Packet {
     Delta delta = 8;
     WhatIs whatis = 9;
     SendAgain send_again = 10;
+    TransferDone done = 11;
   }
 }

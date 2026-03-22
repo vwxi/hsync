@@ -36,7 +36,8 @@ pub mod protocol {
 }
 
 const HEARTBEAT_INTERVAL: u64 = 5;
-const REFRESH_INTERVAL: u64 = 2;
+const REFRESH_INTERVAL: u64 = 5;
+const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (name TEXT PRIMARY KEY, hash INTEGER, timestamp INTEGER, UNIQUE(name, hash))";
@@ -112,7 +113,7 @@ pub struct Client {
     endpoint: Endpoint,
     send_ch: Option<mpsc::UnboundedSender<Ch>>,
     current_accesses: Mutex<HashSet<i64>>,
-    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64)>>>,
+    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64, u64)>>>,
     outgoing_manifest_requests: Mutex<HashSet<i64>>,
     queued_manifests: Mutex<HashMap<i64, protocol::FileManifest>>,
 }
@@ -322,29 +323,29 @@ impl Client {
         })
     }
 
-    // check differences in a single file and report back the list of blocks
+    // modify db and report back the new block list
     fn check_blocks(
         path: &PathBuf,
         current_timestamp: i64,
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
-        let pathname = path
+        let filename = path
             .file_name()
             .and_then(|f| f.to_str())
             .ok_or(anyhow::anyhow!("malformed filename"))?;
-        let hashed_filename = xxhash_rust::xxh3::xxh3_64(pathname.as_bytes()) as i64;
+        let namehash = xxhash_rust::xxh3::xxh3_64(filename.as_bytes()) as i64;
 
-        tracing::debug!("begin checking blocks for {}", pathname);
+        tracing::debug!("begin checking blocks for {}", filename);
 
         db.execute(
             "INSERT INTO filenames (name, hash, timestamp) VALUES (?1, ?2, ?3)
              ON CONFLICT(name) DO UPDATE SET timestamp=excluded.timestamp",
-            (pathname, hashed_filename, current_timestamp),
+            (filename, namehash, current_timestamp),
         )?;
 
         if let Ok(file) = std::fs::File::open(&path) {
             // TODO: adapt this for subfolders when it gets implemented
-            let mut changes: Vec<(u64, u64, u64)> = vec![];
+            let mut blocks: Vec<(u64, u64, u64)> = vec![];
 
             // NOTE: files are addressed in the block store by hash(filename).
             //       if we have files with different filenames but identical content,
@@ -353,76 +354,74 @@ impl Client {
             let chunker = fastcdc::v2020::StreamCDC::new(file, 4096, 16384, 65535);
 
             for chunk in chunker {
-                let chunk = chunk?;
+                let block = chunk?;
 
-                let block_hash = xxhash_rust::xxh3::xxh3_64(chunk.data.as_slice());
+                let block_hash = xxhash_rust::xxh3::xxh3_64(block.data.as_slice());
 
                 let ex: Result<i64, _> = db.query_one(
-                    "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 LIMIT 1",
+                    "SELECT hash FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
                     (
-                        hashed_filename,
-                        chunk.offset as i64,
-                        (chunk.offset as usize + chunk.length) as i64,
-                        block_hash as i64,
+                        namehash,
+                        block.offset as i64,
+                        (block.offset as usize + block.length) as i64,
                     ),
-                    |r| r.get(0));
+                    |r| r.get(0),
+                );
 
-                // changes recorded are blocks that change hash
-                // or blocks that do not exist
                 if let Ok(existing_hash) = ex {
                     if existing_hash != block_hash as i64 {
-                        // tracing::debug!(
-                        //     "block exists and conflicts, {}:[{}, {}]",
-                        //     existing_hash,
-                        //     chunk.offset,
-                        //     chunk.offset + chunk.length as u64
-                        // );
+                        tracing::debug!(
+                            "block exists and conflicts, {}:[{}, {}]",
+                            existing_hash,
+                            block.offset,
+                            block.offset + block.length as u64
+                        );
 
                         db.execute(
                             "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
                             (
-                                hashed_filename,
-                                chunk.offset as i64,
-                                (chunk.offset + chunk.length as u64) as i64,
+                                namehash,
+                                block.offset as i64,
+                                (block.offset + block.length as u64) as i64,
                                 block_hash as i64,
                             ),
                         )?;
                     } else {
-                        // tracing::debug!(
-                        //     "block exists and does not conflict, {}:[{}, {}]",
-                        //     existing_hash,
-                        //     chunk.offset,
-                        //     chunk.offset + chunk.length as u64
-                        // );
+                        tracing::debug!(
+                            "block exists and does not conflict, {}:[{}, {}]",
+                            existing_hash,
+                            block.offset,
+                            block.offset + block.length as u64
+                        );
                     }
                 } else {
                     tracing::debug!(
                         "block is new, {}:[{}, {}]",
                         block_hash,
-                        chunk.offset,
-                        chunk.offset + chunk.length as u64
+                        block.offset,
+                        block.offset + block.length as u64
                     );
 
                     db.execute(
                         "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
                         (
-                            hashed_filename,
-                            chunk.offset as i64,
-                            (chunk.offset + chunk.length as u64) as i64,
+                            namehash,
+                            block.offset as i64,
+                            (block.offset + block.length as u64) as i64,
                             block_hash as i64,
                         ),
                     )?;
                 }
 
-                changes.push((chunk.offset, chunk.offset + chunk.length as u64, block_hash));
+                blocks.push((block.offset, block.offset + block.length as u64, block_hash));
             }
 
-            Ok(changes)
+            Ok(blocks)
         } else {
             let mut stmt = db.prepare("SELECT start, end, hash FROM blocks WHERE file = ?1")?;
 
             Ok(stmt
-                .query([hashed_filename])?
+                .query([namehash])?
                 .map(|r| {
                     Ok((
                         r.get::<_, i64>(0)? as u64,
@@ -491,30 +490,51 @@ impl Client {
                 let current_timestamp = Self::timestamp()? as i64;
 
                 {
-                    let accesses_lock = self.current_accesses.lock().await;
-                    let outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                    let mut accesses_lock = self.current_accesses.lock().await;
+                    let mut transfers_lock = self.outgoing_transfer_requests.lock().await;
 
                     if accesses_lock.contains(&namehash) {
                         tracing::debug!("accessing {} already, skip", event_file);
+                        accesses_lock.remove(&namehash);
+
                         return Ok(());
-                    } else if outgoing_lock.contains_key(&namehash) {
-                        tracing::debug!(
-                            "{} waits on {} transfers already, skip",
-                            event_file,
-                            outgoing_lock
-                                .get(&namehash)
-                                .ok_or(anyhow::anyhow!("wtf"))?
-                                .len()
-                        );
-                        return Ok(());
-                    } else if let Ok(last_timestamp) = db.query_one(
+                    }
+
+                    if let Ok(last_timestamp) = db.query_one(
                         "SELECT timestamp FROM filenames WHERE hash = ?1",
                         [namehash],
                         |r| r.get::<_, i64>(0),
                     ) {
                         // don't check blocks if we did this the instant before
                         if current_timestamp - last_timestamp <= 1 {
-                            tracing::debug!("loop heuristic triggered, skipping check_blocks");
+                            return Ok(());
+                        }
+                    }
+
+                    if let Some(transfers) = transfers_lock.get(&namehash) {
+                        if transfers.is_empty() {
+                            transfers_lock.remove(&namehash);
+                        } else {
+                            let pathname = filename
+                                .file_name()
+                                .and_then(|f| f.to_str())
+                                .ok_or(anyhow::anyhow!("malformed filename"))?;
+
+                            tracing::debug!(
+                                "{} waits on {} transfers already, skip",
+                                event_file,
+                                transfers_lock
+                                    .get(&namehash)
+                                    .ok_or(anyhow::anyhow!("wtf"))?
+                                    .len()
+                            );
+
+                            db.execute(
+                                "INSERT INTO filenames (name, hash, timestamp) VALUES (?1, ?2, ?3)
+                                 ON CONFLICT(name) DO UPDATE SET timestamp=excluded.timestamp",
+                                (pathname, namehash, current_timestamp),
+                            )?;
+
                             return Ok(());
                         }
                     }
@@ -650,16 +670,32 @@ impl Client {
         Ok(())
     }
 
-    async fn handle_transfer(&mut self, transfer: protocol::Transfer) -> anyhow::Result<()> {
+    async fn handle_transfer(
+        &mut self,
+        code: protocol::Return,
+        transfer: protocol::Transfer,
+    ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
-        let metadata = transfer
+        let mut metadata = transfer
             .metadata
             .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
 
         let namehash = metadata
             .namehash
             .ok_or(anyhow::anyhow!("malformed transfer request"))? as i64;
+
+        match code {
+            protocol::Return::BlockMismatch | protocol::Return::BlockNotFound => {
+                let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                if let Some(reqs) = outgoing_lock.get_mut(&namehash) {
+                    reqs.retain(|r| !(r.0 == metadata.start && r.1 == metadata.end));
+                    return Ok(());
+                }
+            }
+
+            _ => {}
+        };
 
         let filename: String = {
             let mut stmt = db.prepare("SELECT name FROM filenames WHERE hash = ?1")?;
@@ -682,6 +718,14 @@ impl Client {
 
         // we are receiving data from the server
         if let Some(data) = transfer.data {
+            {
+                let hash = xxhash_rust::xxh3::xxh3_64(&data);
+                if hash != metadata.hash {
+                    tracing::debug!("hash mismatch on transfer. skipping");
+                    return Ok(());
+                }
+            }
+
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
 
             if let Some(reqs) = outgoing_lock.get_mut(&namehash) {
@@ -695,8 +739,13 @@ impl Client {
                     let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
 
                     if let Err(e) = db.execute(
-                        "INSERT INTO blocks (hash, start, end) VALUES (?1, ?2, ?3)",
-                        [datahash, metadata.start as i64, metadata.end as i64],
+                        "INSERT INTO blocks (hash, start, end, file) VALUES (?1, ?2, ?3, ?4)",
+                        [
+                            datahash,
+                            metadata.start as i64,
+                            metadata.end as i64,
+                            namehash,
+                        ],
                     ) {
                         anyhow::bail!(
                             "failed to update block metadata in database: {}",
@@ -715,6 +764,8 @@ impl Client {
                         .write(true)
                         .open(&filepath)?;
 
+                    let block_hash = xxhash_rust::xxh3::xxh3_64(data.as_slice());
+
                     if let Err(e) = Self::apply_block(&mut file, metadata.start, data.as_slice()) {
                         anyhow::bail!(
                             "failed to write block [{}, {}] to file {}: {}",
@@ -726,20 +777,30 @@ impl Client {
                     }
 
                     tracing::debug!(
-                        "applied block [{}, {}] to file {}",
+                        "applied block [{}, {}] to file {}, {}",
                         metadata.start,
                         metadata.end,
-                        filepath.to_string_lossy()
+                        filepath.to_string_lossy(),
+                        block_hash as i64,
                     );
-
-                    {
-                        let mut accesses_lock = self.current_accesses.lock().await;
-                        accesses_lock.remove(&namehash);
-                    }
 
                     if reqs.is_empty() {
                         tracing::debug!("removing outgoing");
                         outgoing_lock.remove(&namehash);
+
+                        self.send_ch
+                            .as_ref()
+                            .map(|ch| {
+                                ch.send(Ch::OutPacket(protocol::Packet {
+                                    code: protocol::Return::NoneUnspecified as i32,
+                                    message: Some(protocol::packet::Message::Done(
+                                        protocol::TransferDone {
+                                            namehash: namehash as u64,
+                                        },
+                                    )),
+                                }))
+                            })
+                            .ok_or(anyhow::anyhow!("failed to send done signal"))??;
                     }
                 }
             }
@@ -755,6 +816,8 @@ impl Client {
             let mut data = vec![0u8; length];
             file.read_exact(&mut data)?;
 
+            metadata.hash = xxhash_rust::xxh3::xxh3_64(&data);
+
             self.send_ch
                 .as_ref()
                 .map(|ch| {
@@ -769,13 +832,13 @@ impl Client {
                 })
                 .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
 
-            tracing::debug!(
-                "sending data for {}:[{}, {}] size {}",
-                metadata.hash,
-                metadata.start,
-                metadata.end,
-                length
-            );
+            // tracing::debug!(
+            //     "sending data for {}:[{}, {}] size {}",
+            //     metadata.hash,
+            //     metadata.start,
+            //     metadata.end,
+            //     length
+            // );
         }
 
         Ok(())
@@ -797,27 +860,32 @@ impl Client {
             return Ok(());
         }
 
-        // zero out block
         tracing::debug!("true range [{}, {}]", start, end);
-        let range = end - start;
-        let zeroes = vec![0u8; range as usize];
-        file.write_all_at(&zeroes, start)?;
 
-        // copy blocks at the end
-        let mut block = vec![0u8; 1024];
-        let mut read = 0usize;
-        file.seek(SeekFrom::Start(start))?;
-
-        while file.stream_position()? <= file_len && read <= range as usize {
-            let sz = file.read(&mut block)?;
-            file.write_all_at(&block, start + read as u64)?;
-
-            read += sz;
+        // If we're truncating at the end, we can just resize.
+        if end == file_len {
+            file.set_len(start)?;
+            file.sync_all()?;
+            return Ok(());
         }
 
-        // resize file
-        file.set_len(dbg!(file_len - range))?;
+        let range_len = end - start;
+        let mut buf = vec![0u8; 1024];
 
+        file.seek(SeekFrom::Start(end))?;
+        let mut write_pos = start;
+
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+
+            file.write_all_at(&buf[..n], write_pos)?;
+            write_pos += n as u64;
+        }
+
+        file.set_len(file_len - range_len)?;
         file.sync_all()?;
 
         Ok(())
@@ -829,10 +897,33 @@ impl Client {
         }
 
         let file_len = file.metadata()?.len();
-        let data_len = data.len() as u64;
+        let insert_len = data.len() as u64;
 
         if offset > file_len {
-            file.set_len(offset + data_len)?;
+            file.set_len(offset)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(data)?;
+            file.sync_all()?;
+            return Ok(());
+        }
+
+        let new_len = file_len
+            .checked_add(insert_len)
+            .ok_or_else(|| anyhow::anyhow!("file size overflow"))?;
+        file.set_len(new_len)?;
+
+        let mut buffer = vec![0u8; 8192];
+        let mut read_pos = file_len;
+
+        while read_pos > offset {
+            let chunk_size = std::cmp::min(read_pos - offset, buffer.len() as u64) as usize;
+            read_pos -= chunk_size as u64;
+
+            file.seek(SeekFrom::Start(read_pos))?;
+            file.read_exact(&mut buffer[..chunk_size])?;
+
+            file.seek(SeekFrom::Start(read_pos + insert_len))?;
+            file.write_all(&buffer[..chunk_size])?;
         }
 
         file.seek(SeekFrom::Start(offset))?;
@@ -842,7 +933,7 @@ impl Client {
         Ok(())
     }
 
-    async fn handle_delta(&mut self, delta: protocol::Delta) -> anyhow::Result<()> {
+    async fn handle_delta(&mut self, mut delta: protocol::Delta) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
         let folder = self
@@ -867,6 +958,19 @@ impl Client {
             .read(true)
             .write(true)
             .open(filepath)?;
+
+        // inserts should be sorted by starts ascending
+        // deletes should be sorted by starts descending
+        delta.ops.sort_by(|a, b| match (a.op_type(), b.op_type()) {
+            (protocol::delta::OpType::Delete, protocol::delta::OpType::Delete) => {
+                a.start.cmp(&b.start).reverse()
+            }
+            (protocol::delta::OpType::Insert, protocol::delta::OpType::Delete)
+            | (protocol::delta::OpType::Delete, protocol::delta::OpType::Insert) => {
+                std::cmp::Ordering::Equal
+            }
+            _ => a.start.cmp(&b.start),
+        });
 
         for op in dbg!(delta.ops) {
             let existing_hash: Result<i64, _> = {
@@ -895,11 +999,11 @@ impl Client {
                             outgoing_lock
                                 .entry(namehash)
                                 .and_modify(|o| {
-                                    o.insert((op.start, op.end, timestamp));
+                                    o.insert((op.start, op.end, timestamp, 0));
                                 })
                                 .or_insert_with(|| {
-                                    let mut set: HashSet<(u64, u64, u64)> = HashSet::new();
-                                    set.insert((op.start, op.end, timestamp));
+                                    let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
+                                    set.insert((op.start, op.end, timestamp, 0));
                                     set
                                 });
 
@@ -938,11 +1042,11 @@ impl Client {
                         outgoing_lock
                             .entry(namehash)
                             .and_modify(|o| {
-                                o.insert((op.start, op.end, timestamp));
+                                o.insert((op.start, op.end, timestamp, 0));
                             })
                             .or_insert_with(|| {
-                                let mut set: HashSet<(u64, u64, u64)> = HashSet::new();
-                                set.insert((op.start, op.end, timestamp));
+                                let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
+                                set.insert((op.start, op.end, timestamp, 0));
                                 set
                             });
 
@@ -988,11 +1092,6 @@ impl Client {
                         }
 
                         Self::truncate_range(&mut file, op.start, op.end)?;
-
-                        {
-                            let mut accesses_lock = self.current_accesses.lock().await;
-                            accesses_lock.remove(&namehash);
-                        }
 
                         tracing::debug!(
                             "delta: deleting block [{},{}] for file {}",
@@ -1143,7 +1242,7 @@ impl Client {
         }
 
         {
-            let mut set: HashSet<(u64, u64, u64)> = HashSet::new();
+            let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
             let timestamp = Self::timestamp()?;
 
             manifest
@@ -1161,7 +1260,7 @@ impl Client {
                         )
                         .is_err()
                     {
-                        set.insert((block.start, block.end, timestamp));
+                        set.insert((block.start, block.end, timestamp, 0));
 
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
@@ -1213,7 +1312,7 @@ impl Client {
         // if there's a queued manifest, send it over now
         let mut queue_lock = self.queued_manifests.lock().await;
         if let Some(next_manifest) = queue_lock.remove(&(sendagain.namehash as i64)) {
-            tracing::debug!("sending queued manifest for {}", sendagain.namehash);
+            tracing::warn!("sending queued manifest for {}", sendagain.namehash);
 
             self.send_ch.as_ref().map(|ch| {
                 ch.send(Ch::OutPacket(protocol::Packet {
@@ -1248,7 +1347,9 @@ impl Client {
                 self.handle_manifest(code, manifest).await?
             }
 
-            protocol::packet::Message::Transfer(transfer) => self.handle_transfer(transfer).await?,
+            protocol::packet::Message::Transfer(transfer) => {
+                self.handle_transfer(code, transfer).await?
+            }
 
             protocol::packet::Message::Delta(delta) => self.handle_delta(delta).await?,
 
@@ -1266,13 +1367,24 @@ impl Client {
         let current_timestamp = Self::timestamp()?;
 
         for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
-            let late_requests: Vec<(u64, u64, u64)> = item
+            let late_requests: Vec<(u64, u64, u64, u64)> = item
                 .extract_if(|e| current_timestamp - e.2 >= REFRESH_INTERVAL)
                 .collect();
 
             late_requests
                 .iter()
                 .map(|req| {
+                    if req.3 + 1 >= REFRESH_ATTEMPTS {
+                        tracing::debug!(
+                            "request for {}:[{}, {}] max attempts reached",
+                            req.0,
+                            req.1,
+                            req.2
+                        );
+
+                        return Ok(());
+                    }
+
                     let metadata = protocol::BlockMetadata {
                         namehash: Some(*namehash as u64),
                         start: req.0,
@@ -1296,7 +1408,7 @@ impl Client {
                         })
                         .ok_or(anyhow::anyhow!("could not send transfer request"))??;
 
-                    item.insert((req.0, req.1, current_timestamp));
+                    item.insert((req.0, req.1, current_timestamp, req.3 + 1));
 
                     tracing::debug!(
                         "resending transfer request: {}:[{}, {}]",
@@ -1362,7 +1474,7 @@ impl Client {
                         // we have to send this over the wire
                         Some(Ch::OutPacket(pkt)) => {
                             if let Err(e) = Self::write_packet(&mut send, &pkt).await {
-                                tracing::error!("write packet error: {}", e.to_string());
+                                tracing::error!("write packet error: {}", e.backtrace());
                             }
                         }
 
