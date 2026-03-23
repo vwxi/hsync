@@ -42,6 +42,7 @@ const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (name TEXT PRIMARY KEY, hash INTEGER, timestamp INTEGER, UNIQUE(name, hash))";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, UNIQUE(file, start, end, hash))";
+const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, contents BLOB, UNIQUE(file, start, end, hash, cookie))";
 
 /// to be used with --insecure flag
 #[derive(Debug)]
@@ -154,6 +155,7 @@ impl Client {
             let conn = db_pool.get()?;
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
+            conn.execute(CREATE_JOURNAL_STMT, ())?;
 
             Self::process_files_into_db(&folder, &conn)?;
         }
@@ -255,7 +257,7 @@ impl Client {
         for entry in glob(&folder_glob)? {
             match entry {
                 Ok(path) => {
-                    Self::check_blocks(&path, current_timestamp, db)?;
+                    Self::process_change_get_blocks(&path, current_timestamp, None, db)?;
 
                     tracing::debug!("parsed blocks for file {}", path.to_string_lossy());
                 }
@@ -323,10 +325,51 @@ impl Client {
         })
     }
 
+    // we store the block to be transferred later
+    fn journal_block(
+        db: &PooledConnection<SqliteConnectionManager>,
+        namehash: i64,
+        start: i64,
+        end: i64,
+        cookie: Option<i64>,
+        data: &[u8],
+        hash: i64,
+    ) -> anyhow::Result<()> {
+        if let Some(cookie) = cookie {
+            db.execute(
+            "INSERT OR IGNORE INTO journal (file, start, end, hash, cookie, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                namehash,
+                start,
+                end,
+                hash,
+                cookie,
+                rusqlite::blob::ZeroBlob((end - start) as i32)
+            ),
+        )?;
+
+            let rowid = db.last_insert_rowid();
+            let mut blob = db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
+
+            if blob.write(&data)? != data.len() {
+                anyhow::bail!("did not write full block to database");
+            }
+
+            blob.close()?;
+        } else {
+            db.execute(
+                "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                [namehash, start, end, hash],
+            )?;
+        }
+
+        Ok(())
+    }
     // modify db and report back the new block list
-    fn check_blocks(
+    fn process_change_get_blocks(
         path: &PathBuf,
         current_timestamp: i64,
+        cookie: Option<i64>,
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
         let filename = path
@@ -377,14 +420,16 @@ impl Client {
                             block.offset + block.length as u64
                         );
 
-                        db.execute(
-                            "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                            (
-                                namehash,
-                                block.offset as i64,
-                                (block.offset + block.length as u64) as i64,
-                                block_hash as i64,
-                            ),
+                        // no cookie means this is the initial run at the start of the program
+                        // cookie means we are journaling to send over to the server later
+                        Self::journal_block(
+                            &db,
+                            namehash,
+                            block.offset as i64,
+                            (block.offset + block.length as u64) as i64,
+                            cookie,
+                            &block.data,
+                            block_hash as i64,
                         )?;
                     } else {
                         tracing::debug!(
@@ -402,14 +447,14 @@ impl Client {
                         block.offset + block.length as u64
                     );
 
-                    db.execute(
-                        "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                        (
-                            namehash,
-                            block.offset as i64,
-                            (block.offset + block.length as u64) as i64,
-                            block_hash as i64,
-                        ),
+                    Self::journal_block(
+                        &db,
+                        namehash,
+                        block.offset as i64,
+                        (block.offset + block.length as u64) as i64,
+                        cookie,
+                        &block.data,
+                        block_hash as i64,
                     )?;
                 }
 
@@ -545,19 +590,28 @@ impl Client {
 
                 let new_timestamp = Self::timestamp()? as i64;
 
+                let cookie = rand::random::<i64>();
+
                 let mut manifest = protocol::FileManifest {
                     filename: String::from(event_file),
                     timestamp: new_timestamp as u64,
                     size: metadata.len(),
+                    cookie: cookie as u64,
                     blocks: vec![],
                 };
 
-                for change in Self::check_blocks(&filename, current_timestamp, &db)? {
+                for change in Self::process_change_get_blocks(
+                    &filename,
+                    current_timestamp,
+                    Some(cookie),
+                    &db,
+                )? {
                     manifest.blocks.push(protocol::BlockMetadata {
                         start: change.0,
                         end: change.1,
                         hash: change.2,
                         namehash: None,
+                        cookie: cookie as u64,
                     });
                 }
 
@@ -649,6 +703,7 @@ impl Client {
                     start,
                     end,
                     namehash: None,
+                    cookie: 0,
                     hash,
                 });
             }
@@ -806,17 +861,61 @@ impl Client {
             }
         } else {
             // otherwise, we are fulfilling a data request
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(false)
-                .open(&filepath)?;
-            file.seek(SeekFrom::Start(metadata.start))?;
 
-            let length = (metadata.end - metadata.start) as usize;
-            let mut data = vec![0u8; length];
-            file.read_exact(&mut data)?;
+            // get journaled block from the table
+            let res: (i64, i64) = match db.query_one(
+                "SELECT ROWID, hash FROM journal WHERE name = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4",
+                [namehash as i64, metadata.start as i64, metadata.end as i64, metadata.cookie as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.send_ch
+                        .as_ref()
+                        .map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
+                            code: protocol::Return::BlockNotFound as i32,
+                            message: Some(protocol::packet::Message::Transfer(
+                                protocol::Transfer {
+                                    metadata: Some(metadata),
+                                    mode: protocol::DataMode::WholeUnspecified as i32,
+                                    data: None,
+                                },
+                            )),
+                        })))
+                        .ok_or(anyhow::anyhow!("could not send block error"))??;
 
-            metadata.hash = xxhash_rust::xxh3::xxh3_64(&data);
+                    anyhow::bail!("could not find block, {}", e.to_string());
+                }
+            };
+
+            let size_to_read = (metadata.end - metadata.start) as usize;
+            let mut data: Vec<u8> = vec![0u8; size_to_read];
+            let mut contents =
+                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
+            contents.read_exact(&mut data)?;
+
+            metadata.hash = res.1 as u64;
+
+            // write journaled block to file
+            {
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(filepath)?;
+
+                Self::apply_block(&mut file, metadata.start, &data)?;
+            }
+
+            // insert into main block
+            db.execute(
+                "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                [
+                    namehash as i64,
+                    metadata.start as i64,
+                    metadata.end as i64,
+                    res.1,
+                ],
+            )?;
 
             self.send_ch
                 .as_ref()
@@ -1019,6 +1118,7 @@ impl Client {
                                                     end: op.end,
                                                     namehash: Some(namehash as u64),
                                                     hash: op.hash,
+                                                    cookie: delta.cookie,
                                                 }),
                                                 mode: protocol::DataMode::WholeUnspecified as i32,
                                                 data: None,
@@ -1063,6 +1163,7 @@ impl Client {
                                                 end: op.end,
                                                 namehash: Some(namehash as u64),
                                                 hash: op.hash,
+                                                cookie: delta.cookie,
                                             }),
                                             mode: protocol::DataMode::WholeUnspecified as i32,
                                             data: None,
@@ -1390,6 +1491,7 @@ impl Client {
                         start: req.0,
                         end: req.1,
                         hash: 0,
+                        cookie: 0,
                     };
 
                     self.send_ch

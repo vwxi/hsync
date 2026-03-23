@@ -44,9 +44,18 @@ enum Ch {
     Refresh,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TransferMetadata {
+    pub start: u64,
+    pub end: u64,
+    pub attempts: u64,
+    pub timestamp: u64,
+    pub cookie: u64,
+}
+
 #[derive(Debug)]
 struct IncompleteTransfer {
-    pub transfers: HashSet<(u64, u64, u64, u64)>,
+    pub transfers: HashSet<TransferMetadata>,
     pub who: SocketAddr,
 }
 
@@ -686,7 +695,7 @@ impl Server {
         }
 
         {
-            let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
+            let mut set: HashSet<TransferMetadata> = HashSet::new();
             let timestamp = Self::timestamp()?;
 
             manifest
@@ -704,7 +713,13 @@ impl Server {
                         )
                         .is_err()
                     {
-                        set.insert((block.start, block.end, timestamp, 0));
+                        set.insert(TransferMetadata {
+                            start: block.start,
+                            end: block.end,
+                            timestamp,
+                            attempts: 0,
+                            cookie: manifest.cookie,
+                        });
 
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
@@ -750,7 +765,7 @@ impl Server {
                 .collect();
 
             let delta = self
-                .process_delta(db, folder_id, namehash, new_blocks)
+                .process_delta(db, folder_id, namehash, manifest.cookie, new_blocks)
                 .await?;
 
             let mut deltas_lock = self.pending_deltas.lock().await;
@@ -900,12 +915,13 @@ impl Server {
         self: &Arc<Self>,
         db: PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
-        name_hash: i64,
+        namehash: i64,
+        cookie: u64,
         new_blocks: Vec<(u64, u64, u64)>,
     ) -> anyhow::Result<protocol::Delta> {
         let filename: String = db.query_one(
             "SELECT name FROM filenames WHERE folder = ?1 AND namehash = ?2",
-            [folder_id, name_hash],
+            [folder_id, namehash],
             |r| r.get(0),
         )?;
 
@@ -914,7 +930,7 @@ impl Server {
                 "SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
             )?;
 
-            stmt.query_map((folder_id, name_hash), |row| {
+            stmt.query_map((folder_id, namehash), |row| {
                 Ok((
                     row.get::<_, i64>(0)? as u64,
                     row.get::<_, i64>(1)? as u64,
@@ -934,6 +950,7 @@ impl Server {
         let diff = protocol::Delta {
             size: largest_end_offset,
             filename,
+            cookie,
             ops: similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
                 .iter()
                 .flat_map(|x| x.iter_changes(&old_blocks, &new_blocks))
@@ -1016,7 +1033,11 @@ impl Server {
                 if entry
                     .transfers
                     .iter()
-                    .find(|e| e.0 == metadata.start && e.1 == metadata.end)
+                    .find(|e| {
+                        e.start == metadata.start
+                            && e.end == metadata.end
+                            && e.cookie == metadata.cookie
+                    })
                     .is_some()
                 {
                     db.execute(
@@ -1044,7 +1065,7 @@ impl Server {
 
                 entry
                     .transfers
-                    .retain(|e| !(e.0 == metadata.start && e.1 == metadata.end));
+                    .retain(|e| !(e.start == metadata.start && e.end == metadata.end));
 
                 if entry.transfers.is_empty() {
                     let who = entry.who;
@@ -1199,6 +1220,7 @@ impl Server {
                 filename: whatis.filename,
                 timestamp: Self::timestamp().map_err(|_| rusqlite::Error::UnwindingPanic)?,
                 size: largest_end_offset,
+                cookie: 0,
                 blocks: vec![],
             };
 
@@ -1208,6 +1230,7 @@ impl Server {
                     hash: block.get::<_, i64>(0)? as u64,
                     start: block.get::<_, i64>(1)? as u64,
                     end: block.get::<_, i64>(2)? as u64,
+                    cookie: 0,
                     namehash: None,
                 });
             }
@@ -1231,15 +1254,15 @@ impl Server {
         let current_timestamp = Self::timestamp()?;
 
         for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
-            let late_requests: Vec<(u64, u64, u64, u64)> = item
+            let late_requests: Vec<TransferMetadata> = item
                 .transfers
-                .extract_if(|e| current_timestamp - e.2 >= REFRESH_INTERVAL)
+                .extract_if(|e| current_timestamp - e.timestamp >= REFRESH_INTERVAL)
                 .collect();
 
             late_requests
                 .iter()
                 .map(|req| {
-                    if req.3 + 1 >= REFRESH_ATTEMPTS {
+                    if req.attempts + 1 >= REFRESH_ATTEMPTS {
                         // tracing::debug!(
                         //     "request for {}:[{}, {}] max attempts reached",
                         //     req.0,
@@ -1252,8 +1275,9 @@ impl Server {
 
                     let metadata = protocol::BlockMetadata {
                         namehash: Some(*namehash as u64),
-                        start: req.0,
-                        end: req.1,
+                        start: req.start,
+                        end: req.end,
+                        cookie: req.cookie,
                         hash: 0,
                     };
 
@@ -1278,8 +1302,13 @@ impl Server {
                             .ok_or(anyhow::anyhow!("failed to send transfer request"))
                     })??;
 
-                    item.transfers
-                        .insert((req.0, req.1, current_timestamp, req.3 + 1));
+                    item.transfers.insert(TransferMetadata {
+                        start: req.start,
+                        end: req.end,
+                        attempts: req.attempts + 1,
+                        timestamp: current_timestamp,
+                        cookie: req.cookie,
+                    });
 
                     // tracing::debug!(
                     //     "resending transfer request: {}:[{}, {}]",
