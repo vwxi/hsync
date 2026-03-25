@@ -31,7 +31,8 @@ message BlockMetadata {
   uint64 end = 2;
   optional uint64 namehash = 3;
   uint64 hash = 4;
-  uint64 cookie = 5;
+  // server->client ignores this, client->server requires this
+  optional uint64 cookie = 5;
 }
 
 // describes a file.
@@ -39,7 +40,10 @@ message FileManifest {
   string filename = 1;
   uint64 timestamp = 2;
   uint64 size = 3;
-  uint64 cookie = 4;
+  // no cookie means transfers will come from the main block table
+  //
+  // server->client ignores this, client->server requires this
+  optional uint64 cookie = 4;
   repeated BlockMetadata blocks = 5;
 }
 

@@ -107,6 +107,16 @@ enum Ch {
     Refresh,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+struct TransferMetadata {
+    pub start: u64,
+    pub end: u64,
+    pub hash: u64,
+    pub attempts: u64,
+    pub timestamp: u64,
+    pub cookie: Option<u64>,
+}
+
 pub struct Client {
     config: Config,
     wd: WatchDescriptor,
@@ -114,7 +124,7 @@ pub struct Client {
     endpoint: Endpoint,
     send_ch: Option<mpsc::UnboundedSender<Ch>>,
     current_accesses: Mutex<HashSet<i64>>,
-    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<(u64, u64, u64, u64)>>>,
+    outgoing_transfer_requests: Mutex<HashMap<i64, HashSet<TransferMetadata>>>,
     outgoing_manifest_requests: Mutex<HashSet<i64>>,
     queued_manifests: Mutex<HashMap<i64, protocol::FileManifest>>,
 }
@@ -365,6 +375,98 @@ impl Client {
 
         Ok(())
     }
+
+    fn fetch_block(
+        &mut self,
+        db: &PooledConnection<SqliteConnectionManager>,
+        filepath: &PathBuf,
+        namehash: i64,
+        mut metadata: protocol::BlockMetadata,
+    ) -> anyhow::Result<Vec<u8>> {
+        // if cookie is present, get from journal
+        // otherwise, get it from the main table
+        if let Some(cookie) = metadata.cookie {
+            let res: (i64, i64) = match db.query_one(
+                "SELECT ROWID, hash FROM journal WHERE name = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4",
+                [namehash, metadata.start as i64, metadata.end as i64, cookie as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.send_ch
+                        .as_ref()
+                        .map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
+                            code: protocol::Return::BlockNotFound as i32,
+                            message: Some(protocol::packet::Message::Transfer(
+                                protocol::Transfer {
+                                    metadata: Some(metadata),
+                                    mode: protocol::DataMode::WholeUnspecified as i32,
+                                    data: None,
+                                },
+                            )),
+                        })))
+                        .ok_or(anyhow::anyhow!("could not send block error"))??;
+
+                    anyhow::bail!("could not find block {}:{}:[{}, {}], {}",
+                        metadata.namehash(), metadata.hash, metadata.start, metadata.end, e.to_string());
+                }
+            };
+
+            let size_to_read = (metadata.end - metadata.start) as usize;
+            let mut data: Vec<u8> = vec![0u8; size_to_read];
+            let mut contents =
+                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
+            contents.read_exact(&mut data)?;
+
+            metadata.hash = res.1 as u64;
+
+            // write journaled block to file
+            {
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(filepath)?;
+
+                Self::apply_block(&mut file, metadata.start, &data)?;
+            }
+
+            // insert into main block
+            db.execute(
+                "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                [
+                    namehash as i64,
+                    metadata.start as i64,
+                    metadata.end as i64,
+                    res.1,
+                ],
+            )?;
+
+            // delete from journal
+            db.execute(
+                "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4",
+                [
+                    namehash as i64,
+                    metadata.start as i64,
+                    metadata.end as i64,
+                    res.1,
+                ],
+            )?;
+
+            Ok(data)
+        } else {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(false)
+                .open(filepath)?;
+
+            let mut block = vec![0u8; (metadata.end - metadata.start) as usize];
+            file.seek(SeekFrom::Start(metadata.start))?;
+            file.read_exact(&mut block)?;
+
+            Ok(block)
+        }
+    }
+
     // modify db and report back the new block list
     fn process_change_get_blocks(
         path: &PathBuf,
@@ -596,7 +698,7 @@ impl Client {
                     filename: String::from(event_file),
                     timestamp: new_timestamp as u64,
                     size: metadata.len(),
-                    cookie: cookie as u64,
+                    cookie: Some(cookie as u64),
                     blocks: vec![],
                 };
 
@@ -611,7 +713,7 @@ impl Client {
                         end: change.1,
                         hash: change.2,
                         namehash: None,
-                        cookie: cookie as u64,
+                        cookie: Some(cookie as u64),
                     });
                 }
 
@@ -699,11 +801,12 @@ impl Client {
                     block.get::<_, i64>(2)? as u64,
                 );
 
+                // manifest block
                 manifest.blocks.push(protocol::BlockMetadata {
                     start,
                     end,
                     namehash: None,
-                    cookie: 0,
+                    cookie: None,
                     hash,
                 });
             }
@@ -732,7 +835,7 @@ impl Client {
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
-        let mut metadata = transfer
+        let metadata = transfer
             .metadata
             .ok_or(anyhow::anyhow!("transfer request with no metadata"))?;
 
@@ -744,7 +847,7 @@ impl Client {
             protocol::Return::BlockMismatch | protocol::Return::BlockNotFound => {
                 let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
                 if let Some(reqs) = outgoing_lock.get_mut(&namehash) {
-                    reqs.retain(|r| !(r.0 == metadata.start && r.1 == metadata.end));
+                    reqs.retain(|r| !(r.start == metadata.start && r.end == metadata.end));
                     return Ok(());
                 }
             }
@@ -786,10 +889,10 @@ impl Client {
             if let Some(reqs) = outgoing_lock.get_mut(&namehash) {
                 if reqs
                     .iter()
-                    .find(|e| e.0 == metadata.start && e.1 == metadata.end)
+                    .find(|e| e.start == metadata.start && e.end == metadata.end)
                     .is_some()
                 {
-                    reqs.retain(|e| !(e.0 == metadata.start && e.1 == metadata.end));
+                    reqs.retain(|e| !(e.start == metadata.start && e.end == metadata.end));
 
                     let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
 
@@ -861,61 +964,7 @@ impl Client {
             }
         } else {
             // otherwise, we are fulfilling a data request
-
-            // get journaled block from the table
-            let res: (i64, i64) = match db.query_one(
-                "SELECT ROWID, hash FROM journal WHERE name = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4",
-                [namehash as i64, metadata.start as i64, metadata.end as i64, metadata.cookie as i64],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    self.send_ch
-                        .as_ref()
-                        .map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
-                            code: protocol::Return::BlockNotFound as i32,
-                            message: Some(protocol::packet::Message::Transfer(
-                                protocol::Transfer {
-                                    metadata: Some(metadata),
-                                    mode: protocol::DataMode::WholeUnspecified as i32,
-                                    data: None,
-                                },
-                            )),
-                        })))
-                        .ok_or(anyhow::anyhow!("could not send block error"))??;
-
-                    anyhow::bail!("could not find block, {}", e.to_string());
-                }
-            };
-
-            let size_to_read = (metadata.end - metadata.start) as usize;
-            let mut data: Vec<u8> = vec![0u8; size_to_read];
-            let mut contents =
-                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
-            contents.read_exact(&mut data)?;
-
-            metadata.hash = res.1 as u64;
-
-            // write journaled block to file
-            {
-                let mut file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(filepath)?;
-
-                Self::apply_block(&mut file, metadata.start, &data)?;
-            }
-
-            // insert into main block
-            db.execute(
-                "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                [
-                    namehash as i64,
-                    metadata.start as i64,
-                    metadata.end as i64,
-                    res.1,
-                ],
-            )?;
+            let data = self.fetch_block(&db, &filepath, namehash, metadata.clone())?;
 
             self.send_ch
                 .as_ref()
@@ -1082,6 +1131,16 @@ impl Client {
 
             match op.op_type() {
                 protocol::delta::OpType::Insert => {
+                    let timestamp = Self::timestamp()?;
+                    let transfer_metadata = TransferMetadata {
+                        start: op.start,
+                        end: op.end,
+                        hash: op.hash,
+                        attempts: 0,
+                        timestamp,
+                        cookie: None,
+                    };
+
                     if let Ok(hash) = existing_hash {
                         if hash as u64 == op.hash {
                             tracing::debug!(
@@ -1093,16 +1152,15 @@ impl Client {
                         } else {
                             // request transfer
                             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-                            let timestamp = Self::timestamp()?;
 
                             outgoing_lock
                                 .entry(namehash)
                                 .and_modify(|o| {
-                                    o.insert((op.start, op.end, timestamp, 0));
+                                    o.insert(transfer_metadata);
                                 })
                                 .or_insert_with(|| {
-                                    let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
-                                    set.insert((op.start, op.end, timestamp, 0));
+                                    let mut set: HashSet<TransferMetadata> = HashSet::new();
+                                    set.insert(transfer_metadata);
                                     set
                                 });
 
@@ -1118,7 +1176,7 @@ impl Client {
                                                     end: op.end,
                                                     namehash: Some(namehash as u64),
                                                     hash: op.hash,
-                                                    cookie: delta.cookie,
+                                                    cookie: Some(delta.cookie),
                                                 }),
                                                 mode: protocol::DataMode::WholeUnspecified as i32,
                                                 data: None,
@@ -1137,16 +1195,15 @@ impl Client {
                         );
 
                         let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-                        let timestamp = Self::timestamp()?;
 
                         outgoing_lock
                             .entry(namehash)
                             .and_modify(|o| {
-                                o.insert((op.start, op.end, timestamp, 0));
+                                o.insert(transfer_metadata);
                             })
                             .or_insert_with(|| {
-                                let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
-                                set.insert((op.start, op.end, timestamp, 0));
+                                let mut set: HashSet<TransferMetadata> = HashSet::new();
+                                set.insert(transfer_metadata);
                                 set
                             });
 
@@ -1163,7 +1220,7 @@ impl Client {
                                                 end: op.end,
                                                 namehash: Some(namehash as u64),
                                                 hash: op.hash,
-                                                cookie: delta.cookie,
+                                                cookie: Some(delta.cookie),
                                             }),
                                             mode: protocol::DataMode::WholeUnspecified as i32,
                                             data: None,
@@ -1343,7 +1400,7 @@ impl Client {
         }
 
         {
-            let mut set: HashSet<(u64, u64, u64, u64)> = HashSet::new();
+            let mut set: HashSet<TransferMetadata> = HashSet::new();
             let timestamp = Self::timestamp()?;
 
             manifest
@@ -1361,7 +1418,15 @@ impl Client {
                         )
                         .is_err()
                     {
-                        set.insert((block.start, block.end, timestamp, 0));
+                        // cookies from manifests are None
+                        set.insert(TransferMetadata {
+                            start: block.start,
+                            end: block.end,
+                            hash: block.hash,
+                            attempts: 0,
+                            timestamp,
+                            cookie: block.cookie,
+                        });
 
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
@@ -1468,19 +1533,20 @@ impl Client {
         let current_timestamp = Self::timestamp()?;
 
         for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
-            let late_requests: Vec<(u64, u64, u64, u64)> = item
-                .extract_if(|e| current_timestamp - e.2 >= REFRESH_INTERVAL)
+            let late_requests: Vec<TransferMetadata> = item
+                .extract_if(|e| current_timestamp - e.timestamp >= REFRESH_INTERVAL)
                 .collect();
 
             late_requests
                 .iter()
                 .map(|req| {
-                    if req.3 + 1 >= REFRESH_ATTEMPTS {
+                    if req.attempts + 1 >= REFRESH_ATTEMPTS {
                         tracing::debug!(
-                            "request for {}:[{}, {}] max attempts reached",
-                            req.0,
-                            req.1,
-                            req.2
+                            "request for {}:{}:[{}, {}] max attempts reached",
+                            namehash,
+                            req.cookie.unwrap_or(0),
+                            req.start,
+                            req.end,
                         );
 
                         return Ok(());
@@ -1488,10 +1554,10 @@ impl Client {
 
                     let metadata = protocol::BlockMetadata {
                         namehash: Some(*namehash as u64),
-                        start: req.0,
-                        end: req.1,
-                        hash: 0,
-                        cookie: 0,
+                        start: req.start,
+                        end: req.end,
+                        hash: req.hash,
+                        cookie: req.cookie,
                     };
 
                     self.send_ch
@@ -1510,13 +1576,21 @@ impl Client {
                         })
                         .ok_or(anyhow::anyhow!("could not send transfer request"))??;
 
-                    item.insert((req.0, req.1, current_timestamp, req.3 + 1));
+                    item.insert(TransferMetadata {
+                        start: req.start,
+                        end: req.end,
+                        hash: req.hash,
+                        attempts: req.attempts + 1,
+                        timestamp: Self::timestamp()?,
+                        cookie: req.cookie,
+                    });
 
                     tracing::debug!(
-                        "resending transfer request: {}:[{}, {}]",
+                        "resending transfer request: {}:{}:[{}, {}]",
                         namehash,
-                        req.0,
-                        req.1
+                        req.cookie.unwrap_or(0),
+                        req.start,
+                        req.end,
                     );
 
                     anyhow::Ok(())

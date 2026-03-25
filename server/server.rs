@@ -50,7 +50,7 @@ struct TransferMetadata {
     pub end: u64,
     pub attempts: u64,
     pub timestamp: u64,
-    pub cookie: Option<u64>,
+    pub cookie: u64,
 }
 
 #[derive(Debug)]
@@ -609,10 +609,7 @@ impl Server {
         {
             let deltas_lock = self.pending_deltas.lock().await;
             if deltas_lock.contains_key(&namehash) {
-                tracing::warn!(
-                    "already sent out deltas for {}, notifying",
-                    manifest.filename
-                );
+                tracing::warn!("already processing {}, notifying", manifest.filename);
                 stream.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::TransfersPending as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
@@ -690,10 +687,9 @@ impl Server {
                 );
 
                 tracing::debug!(
-                    "start: begin processing {} from {} (cookie: {})",
+                    "start: begin processing {} from {}",
                     manifest.filename,
-                    addr,
-                    manifest.cookie()
+                    addr
                 );
             }
         }
@@ -710,6 +706,8 @@ impl Server {
                         "SELECT * FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
                     )?;
 
+                    let cookie = manifest.cookie.ok_or(anyhow::anyhow!("no cookie"))?;
+
                     if stmt
                         .query_one(
                             (block.hash as i64, block.start as i64, block.end as i64),
@@ -722,7 +720,7 @@ impl Server {
                             end: block.end,
                             timestamp,
                             attempts: 0,
-                            cookie: block.cookie,
+                            cookie,
                         });
 
                         let mut block_with_namehash = block.clone();
@@ -768,7 +766,7 @@ impl Server {
                 .map(|m| (m.hash, m.start, m.end))
                 .collect();
 
-            // delta has its own cookie
+            // delta generates its own cookie
             let delta = self
                 .process_delta(db, folder_id, namehash, new_blocks)
                 .await?;
@@ -1016,6 +1014,8 @@ impl Server {
             .namehash
             .ok_or(anyhow::anyhow!("transfer metadata missing namehash"))?;
 
+        let cookie = metadata.cookie.unwrap_or(0);
+
         let folder_id: i64 = db.query_row(
             "SELECT current_folder FROM users WHERE addr = ?1",
             [addr.to_string()],
@@ -1042,7 +1042,7 @@ impl Server {
                     .find(|e| {
                         e.start == metadata.start
                             && e.end == metadata.end
-                            && e.cookie.zip(metadata.cookie).map_or(true, |(a, b)| a == b)
+                            && metadata.cookie.map_or(false, |c| c == e.cookie)
                     })
                     .is_some()
                 {
@@ -1102,19 +1102,6 @@ impl Server {
                         tracing::info!(
                             "transfer queue satisfied for file {namehash}. broadcasting delta"
                         );
-
-                        // edge: if there isn't anyone else to send the delta to,
-                        //       complete the process
-                        if !streams_lock.iter().any(|s| *s.0 != who) {
-                            let mut processes_lock = self.processes.lock().await;
-
-                            processes_lock.remove(&(namehash as i64));
-                            deltas_lock.remove(&(namehash as i64));
-
-                            tracing::info!("no other users, process for {namehash} is finished");
-
-                            return Ok(());
-                        }
 
                         streams_lock
                             .iter()
@@ -1235,11 +1222,13 @@ impl Server {
                 |r| r.get::<_, i64>(0),
             )? as u64;
 
+            let cookie = rand::random::<u64>();
+
             let mut manifest = protocol::FileManifest {
                 filename: whatis.filename,
                 timestamp: Self::timestamp().map_err(|_| rusqlite::Error::UnwindingPanic)?,
                 size: largest_end_offset,
-                cookie: None,
+                cookie: Some(cookie),
                 blocks: vec![],
             };
 
@@ -1249,7 +1238,7 @@ impl Server {
                     hash: block.get::<_, i64>(0)? as u64,
                     start: block.get::<_, i64>(1)? as u64,
                     end: block.get::<_, i64>(2)? as u64,
-                    cookie: None,
+                    cookie: Some(cookie),
                     namehash: None,
                 });
             }
@@ -1296,7 +1285,7 @@ impl Server {
                         namehash: Some(*namehash as u64),
                         start: req.start,
                         end: req.end,
-                        cookie: req.cookie,
+                        cookie: Some(req.cookie),
                         hash: 0,
                     };
 
