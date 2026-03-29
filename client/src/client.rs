@@ -109,6 +109,7 @@ enum Ch {
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 struct TransferMetadata {
+    pub op_type: protocol::delta::OpType,
     pub start: u64,
     pub end: u64,
     pub hash: u64,
@@ -387,7 +388,7 @@ impl Client {
         // otherwise, get it from the main table
         if let Some(cookie) = metadata.cookie {
             let res: (i64, i64) = match db.query_one(
-                "SELECT ROWID, hash FROM journal WHERE name = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4",
+                "SELECT ROWID, hash FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4 LIMIT 1",
                 [namehash, metadata.start as i64, metadata.end as i64, cookie as i64],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             ) {
@@ -415,7 +416,7 @@ impl Client {
             let size_to_read = (metadata.end - metadata.start) as usize;
             let mut data: Vec<u8> = vec![0u8; size_to_read];
             let mut contents =
-                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
+                db.blob_open(rusqlite::MAIN_DB, "journal", "contents", res.0, true)?;
             contents.read_exact(&mut data)?;
 
             metadata.hash = res.1 as u64;
@@ -427,7 +428,7 @@ impl Client {
                     .write(true)
                     .open(filepath)?;
 
-                Self::apply_block(&mut file, metadata.start, &data)?;
+                Self::modify_block(&mut file, metadata.start, &data)?;
             }
 
             // insert into main block
@@ -886,18 +887,19 @@ impl Client {
 
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
 
-            if let Some(reqs) = outgoing_lock.get_mut(&namehash) {
-                if reqs
+            if let Some(transfer) = outgoing_lock.get_mut(&namehash) {
+                if let Some(t) = transfer
                     .iter()
                     .find(|e| e.start == metadata.start && e.end == metadata.end)
-                    .is_some()
                 {
-                    reqs.retain(|e| !(e.start == metadata.start && e.end == metadata.end));
+                    let op_type = t.op_type;
+
+                    transfer.retain(|e| !(e.start == metadata.start && e.end == metadata.end));
 
                     let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
 
                     if let Err(e) = db.execute(
-                        "INSERT INTO blocks (hash, start, end, file) VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT OR IGNORE INTO blocks (hash, start, end, file) VALUES (?1, ?2, ?3, ?4)",
                         [
                             datahash,
                             metadata.start as i64,
@@ -924,14 +926,37 @@ impl Client {
 
                     let block_hash = xxhash_rust::xxh3::xxh3_64(data.as_slice());
 
-                    if let Err(e) = Self::apply_block(&mut file, metadata.start, data.as_slice()) {
-                        anyhow::bail!(
-                            "failed to write block [{}, {}] to file {}: {}",
-                            metadata.start,
-                            metadata.end,
-                            filepath.to_string_lossy(),
-                            e.to_string()
-                        );
+                    match op_type {
+                        protocol::delta::OpType::Insert => {
+                            if let Err(e) =
+                                Self::insert_block(&mut file, metadata.start, data.as_slice())
+                            {
+                                anyhow::bail!(
+                                    "failed to insert block [{}, {}] to file {}: {}",
+                                    metadata.start,
+                                    metadata.end,
+                                    filepath.to_string_lossy(),
+                                    e.to_string()
+                                );
+                            }
+                        }
+
+                        protocol::delta::OpType::Modify
+                        | protocol::delta::OpType::EqualUnspecified => {
+                            if let Err(e) =
+                                Self::modify_block(&mut file, metadata.start, data.as_slice())
+                            {
+                                anyhow::bail!(
+                                    "failed to modify block [{}, {}] in file {}: {}",
+                                    metadata.start,
+                                    metadata.end,
+                                    filepath.to_string_lossy(),
+                                    e.to_string()
+                                );
+                            }
+                        }
+
+                        _ => {}
                     }
 
                     tracing::debug!(
@@ -939,11 +964,12 @@ impl Client {
                         metadata.start,
                         metadata.end,
                         filepath.to_string_lossy(),
-                        block_hash as i64,
+                        block_hash,
                     );
 
-                    if reqs.is_empty() {
-                        tracing::debug!("removing outgoing");
+                    if transfer.is_empty() {
+                        tracing::debug!("done with {}", namehash as u64);
+
                         outgoing_lock.remove(&namehash);
 
                         self.send_ch
@@ -1013,7 +1039,6 @@ impl Client {
         // If we're truncating at the end, we can just resize.
         if end == file_len {
             file.set_len(start)?;
-            file.sync_all()?;
             return Ok(());
         }
 
@@ -1034,14 +1059,30 @@ impl Client {
         }
 
         file.set_len(file_len - range_len)?;
-        file.sync_all()?;
 
         Ok(())
     }
 
-    fn apply_block(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    fn modify_block(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         if data.is_empty() {
-            return Ok(());
+            anyhow::bail!("cannot modify empty data");
+        }
+
+        let file_len = file.metadata()?.len();
+        let write_len = data.len() as u64;
+
+        if offset + write_len >= file_len {
+            file.set_len(offset + write_len)?;
+        }
+
+        dbg!(file.write_all_at(&data, offset))?;
+
+        Ok(())
+    }
+
+    fn insert_block(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot insert empty data");
         }
 
         let file_len = file.metadata()?.len();
@@ -1052,6 +1093,7 @@ impl Client {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(data)?;
             file.sync_all()?;
+
             return Ok(());
         }
 
@@ -1077,6 +1119,48 @@ impl Client {
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
         file.sync_all()?;
+
+        Ok(())
+    }
+
+    async fn request_block(
+        &mut self,
+        namehash: i64,
+        transfer_metadata: TransferMetadata,
+    ) -> anyhow::Result<()> {
+        // request transfer
+        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+
+        outgoing_lock
+            .entry(namehash)
+            .and_modify(|o| {
+                o.insert(transfer_metadata);
+            })
+            .or_insert_with(|| {
+                let mut set: HashSet<TransferMetadata> = HashSet::new();
+                set.insert(transfer_metadata);
+                set
+            });
+
+        self.send_ch
+            .as_ref()
+            .map(|ch| {
+                ch.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                        metadata: Some(protocol::BlockMetadata {
+                            start: transfer_metadata.start,
+                            end: transfer_metadata.end,
+                            namehash: Some(namehash as u64),
+                            hash: transfer_metadata.hash,
+                            cookie: transfer_metadata.cookie,
+                        }),
+                        mode: protocol::DataMode::WholeUnspecified as i32,
+                        data: None,
+                    })),
+                }))
+            })
+            .ok_or(anyhow::anyhow!("could not request data transfer"))??;
 
         Ok(())
     }
@@ -1129,106 +1213,46 @@ impl Client {
                 stmt.query_row((namehash, op.start as i64, op.end as i64), |row| row.get(0))
             };
 
-            match op.op_type() {
-                protocol::delta::OpType::Insert => {
-                    let timestamp = Self::timestamp()?;
-                    let transfer_metadata = TransferMetadata {
-                        start: op.start,
-                        end: op.end,
-                        hash: op.hash,
-                        attempts: 0,
-                        timestamp,
-                        cookie: None,
-                    };
+            let timestamp = Self::timestamp()?;
+            let transfer_metadata = TransferMetadata {
+                op_type: op.op_type(),
+                start: op.start,
+                end: op.end,
+                hash: op.hash,
+                attempts: 0,
+                timestamp,
+                cookie: Some(delta.cookie),
+            };
 
+            match op.op_type() {
+                protocol::delta::OpType::Insert | protocol::delta::OpType::Modify => {
                     if let Ok(hash) = existing_hash {
                         if hash as u64 == op.hash {
                             tracing::debug!(
-                                "block [{}, {}] hash matches, skipping",
+                                "delta: block [{}, {}] hash matches, skipping",
                                 op.start,
                                 op.end
                             );
                             continue;
                         } else {
-                            // request transfer
-                            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                            tracing::debug!(
+                                "delta: block {} ({}, {}) does not exist, requesting from server",
+                                op.hash,
+                                op.start,
+                                op.end
+                            );
 
-                            outgoing_lock
-                                .entry(namehash)
-                                .and_modify(|o| {
-                                    o.insert(transfer_metadata);
-                                })
-                                .or_insert_with(|| {
-                                    let mut set: HashSet<TransferMetadata> = HashSet::new();
-                                    set.insert(transfer_metadata);
-                                    set
-                                });
-
-                            self.send_ch
-                                .as_ref()
-                                .map(|ch| {
-                                    ch.send(Ch::OutPacket(protocol::Packet {
-                                        code: protocol::Return::NoneUnspecified as i32,
-                                        message: Some(protocol::packet::Message::Transfer(
-                                            protocol::Transfer {
-                                                metadata: Some(protocol::BlockMetadata {
-                                                    start: op.start,
-                                                    end: op.end,
-                                                    namehash: Some(namehash as u64),
-                                                    hash: op.hash,
-                                                    cookie: Some(delta.cookie),
-                                                }),
-                                                mode: protocol::DataMode::WholeUnspecified as i32,
-                                                data: None,
-                                            },
-                                        )),
-                                    }))
-                                })
-                                .ok_or(anyhow::anyhow!("could not request data transfer"))??;
+                            self.request_block(namehash, transfer_metadata).await?;
                         }
                     } else {
                         tracing::debug!(
-                            "INSERT: block {} ({}, {}) does not exist, requesting from server",
+                            "delta: block {} ({}, {}) does not exist, requesting from server",
                             op.hash,
                             op.start,
                             op.end
                         );
 
-                        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-
-                        outgoing_lock
-                            .entry(namehash)
-                            .and_modify(|o| {
-                                o.insert(transfer_metadata);
-                            })
-                            .or_insert_with(|| {
-                                let mut set: HashSet<TransferMetadata> = HashSet::new();
-                                set.insert(transfer_metadata);
-                                set
-                            });
-
-                        // request transfer
-                        self.send_ch
-                            .as_ref()
-                            .map(|ch| {
-                                ch.send(Ch::OutPacket(protocol::Packet {
-                                    code: protocol::Return::NoneUnspecified as i32,
-                                    message: Some(protocol::packet::Message::Transfer(
-                                        protocol::Transfer {
-                                            metadata: Some(protocol::BlockMetadata {
-                                                start: op.start,
-                                                end: op.end,
-                                                namehash: Some(namehash as u64),
-                                                hash: op.hash,
-                                                cookie: Some(delta.cookie),
-                                            }),
-                                            mode: protocol::DataMode::WholeUnspecified as i32,
-                                            data: None,
-                                        },
-                                    )),
-                                }))
-                            })
-                            .ok_or(anyhow::anyhow!("could not request data transfer"))??;
+                        self.request_block(namehash, transfer_metadata).await?;
                     }
                 }
 
@@ -1420,6 +1444,7 @@ impl Client {
                     {
                         // cookies from manifests are None
                         set.insert(TransferMetadata {
+                            op_type: protocol::delta::OpType::EqualUnspecified,
                             start: block.start,
                             end: block.end,
                             hash: block.hash,
@@ -1529,6 +1554,23 @@ impl Client {
         Ok(())
     }
 
+    async fn check_queued_manifests(&mut self) -> anyhow::Result<()> {
+        let mut manifests_lock = self.queued_manifests.lock().await;
+
+        manifests_lock.drain().for_each(|(namehash, manifest)| {
+            tracing::debug!("sending queued manifest for {}", namehash as u64);
+
+            self.send_ch.as_ref().map(|ch| {
+                ch.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Manifest(manifest)),
+                }))
+            });
+        });
+
+        Ok(())
+    }
+
     async fn check_outgoing_transfers(&mut self) -> anyhow::Result<()> {
         let current_timestamp = Self::timestamp()?;
 
@@ -1577,6 +1619,7 @@ impl Client {
                         .ok_or(anyhow::anyhow!("could not send transfer request"))??;
 
                     item.insert(TransferMetadata {
+                        op_type: req.op_type,
                         start: req.start,
                         end: req.end,
                         hash: req.hash,
@@ -1643,25 +1686,41 @@ impl Client {
                         // packet coming in from the wire
                         Some(Ch::InPacket(pkt)) => {
                             if let Err(e) = client.handle_server_event(pkt).await {
-                                tracing::error!("server event error: {}", e.backtrace());
+                                tracing::error!(
+                                    "server event error: {}\n{}",
+                                    e.to_string(),
+                                    e.backtrace()
+                                );
                             }
                         }
 
                         // we have to send this over the wire
                         Some(Ch::OutPacket(pkt)) => {
                             if let Err(e) = Self::write_packet(&mut send, &pkt).await {
-                                tracing::error!("write packet error: {}", e.backtrace());
+                                tracing::error!(
+                                    "write packet error: {}\n{}",
+                                    e.to_string(),
+                                    e.backtrace()
+                                );
                             }
                         }
 
                         Some(Ch::Event(ev)) => {
                             if let Err(e) = client.handle_file_event(ev).await {
-                                tracing::error!("handle event error: {}", e.backtrace());
+                                tracing::error!(
+                                    "handle event error: {}\n{}",
+                                    e.to_string(),
+                                    e.backtrace()
+                                );
                             }
                         }
 
                         // check on outgoing transfer requests
                         Some(Ch::Refresh) => {
+                            if let Err(e) = client.check_queued_manifests().await {
+                                tracing::error!("queued manifests check error: {}", e.to_string());
+                            }
+
                             if let Err(e) = client.check_outgoing_transfers().await {
                                 tracing::error!("outgoing transfer check error: {}", e.to_string());
                             }

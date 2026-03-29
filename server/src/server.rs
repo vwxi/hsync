@@ -953,11 +953,8 @@ impl Server {
             .ok_or(anyhow::anyhow!("could not get largest size"))?
             as u64;
 
-        let diff = protocol::Delta {
-            size: largest_end_offset,
-            filename,
-            cookie,
-            ops: similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
+        let diff_ops: Vec<protocol::delta::Operation> =
+            similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
                 .iter()
                 .flat_map(|x| x.iter_changes(&old_blocks, &new_blocks))
                 .filter(|x| x.tag() != similar::ChangeTag::Equal)
@@ -965,29 +962,16 @@ impl Server {
                     let (new_hash, start, end) =
                         (x.value().0 as i64, x.value().1 as i64, x.value().2 as i64);
 
-                    match x.tag() {
-                        similar::ChangeTag::Delete => {
-                            let old_hash = old_blocks
-                                .get(
-                                    x.old_index()
-                                        .ok_or(anyhow::anyhow!("internal delta error"))?,
-                                )
-                                .ok_or(anyhow::anyhow!("internal delta fail"))?
-                                .0;
-
-                            db.execute(
-                                "DELETE FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
-                                (old_hash as i64, start, end),
-                            )?;
-                        }
-                        _ => {}
-                    };
-
                     Ok::<protocol::delta::Operation, anyhow::Error>(protocol::delta::Operation {
                         op_type: match x.tag() {
                             similar::ChangeTag::Equal => protocol::delta::OpType::EqualUnspecified,
                             similar::ChangeTag::Insert => protocol::delta::OpType::Insert,
-                            similar::ChangeTag::Delete => protocol::delta::OpType::Delete,
+                            similar::ChangeTag::Delete => {
+                                db.execute("DELETE FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3 AND hash = ?4",
+                                    [namehash, start, end, new_hash])?;
+
+                                protocol::delta::OpType::Delete
+                            },
                         } as i32,
                         hash: new_hash as u64,
                         start: start as u64,
@@ -995,10 +979,32 @@ impl Server {
                     })
                 })
                 .filter_map(|f| f.ok())
-                .collect(),
-        };
+                .collect();
 
-        Ok(diff)
+        let mut final_ops = Vec::new();
+        let mut i = 0;
+        while i < diff_ops.len() {
+            if i + 1 < diff_ops.len()
+                && diff_ops[i].op_type == protocol::delta::OpType::Delete as i32
+                && diff_ops[i + 1].op_type == protocol::delta::OpType::Insert as i32
+            {
+                let mut modify_op = diff_ops[i + 1].clone();
+                modify_op.op_type = protocol::delta::OpType::Modify as i32;
+
+                final_ops.push(modify_op);
+                i += 2;
+            } else {
+                final_ops.push(diff_ops[i].clone());
+                i += 1;
+            }
+        }
+
+        Ok(protocol::Delta {
+            size: largest_end_offset,
+            filename,
+            cookie,
+            ops: final_ops,
+        })
     }
 
     async fn handle_transfer(
@@ -1061,12 +1067,12 @@ impl Server {
 
                     blob.close()?;
 
-                    // tracing::debug!(
-                    //     "got back data for {}:[{}, {}]",
-                    //     namehash,
-                    //     metadata.start,
-                    //     metadata.end
-                    // );
+                    tracing::debug!(
+                        "got back data for {}:[{}, {}]",
+                        namehash,
+                        metadata.start,
+                        metadata.end
+                    );
                 }
 
                 entry
@@ -1148,8 +1154,8 @@ impl Server {
             //     metadata.end
             // );
 
-            let res: (i64, i64) = match db.query_one(
-                "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3",
+            let res: (i64, i64) = match db.query_row(
+                "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
                 [namehash as i64, metadata.start as i64, metadata.end as i64],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             ) {
