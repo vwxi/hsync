@@ -59,10 +59,9 @@ struct IncompleteTransfer {
     pub who: SocketAddr,
 }
 
-#[derive(Debug)]
-struct Process {
-    pub waiting: HashSet<SocketAddr>,
-    pub origin: SocketAddr,
+enum LockState {
+    Free,
+    LockedBy(SocketAddr),
 }
 
 pub struct Server {
@@ -70,7 +69,7 @@ pub struct Server {
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
-    processes: Mutex<HashMap<i64, Process>>,
+    locks: Mutex<HashMap<i64, LockState>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
     pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
@@ -169,7 +168,7 @@ impl Server {
             endpoint,
             db_pool: pool,
             streams: RwLock::new(HashMap::new()),
-            processes: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
             pending_deltas: Mutex::new(HashMap::new()),
         })
@@ -400,15 +399,13 @@ impl Server {
         addr: SocketAddr,
         done: protocol::TransferDone,
     ) -> anyhow::Result<()> {
-        let mut processes_lock = self.processes.lock().await;
+        let mut locks_lock = self.locks.lock().await;
 
-        if let Some(p) = processes_lock.get_mut(&(done.namehash as i64)) {
-            tracing::debug!("complete: {} is done with {}", addr, done.namehash);
-            p.waiting.remove(&addr);
-
-            if p.waiting.is_empty() {
-                tracing::info!("file {} is done being processed", done.namehash);
-                processes_lock.remove(&(done.namehash as i64));
+        // Release lock
+        if let Some(LockState::LockedBy(owner)) = locks_lock.get(&(done.namehash as i64)) {
+            if *owner == addr {
+                locks_lock.insert(done.namehash as i64, LockState::Free);
+                tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
             }
         }
 
@@ -613,6 +610,7 @@ impl Server {
                     "already sent out deltas for {}, notifying",
                     manifest.filename
                 );
+
                 stream.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::TransfersPending as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
@@ -651,50 +649,22 @@ impl Server {
 
         // are other clients done transferring etc
         {
-            let mut processes_lock = self.processes.lock().await;
-            if let Some(process) = processes_lock.get_mut(&namehash) {
-                // process is done?
-                if !process.waiting.is_empty() {
-                    tracing::debug!("still processing {}, delay", manifest.filename);
+            let mut locks_lock = self.locks.lock().await;
+            match locks_lock.get(&namehash) {
+                // if locked, reject
+                Some(LockState::LockedBy(owner)) => {
+                    tracing::debug!("file locked by {:?}, rejecting {:?}", owner, addr);
                     stream.send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::TransfersPending as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
                     }))?;
-
                     return Ok(());
                 }
-
-                if process.origin != addr {
-                    tracing::debug!("origin mismatch on {}, delay", manifest.filename);
-                    stream.send(Ch::OutPacket(protocol::Packet {
-                        code: protocol::Return::TransfersPending as i32,
-                        message: Some(protocol::packet::Message::Manifest(manifest)),
-                    }))?;
-
-                    return Ok(());
+                // otherwise
+                _ => {
+                    locks_lock.insert(namehash, LockState::LockedBy(addr));
+                    tracing::debug!("lock acquired by {:?} for file {}", addr, namehash);
                 }
-            } else {
-                let mut set: HashSet<SocketAddr> = HashSet::new();
-                for a in self.streams.read().await.keys() {
-                    if *a != addr {
-                        set.insert(*a);
-                    }
-                }
-
-                processes_lock.insert(
-                    namehash,
-                    Process {
-                        origin: addr,
-                        waiting: set,
-                    },
-                );
-
-                tracing::debug!(
-                    "start: begin processing {} from {} (cookie: {})",
-                    manifest.filename,
-                    addr,
-                    manifest.cookie()
-                );
             }
         }
 
@@ -727,6 +697,7 @@ impl Server {
 
                         let mut block_with_namehash = block.clone();
                         block_with_namehash.namehash = Some(namehash as u64);
+                        block_with_namehash.cookie = block.cookie;
 
                         stream.send(Ch::OutPacket(protocol::Packet {
                             code: protocol::Return::NoneUnspecified as i32,
@@ -739,17 +710,27 @@ impl Server {
                             )),
                         }))?;
 
-                        // tracing::debug!(
-                        //     "requesting block [{}, {}] from client for file {}",
-                        //     block.start,
-                        //     block.end,
-                        //     manifest.filename
-                        // );
+                        tracing::debug!(
+                            "requesting block [{}, {}] from client for file {}",
+                            block.start,
+                            block.end,
+                            manifest.filename
+                        );
                     }
 
                     Ok::<(), anyhow::Error>(())
                 })
                 .collect::<anyhow::Result<()>>()?;
+
+            if set.is_empty() {
+                // ignore this, go away
+                tracing::debug!("manifest is identical, ignoring");
+
+                let mut locks_lock = self.locks.lock().await;
+                locks_lock.remove(&namehash);
+
+                return Ok(());
+            }
 
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
             outgoing_lock.insert(
@@ -953,52 +934,60 @@ impl Server {
             .ok_or(anyhow::anyhow!("could not get largest size"))?
             as u64;
 
-        let diff = protocol::Delta {
-            size: largest_end_offset,
-            filename,
-            cookie,
-            ops: similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
+        let diff_ops: Vec<protocol::delta::Operation> =
+            similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
                 .iter()
                 .flat_map(|x| x.iter_changes(&old_blocks, &new_blocks))
                 .filter(|x| x.tag() != similar::ChangeTag::Equal)
                 .map(|x| {
-                    let (new_hash, start, end) =
+                    let (hash, start, end) =
                         (x.value().0 as i64, x.value().1 as i64, x.value().2 as i64);
-
-                    match x.tag() {
-                        similar::ChangeTag::Delete => {
-                            let old_hash = old_blocks
-                                .get(
-                                    x.old_index()
-                                        .ok_or(anyhow::anyhow!("internal delta error"))?,
-                                )
-                                .ok_or(anyhow::anyhow!("internal delta fail"))?
-                                .0;
-
-                            db.execute(
-                                "DELETE FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
-                                (old_hash as i64, start, end),
-                            )?;
-                        }
-                        _ => {}
-                    };
 
                     Ok::<protocol::delta::Operation, anyhow::Error>(protocol::delta::Operation {
                         op_type: match x.tag() {
                             similar::ChangeTag::Equal => protocol::delta::OpType::EqualUnspecified,
                             similar::ChangeTag::Insert => protocol::delta::OpType::Insert,
-                            similar::ChangeTag::Delete => protocol::delta::OpType::Delete,
+                            similar::ChangeTag::Delete => {
+                                db.execute("DELETE FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3 AND hash = ?4",
+                                    [namehash, start, end, hash])?;
+
+                                protocol::delta::OpType::Delete
+                            },
                         } as i32,
-                        hash: new_hash as u64,
+                        hash: hash as u64,
                         start: start as u64,
                         end: end as u64,
                     })
                 })
                 .filter_map(|f| f.ok())
-                .collect(),
-        };
+                .collect();
 
-        Ok(diff)
+        let mut final_ops = Vec::new();
+        let mut i = 0;
+        while i < diff_ops.len() {
+            if i + 1 < diff_ops.len()
+                && diff_ops[i].op_type == protocol::delta::OpType::Delete as i32
+                && diff_ops[i + 1].op_type == protocol::delta::OpType::Insert as i32
+                && diff_ops[i].start == diff_ops[i + 1].start
+                && diff_ops[i].end == diff_ops[i + 1].end
+            {
+                let mut modify_op = diff_ops[i + 1].clone();
+                modify_op.op_type = protocol::delta::OpType::Modify as i32;
+
+                final_ops.push(modify_op);
+                i += 2;
+            } else {
+                final_ops.push(diff_ops[i].clone());
+                i += 1;
+            }
+        }
+
+        Ok(protocol::Delta {
+            size: largest_end_offset,
+            filename,
+            cookie,
+            ops: final_ops,
+        })
     }
 
     async fn handle_transfer(
@@ -1061,12 +1050,12 @@ impl Server {
 
                     blob.close()?;
 
-                    // tracing::debug!(
-                    //     "got back data for {}:[{}, {}]",
-                    //     namehash,
-                    //     metadata.start,
-                    //     metadata.end
-                    // );
+                    tracing::debug!(
+                        "got back data for {}:[{}, {}]",
+                        namehash,
+                        metadata.start,
+                        metadata.end
+                    );
                 }
 
                 entry
@@ -1103,17 +1092,10 @@ impl Server {
                             "transfer queue satisfied for file {namehash}. broadcasting delta"
                         );
 
-                        // edge: if there isn't anyone else to send the delta to,
-                        //       complete the process
-                        if !streams_lock.iter().any(|s| *s.0 != who) {
-                            let mut processes_lock = self.processes.lock().await;
+                        {
+                            let mut locks_lock = self.locks.lock().await;
 
-                            processes_lock.remove(&(namehash as i64));
-                            deltas_lock.remove(&(namehash as i64));
-
-                            tracing::info!("no other users, process for {namehash} is finished");
-
-                            return Ok(());
+                            locks_lock.remove(&(namehash as i64));
                         }
 
                         streams_lock
@@ -1148,8 +1130,8 @@ impl Server {
             //     metadata.end
             // );
 
-            let res: (i64, i64) = match db.query_one(
-                "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3",
+            let res: (i64, i64) = match db.query_row(
+                "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
                 [namehash as i64, metadata.start as i64, metadata.end as i64],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             ) {
@@ -1239,7 +1221,7 @@ impl Server {
                 filename: whatis.filename,
                 timestamp: Self::timestamp().map_err(|_| rusqlite::Error::UnwindingPanic)?,
                 size: largest_end_offset,
-                cookie: None,
+                cookie: Some(rand::random()),
                 blocks: vec![],
             };
 
@@ -1249,7 +1231,7 @@ impl Server {
                     hash: block.get::<_, i64>(0)? as u64,
                     start: block.get::<_, i64>(1)? as u64,
                     end: block.get::<_, i64>(2)? as u64,
-                    cookie: None,
+                    cookie: manifest.cookie,
                     namehash: None,
                 });
             }

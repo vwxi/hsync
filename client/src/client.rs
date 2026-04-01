@@ -40,9 +40,13 @@ const REFRESH_INTERVAL: u64 = 5;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
+
+/// name string <-> name hash
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (name TEXT PRIMARY KEY, hash INTEGER, timestamp INTEGER, UNIQUE(name, hash))";
+/// block metadata tied to files in folder
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, UNIQUE(file, start, end, hash))";
-const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, contents BLOB, UNIQUE(file, start, end, hash, cookie))";
+/// temp blocks waiting to be sent to server or waiting to be applied to files
+const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (file INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(file, start, end, hash, cookie))";
 
 /// to be used with --insecure flag
 #[derive(Debug)]
@@ -109,6 +113,7 @@ enum Ch {
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 struct TransferMetadata {
+    pub op_type: protocol::delta::OpType,
     pub start: u64,
     pub end: u64,
     pub hash: u64,
@@ -342,30 +347,43 @@ impl Client {
         start: i64,
         end: i64,
         cookie: Option<i64>,
-        data: &[u8],
+        op_type: Option<protocol::delta::OpType>,
+        data: Option<&[u8]>,
         hash: i64,
     ) -> anyhow::Result<()> {
-        if let Some(cookie) = cookie {
+        if let Some(cookie) = dbg!(cookie) {
             db.execute(
-            "INSERT OR IGNORE INTO journal (file, start, end, hash, cookie, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            (
-                namehash,
-                start,
-                end,
-                hash,
-                cookie,
-                rusqlite::blob::ZeroBlob((end - start) as i32)
-            ),
-        )?;
+                "INSERT OR IGNORE INTO journal (file, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    namehash,
+                    start,
+                    end,
+                    hash,
+                    cookie,
+                    op_type.map(|o| o as i64),
+                    data.as_ref().map(|_| rusqlite::blob::ZeroBlob((end - start) as i32)),
+                ),
+            )?;
 
-            let rowid = db.last_insert_rowid();
-            let mut blob = db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
+            if let Some(data) = data {
+                let rowid = db.last_insert_rowid();
+                let mut blob =
+                    db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
 
-            if blob.write(&data)? != data.len() {
-                anyhow::bail!("did not write full block to database");
+                if blob.write(&data)? != data.len() {
+                    anyhow::bail!("did not write full block to database");
+                }
+
+                blob.close()?;
             }
 
-            blob.close()?;
+            tracing::debug!(
+                "journal: stored block {}:[{}, {}] (ck: {:?})",
+                namehash as u64,
+                start,
+                end,
+                cookie
+            );
         } else {
             db.execute(
                 "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
@@ -376,6 +394,11 @@ impl Client {
         Ok(())
     }
 
+    /// this is for pending blocks being sent to the server,
+    /// transferring the block from journal to main block table.
+    /// this procedure differs from receiving an external change
+    /// because although they operate on the same journal they
+    /// do not cross paths
     fn fetch_block(
         &mut self,
         db: &PooledConnection<SqliteConnectionManager>,
@@ -387,7 +410,7 @@ impl Client {
         // otherwise, get it from the main table
         if let Some(cookie) = metadata.cookie {
             let res: (i64, i64) = match db.query_one(
-                "SELECT ROWID, hash FROM journal WHERE name = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4",
+                "SELECT ROWID, hash FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4 LIMIT 1",
                 [namehash, metadata.start as i64, metadata.end as i64, cookie as i64],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             ) {
@@ -415,7 +438,7 @@ impl Client {
             let size_to_read = (metadata.end - metadata.start) as usize;
             let mut data: Vec<u8> = vec![0u8; size_to_read];
             let mut contents =
-                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
+                db.blob_open(rusqlite::MAIN_DB, "journal", "contents", res.0, true)?;
             contents.read_exact(&mut data)?;
 
             metadata.hash = res.1 as u64;
@@ -427,7 +450,7 @@ impl Client {
                     .write(true)
                     .open(filepath)?;
 
-                Self::apply_block(&mut file, metadata.start, &data)?;
+                Self::modify_block(&mut file, metadata.start, &data)?;
             }
 
             // insert into main block
@@ -451,6 +474,14 @@ impl Client {
                     res.1,
                 ],
             )?;
+
+            tracing::debug!(
+                "journal: fetched block {}:[{}, {}] (ck: {:?})",
+                namehash,
+                metadata.start,
+                metadata.end,
+                metadata.cookie
+            );
 
             Ok(data)
         } else {
@@ -530,7 +561,8 @@ impl Client {
                             block.offset as i64,
                             (block.offset + block.length as u64) as i64,
                             cookie,
-                            &block.data,
+                            None,
+                            Some(&block.data),
                             block_hash as i64,
                         )?;
                     } else {
@@ -555,7 +587,8 @@ impl Client {
                         block.offset as i64,
                         (block.offset + block.length as u64) as i64,
                         cookie,
-                        &block.data,
+                        Some(protocol::delta::OpType::Insert),
+                        Some(&block.data),
                         block_hash as i64,
                     )?;
                 }
@@ -653,7 +686,7 @@ impl Client {
                         |r| r.get::<_, i64>(0),
                     ) {
                         // don't check blocks if we did this the instant before
-                        if current_timestamp - last_timestamp <= 1 {
+                        if current_timestamp - last_timestamp <= 2 {
                             return Ok(());
                         }
                     }
@@ -686,6 +719,8 @@ impl Client {
                         }
                     }
                 }
+
+                tracing::info!("WRITE TO {}", event_file);
 
                 // if this fails, then we are trying to fetch some sort of swap file
                 let metadata = metadata(&filename)?;
@@ -828,6 +863,96 @@ impl Client {
         Ok(())
     }
 
+    /// drain the journal of a file's blocks given a cookie
+    /// but treat as a delta
+    fn drain_journaled_delta(
+        &mut self,
+        db: PooledConnection<SqliteConnectionManager>,
+        namehash: i64,
+        cookie: i64,
+    ) -> anyhow::Result<()> {
+        let filename: String = db.query_one(
+            "SELECT name FROM filenames WHERE hash = ?1",
+            [namehash],
+            |r| r.get(0),
+        )?;
+
+        let folder = self
+            .config
+            .folder
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let filepath = folder.join(&filename);
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(filepath)?;
+
+        let mut stmt = db.prepare(
+            "SELECT ROWID, hash, start, end, op FROM journal WHERE file = ?1 AND cookie = ?2
+             ORDER BY CASE WHEN op = 3 THEN 0 ELSE 1 END, CASE WHEN op = 3 THEN -start ELSE start END",
+        )?;
+
+        let mut ops = stmt.query([namehash, cookie])?;
+
+        while let Ok(Some(row)) = ops.next() {
+            let (rowid, hash, start, end, op) = (
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                protocol::delta::OpType::try_from(row.get::<_, i64>(4)? as i32)?,
+            );
+
+            tracing::debug!(
+                "{:?} => {}:[{}, {}] (ck: {})",
+                op,
+                hash,
+                start,
+                end,
+                cookie as u64
+            );
+
+            match op {
+                protocol::delta::OpType::Delete => {
+                    Self::truncate_range(&mut file, start, end)?;
+                }
+
+                protocol::delta::OpType::Insert | protocol::delta::OpType::EqualUnspecified => {
+                    let size_to_read = (end - start) as usize;
+                    let mut data: Vec<u8> = vec![0u8; size_to_read];
+                    let mut contents =
+                        db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, true)?;
+                    contents.read_exact(&mut data)?;
+                    contents.close()?;
+
+                    Self::insert_block(&mut file, start, &data)?;
+                }
+
+                protocol::delta::OpType::Modify => {
+                    let size_to_read = (end - start) as usize;
+                    let mut data: Vec<u8> = vec![0u8; size_to_read];
+                    let mut contents =
+                        db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, true)?;
+                    contents.read_exact(&mut data)?;
+                    contents.close()?;
+
+                    Self::modify_block(&mut file, start, &data)?;
+                }
+            }
+        }
+
+        db.execute(
+            "DELETE FROM journal WHERE file = ?1 AND cookie = ?2",
+            [namehash, cookie],
+        )?;
+
+        tracing::debug!("applied delta {} for file {}", cookie as u64, filename);
+
+        Ok(())
+    }
+
     async fn handle_transfer(
         &mut self,
         code: protocol::Return,
@@ -870,7 +995,10 @@ impl Client {
         // maybe we do not have the file yet, we should not satisfy a transfer for
         // a file we do not have.
         if !self.maybe_request_file_manifest(&filepath).await? {
-            tracing::debug!("file {} does not exist yet, asking for manifest", filename);
+            tracing::debug!(
+                "xfer: file {} does not exist yet, asking for manifest",
+                filename
+            );
             return Ok(());
         }
 
@@ -879,37 +1007,21 @@ impl Client {
             {
                 let hash = xxhash_rust::xxh3::xxh3_64(&data);
                 if hash != metadata.hash {
-                    tracing::debug!("hash mismatch on transfer. skipping");
+                    tracing::debug!("xfer: hash mismatch. skipping");
                     return Ok(());
                 }
             }
 
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
 
-            if let Some(reqs) = outgoing_lock.get_mut(&namehash) {
-                if reqs
+            if let Some(transfer) = outgoing_lock.get_mut(&namehash) {
+                if let Some(t) = transfer
                     .iter()
                     .find(|e| e.start == metadata.start && e.end == metadata.end)
-                    .is_some()
                 {
-                    reqs.retain(|e| !(e.start == metadata.start && e.end == metadata.end));
+                    let op_type = t.op_type;
 
-                    let datahash = xxhash_rust::xxh3::xxh3_64(data.as_slice()) as i64;
-
-                    if let Err(e) = db.execute(
-                        "INSERT INTO blocks (hash, start, end, file) VALUES (?1, ?2, ?3, ?4)",
-                        [
-                            datahash,
-                            metadata.start as i64,
-                            metadata.end as i64,
-                            namehash,
-                        ],
-                    ) {
-                        anyhow::bail!(
-                            "failed to update block metadata in database: {}",
-                            e.to_string()
-                        );
-                    }
+                    transfer.retain(|e| !(e.start == metadata.start && e.end == metadata.end));
 
                     // add access to set
                     {
@@ -917,16 +1029,21 @@ impl Client {
                         accesses_lock.insert(namehash);
                     }
 
-                    let mut file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&filepath)?;
-
                     let block_hash = xxhash_rust::xxh3::xxh3_64(data.as_slice());
 
-                    if let Err(e) = Self::apply_block(&mut file, metadata.start, data.as_slice()) {
+                    if let Err(e) = Self::journal_block(
+                        &db,
+                        namehash,
+                        metadata.start as i64,
+                        metadata.end as i64,
+                        metadata.cookie.map(|c| c as i64),
+                        Some(op_type),
+                        Some(&data),
+                        metadata.hash as i64,
+                    ) {
                         anyhow::bail!(
-                            "failed to write block [{}, {}] to file {}: {}",
+                            "xfer: failed to journal incoming block op {:?} [{}, {}] to file {}: {}",
+                            op_type,
                             metadata.start,
                             metadata.end,
                             filepath.to_string_lossy(),
@@ -935,16 +1052,31 @@ impl Client {
                     }
 
                     tracing::debug!(
-                        "applied block [{}, {}] to file {}, {}",
+                        "xfer: journaled block op {:?} [{}, {}] to file {}, {}",
+                        op_type,
                         metadata.start,
                         metadata.end,
                         filepath.to_string_lossy(),
-                        block_hash as i64,
+                        block_hash,
                     );
 
-                    if reqs.is_empty() {
-                        tracing::debug!("removing outgoing");
+                    if transfer.is_empty() {
+                        tracing::debug!("delta: done with {}", namehash as u64);
+
                         outgoing_lock.remove(&namehash);
+
+                        drop(outgoing_lock);
+
+                        self.drain_journaled_delta(
+                            db,
+                            namehash,
+                            metadata.cookie.unwrap_or(0) as i64,
+                        )?;
+
+                        {
+                            let mut accesses_lock = self.current_accesses.lock().await;
+                            accesses_lock.remove(&namehash);
+                        }
 
                         self.send_ch
                             .as_ref()
@@ -980,13 +1112,12 @@ impl Client {
                 })
                 .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
 
-            // tracing::debug!(
-            //     "sending data for {}:[{}, {}] size {}",
-            //     metadata.hash,
-            //     metadata.start,
-            //     metadata.end,
-            //     length
-            // );
+            tracing::debug!(
+                "sending data for {}:[{}, {}]",
+                metadata.hash,
+                metadata.start,
+                metadata.end,
+            );
         }
 
         Ok(())
@@ -1013,7 +1144,6 @@ impl Client {
         // If we're truncating at the end, we can just resize.
         if end == file_len {
             file.set_len(start)?;
-            file.sync_all()?;
             return Ok(());
         }
 
@@ -1034,14 +1164,30 @@ impl Client {
         }
 
         file.set_len(file_len - range_len)?;
-        file.sync_all()?;
 
         Ok(())
     }
 
-    fn apply_block(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    fn modify_block(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         if data.is_empty() {
-            return Ok(());
+            anyhow::bail!("cannot modify empty data");
+        }
+
+        let file_len = file.metadata()?.len();
+        let write_len = data.len() as u64;
+
+        if offset + write_len >= file_len {
+            file.set_len(offset + write_len)?;
+        }
+
+        file.write_all_at(&data, offset)?;
+
+        Ok(())
+    }
+
+    fn insert_block(file: &mut std::fs::File, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot insert empty data");
         }
 
         let file_len = file.metadata()?.len();
@@ -1052,6 +1198,7 @@ impl Client {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(data)?;
             file.sync_all()?;
+
             return Ok(());
         }
 
@@ -1081,6 +1228,48 @@ impl Client {
         Ok(())
     }
 
+    async fn request_block(
+        &mut self,
+        namehash: i64,
+        transfer_metadata: TransferMetadata,
+    ) -> anyhow::Result<()> {
+        // request transfer
+        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+
+        outgoing_lock
+            .entry(namehash)
+            .and_modify(|o| {
+                o.insert(transfer_metadata);
+            })
+            .or_insert_with(|| {
+                let mut set: HashSet<TransferMetadata> = HashSet::new();
+                set.insert(transfer_metadata);
+                set
+            });
+
+        self.send_ch
+            .as_ref()
+            .map(|ch| {
+                ch.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                        metadata: Some(protocol::BlockMetadata {
+                            start: transfer_metadata.start,
+                            end: transfer_metadata.end,
+                            namehash: Some(namehash as u64),
+                            hash: transfer_metadata.hash,
+                            cookie: transfer_metadata.cookie,
+                        }),
+                        mode: protocol::DataMode::WholeUnspecified as i32,
+                        data: None,
+                    })),
+                }))
+            })
+            .ok_or(anyhow::anyhow!("could not request data transfer"))??;
+
+        Ok(())
+    }
+
     async fn handle_delta(&mut self, mut delta: protocol::Delta) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
@@ -1102,24 +1291,6 @@ impl Client {
 
         let namehash = xxhash_rust::xxh3::xxh3_64(delta.filename.as_bytes()) as i64;
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(filepath)?;
-
-        // inserts should be sorted by starts ascending
-        // deletes should be sorted by starts descending
-        delta.ops.sort_by(|a, b| match (a.op_type(), b.op_type()) {
-            (protocol::delta::OpType::Delete, protocol::delta::OpType::Delete) => {
-                a.start.cmp(&b.start).reverse()
-            }
-            (protocol::delta::OpType::Insert, protocol::delta::OpType::Delete)
-            | (protocol::delta::OpType::Delete, protocol::delta::OpType::Insert) => {
-                std::cmp::Ordering::Equal
-            }
-            _ => a.start.cmp(&b.start),
-        });
-
         for op in dbg!(delta.ops) {
             let existing_hash: Result<i64, _> = {
                 let mut stmt = db.prepare(
@@ -1129,139 +1300,100 @@ impl Client {
                 stmt.query_row((namehash, op.start as i64, op.end as i64), |row| row.get(0))
             };
 
-            match op.op_type() {
-                protocol::delta::OpType::Insert => {
-                    let timestamp = Self::timestamp()?;
-                    let transfer_metadata = TransferMetadata {
-                        start: op.start,
-                        end: op.end,
-                        hash: op.hash,
-                        attempts: 0,
-                        timestamp,
-                        cookie: None,
-                    };
+            let timestamp = Self::timestamp()?;
+            let transfer_metadata = TransferMetadata {
+                op_type: op.op_type(),
+                start: op.start,
+                end: op.end,
+                hash: op.hash,
+                attempts: 0,
+                timestamp,
+                cookie: Some(delta.cookie),
+            };
 
+            match op.op_type() {
+                protocol::delta::OpType::Insert | protocol::delta::OpType::Modify => {
                     if let Ok(hash) = existing_hash {
                         if hash as u64 == op.hash {
                             tracing::debug!(
-                                "block [{}, {}] hash matches, skipping",
+                                "delta: block [{}, {}] hash matches, skipping",
                                 op.start,
                                 op.end
                             );
                             continue;
                         } else {
-                            // request transfer
-                            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                            tracing::debug!(
+                                "delta: block {} ({}, {}) does not exist, requesting from server",
+                                op.hash,
+                                op.start,
+                                op.end
+                            );
 
-                            outgoing_lock
-                                .entry(namehash)
-                                .and_modify(|o| {
-                                    o.insert(transfer_metadata);
-                                })
-                                .or_insert_with(|| {
-                                    let mut set: HashSet<TransferMetadata> = HashSet::new();
-                                    set.insert(transfer_metadata);
-                                    set
-                                });
-
-                            self.send_ch
-                                .as_ref()
-                                .map(|ch| {
-                                    ch.send(Ch::OutPacket(protocol::Packet {
-                                        code: protocol::Return::NoneUnspecified as i32,
-                                        message: Some(protocol::packet::Message::Transfer(
-                                            protocol::Transfer {
-                                                metadata: Some(protocol::BlockMetadata {
-                                                    start: op.start,
-                                                    end: op.end,
-                                                    namehash: Some(namehash as u64),
-                                                    hash: op.hash,
-                                                    cookie: Some(delta.cookie),
-                                                }),
-                                                mode: protocol::DataMode::WholeUnspecified as i32,
-                                                data: None,
-                                            },
-                                        )),
-                                    }))
-                                })
-                                .ok_or(anyhow::anyhow!("could not request data transfer"))??;
+                            self.request_block(namehash, transfer_metadata).await?;
                         }
                     } else {
                         tracing::debug!(
-                            "INSERT: block {} ({}, {}) does not exist, requesting from server",
+                            "delta: block {} ({}, {}) does not exist, requesting from server",
                             op.hash,
                             op.start,
                             op.end
                         );
 
-                        let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-
-                        outgoing_lock
-                            .entry(namehash)
-                            .and_modify(|o| {
-                                o.insert(transfer_metadata);
-                            })
-                            .or_insert_with(|| {
-                                let mut set: HashSet<TransferMetadata> = HashSet::new();
-                                set.insert(transfer_metadata);
-                                set
-                            });
-
-                        // request transfer
-                        self.send_ch
-                            .as_ref()
-                            .map(|ch| {
-                                ch.send(Ch::OutPacket(protocol::Packet {
-                                    code: protocol::Return::NoneUnspecified as i32,
-                                    message: Some(protocol::packet::Message::Transfer(
-                                        protocol::Transfer {
-                                            metadata: Some(protocol::BlockMetadata {
-                                                start: op.start,
-                                                end: op.end,
-                                                namehash: Some(namehash as u64),
-                                                hash: op.hash,
-                                                cookie: Some(delta.cookie),
-                                            }),
-                                            mode: protocol::DataMode::WholeUnspecified as i32,
-                                            data: None,
-                                        },
-                                    )),
-                                }))
-                            })
-                            .ok_or(anyhow::anyhow!("could not request data transfer"))??;
+                        self.request_block(namehash, transfer_metadata).await?;
                     }
                 }
 
                 protocol::delta::OpType::Delete => {
-                    if let Ok(hash) = existing_hash {
-                        // remove block from file and metadata table
-                        db.execute("DELETE FROM blocks WHERE file = ?1 AND hash = ?2 AND start = ?3 AND end = ?4",
-                            [
-                                namehash,
-                                hash,
-                                op.start as i64,
-                                op.end as i64,
-                            ]
-                        )?;
+                    // remove block from file and metadata table
+                    {
+                        let mut accesses_lock = self.current_accesses.lock().await;
+                        accesses_lock.insert(namehash);
+                    }
 
-                        {
-                            let mut accesses_lock = self.current_accesses.lock().await;
-                            accesses_lock.insert(namehash);
-                        }
+                    Self::journal_block(
+                        &db,
+                        namehash,
+                        op.start as i64,
+                        op.end as i64,
+                        Some(delta.cookie as i64),
+                        Some(protocol::delta::OpType::Delete),
+                        None,
+                        op.hash as i64,
+                    )?;
 
-                        Self::truncate_range(&mut file, op.start, op.end)?;
-
-                        tracing::debug!(
-                            "delta: deleting block [{},{}] for file {}",
-                            op.start,
-                            op.end,
-                            delta.filename
-                        );
+                    {
+                        let mut accesses_lock = self.current_accesses.lock().await;
+                        accesses_lock.remove(&namehash);
                     }
                 }
 
                 _ => {}
             }
+        }
+
+        let has_pending_transfers = {
+            let outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            outgoing_lock.contains_key(&namehash)
+        };
+
+        // if there arent any transfers needed send done
+        if !has_pending_transfers {
+            self.send_ch
+                .as_ref()
+                .map(|ch| {
+                    ch.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::Done(protocol::TransferDone {
+                            namehash: namehash as u64,
+                        })),
+                    }))
+                })
+                .ok_or(anyhow::anyhow!("failed to send done signal after delta"))??;
+
+            tracing::debug!(
+                "delta: no transfers needed for {}, sending done",
+                delta.filename
+            );
         }
 
         Ok(())
@@ -1271,7 +1403,7 @@ impl Client {
         &self,
         db: &PooledConnection<SqliteConnectionManager>,
         name_string: &str,
-        name_hash: i64,
+        namehash: i64,
     ) -> anyhow::Result<()> {
         let folder = self
             .config
@@ -1282,7 +1414,7 @@ impl Client {
 
         db.execute(
             "INSERT OR IGNORE INTO filenames (name, hash, timestamp) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
-            (name_string, name_hash, Self::timestamp()? as i64),
+            (name_string, namehash, Self::timestamp()? as i64),
         )?;
 
         if metadata(&filepath).is_err() {
@@ -1295,24 +1427,21 @@ impl Client {
     fn delete_file_by_hash(
         &mut self,
         db: &PooledConnection<SqliteConnectionManager>,
-        name_hash: i64,
+        namehash: i64,
     ) -> anyhow::Result<()> {
-        db.execute("DELETE FROM blocks WHERE file = ?1", [name_hash])?;
+        db.execute("DELETE FROM blocks WHERE file = ?1", [namehash])?;
 
-        tracing::debug!("deleted all blocks related to file {} in folder", name_hash,);
+        tracing::debug!("deleted all blocks related to file {} in folder", namehash,);
 
         let filename: String = db.query_one(
             "SELECT name FROM filenames WHERE hash = ?1",
-            [name_hash],
+            [namehash],
             |r| r.get(0),
         )?;
 
-        db.execute("DELETE FROM filenames WHERE hash = ?1", [name_hash])?;
+        db.execute("DELETE FROM filenames WHERE hash = ?1", [namehash])?;
 
-        tracing::debug!(
-            "deleted filename entry for namehash {} in folder",
-            name_hash,
-        );
+        tracing::debug!("deleted filename entry for namehash {} in folder", namehash,);
 
         let folder = self
             .config
@@ -1420,6 +1549,7 @@ impl Client {
                     {
                         // cookies from manifests are None
                         set.insert(TransferMetadata {
+                            op_type: protocol::delta::OpType::EqualUnspecified,
                             start: block.start,
                             end: block.end,
                             hash: block.hash,
@@ -1477,16 +1607,25 @@ impl Client {
     async fn handle_sendagain(&mut self, sendagain: protocol::SendAgain) -> anyhow::Result<()> {
         // if there's a queued manifest, send it over now
         let mut queue_lock = self.queued_manifests.lock().await;
-        if let Some(next_manifest) = queue_lock.remove(&(sendagain.namehash as i64)) {
-            tracing::warn!("sending queued manifest for {}", sendagain.namehash);
 
-            self.send_ch.as_ref().map(|ch| {
-                ch.send(Ch::OutPacket(protocol::Packet {
-                    code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Manifest(next_manifest)),
-                }))
-            });
-        }
+        tracing::warn!("sending queued manifest for {}", sendagain.namehash);
+
+        self.send_ch.as_ref().map(|ch| {
+            ch.send(Ch::OutPacket(protocol::Packet {
+                code: protocol::Return::NoneUnspecified as i32,
+                message: Some(
+                    // we should resend a manifest
+                    if let Some(next_manifest) = queue_lock.remove(&(sendagain.namehash as i64)) {
+                        protocol::packet::Message::Manifest(next_manifest)
+                    } else {
+                        // we are done and should send a done to unlock the file on the server
+                        protocol::packet::Message::Done(protocol::TransferDone {
+                            namehash: sendagain.namehash,
+                        })
+                    },
+                ),
+            }))
+        });
 
         Ok(())
     }
@@ -1529,17 +1668,30 @@ impl Client {
         Ok(())
     }
 
+    async fn check_queued_manifests(&mut self) -> anyhow::Result<()> {
+        let mut manifests_lock = self.queued_manifests.lock().await;
+
+        manifests_lock.drain().for_each(|(namehash, manifest)| {
+            tracing::debug!("sending queued manifest for {}", namehash as u64);
+
+            self.send_ch.as_ref().map(|ch| {
+                ch.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Manifest(manifest)),
+                }))
+            });
+        });
+
+        Ok(())
+    }
+
     async fn check_outgoing_transfers(&mut self) -> anyhow::Result<()> {
         let current_timestamp = Self::timestamp()?;
 
-        for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
-            let late_requests: Vec<TransferMetadata> = item
-                .extract_if(|e| current_timestamp - e.timestamp >= REFRESH_INTERVAL)
-                .collect();
-
-            late_requests
-                .iter()
-                .map(|req| {
+        for (namehash, requests) in self.outgoing_transfer_requests.lock().await.iter_mut() {
+            let temp: Vec<TransferMetadata> = requests
+                .drain()
+                .filter(|req| {
                     if req.attempts + 1 >= REFRESH_ATTEMPTS {
                         tracing::debug!(
                             "request for {}:{}:[{}, {}] max attempts reached",
@@ -1549,7 +1701,7 @@ impl Client {
                             req.end,
                         );
 
-                        return Ok(());
+                        return false;
                     }
 
                     let metadata = protocol::BlockMetadata {
@@ -1560,7 +1712,8 @@ impl Client {
                         cookie: req.cookie,
                     };
 
-                    self.send_ch
+                    if let Err(e) = self
+                        .send_ch
                         .as_ref()
                         .map(|ch| {
                             ch.send(Ch::OutPacket(protocol::Packet {
@@ -1574,16 +1727,12 @@ impl Client {
                                 )),
                             }))
                         })
-                        .ok_or(anyhow::anyhow!("could not send transfer request"))??;
+                        .ok_or(anyhow::anyhow!("could not send transfer request"))
+                    {
+                        tracing::error!("resend transfer error: {}", e.to_string());
 
-                    item.insert(TransferMetadata {
-                        start: req.start,
-                        end: req.end,
-                        hash: req.hash,
-                        attempts: req.attempts + 1,
-                        timestamp: Self::timestamp()?,
-                        cookie: req.cookie,
-                    });
+                        return true;
+                    }
 
                     tracing::debug!(
                         "resending transfer request: {}:{}:[{}, {}]",
@@ -1593,9 +1742,22 @@ impl Client {
                         req.end,
                     );
 
-                    anyhow::Ok(())
+                    true
                 })
-                .collect::<anyhow::Result<()>>()?;
+                .map(|req| TransferMetadata {
+                    op_type: req.op_type,
+                    start: req.start,
+                    end: req.end,
+                    hash: req.hash,
+                    attempts: req.attempts + 1,
+                    timestamp: current_timestamp,
+                    cookie: req.cookie,
+                })
+                .collect();
+
+            temp.iter().for_each(|req| {
+                requests.insert(*req);
+            });
         }
 
         Ok(())
@@ -1643,25 +1805,41 @@ impl Client {
                         // packet coming in from the wire
                         Some(Ch::InPacket(pkt)) => {
                             if let Err(e) = client.handle_server_event(pkt).await {
-                                tracing::error!("server event error: {}", e.backtrace());
+                                tracing::error!(
+                                    "server event error: {}\n{}",
+                                    e.to_string(),
+                                    e.backtrace()
+                                );
                             }
                         }
 
                         // we have to send this over the wire
                         Some(Ch::OutPacket(pkt)) => {
                             if let Err(e) = Self::write_packet(&mut send, &pkt).await {
-                                tracing::error!("write packet error: {}", e.backtrace());
+                                tracing::error!(
+                                    "write packet error: {}\n{}",
+                                    e.to_string(),
+                                    e.backtrace()
+                                );
                             }
                         }
 
                         Some(Ch::Event(ev)) => {
                             if let Err(e) = client.handle_file_event(ev).await {
-                                tracing::error!("handle event error: {}", e.backtrace());
+                                tracing::error!(
+                                    "handle event error: {}\n{}",
+                                    e.to_string(),
+                                    e.backtrace()
+                                );
                             }
                         }
 
                         // check on outgoing transfer requests
                         Some(Ch::Refresh) => {
+                            if let Err(e) = client.check_queued_manifests().await {
+                                tracing::error!("queued manifests check error: {}", e.to_string());
+                            }
+
                             if let Err(e) = client.check_outgoing_transfers().await {
                                 tracing::error!("outgoing transfer check error: {}", e.to_string());
                             }
