@@ -889,6 +889,7 @@ impl Client {
             .write(true)
             .open(filepath)?;
 
+        // fetch delta ops sorted in proper order
         let mut stmt = db.prepare(
             "SELECT ROWID, hash, start, end, op FROM journal WHERE file = ?1 AND cookie = ?2
              ORDER BY CASE WHEN op = 3 THEN 0 ELSE 1 END, CASE WHEN op = 3 THEN -start ELSE start END",
