@@ -1,0 +1,28 @@
+[package]
+name = "hsync-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.56", features = ["derive"] }
+fastcdc = "3.2.1"
+futures = "0.3.31"
+glob = "0.3.3"
+inotify = "0.11.0"
+prost = "0.14.3"
+prost-types = "0.14.3"
+quinn = "0.11.9"
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.32.0"
+rand = "0.9.2"
+rusqlite = { version = "0.38.0", features = ["blob"] }
+rustls = "0.23.36"
+rustls-platform-verifier = "0.6.2"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+
+[build-dependencies]
+prost-build = "0.14.3"
