@@ -481,13 +481,14 @@ impl Client {
 
             // delete from journal
             db.execute(
-                "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4",
-                [
+                "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 AND cookie = ?5",
+                (
                     namehash as i64,
                     metadata.start as i64,
                     metadata.end as i64,
                     res.1,
-                ],
+                    metadata.cookie.map(|c| c as i64),
+                ),
             )?;
 
             tracing::debug!(
@@ -709,7 +710,7 @@ impl Client {
                         |r| r.get::<_, i64>(0),
                     ) {
                         // don't check blocks if we did this the instant before
-                        if current_timestamp - last_timestamp <= 1 {
+                        if current_timestamp == last_timestamp {
                             return Ok(());
                         }
                     }
@@ -958,8 +959,6 @@ impl Client {
             [namehash, cookie],
         )?;
 
-        tracing::debug!("applied delta {} for file {}", cookie as u64, filename);
-
         Ok(())
     }
 
@@ -1027,16 +1026,18 @@ impl Client {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
 
             if let Some(entry) = outgoing_lock.get_mut(&namehash) {
-                if let Some(t) = entry
-                    .transfers
-                    .iter()
-                    .find(|e| e.start == metadata.start && e.end == metadata.end)
-                {
+                if let Some(t) = entry.transfers.iter().find(|e| {
+                    e.start == metadata.start
+                        && e.end == metadata.end
+                        && e.cookie == metadata.cookie
+                }) {
                     let op_type = t.op_type;
 
-                    entry
-                        .transfers
-                        .retain(|e| !(e.start == metadata.start && e.end == metadata.end));
+                    entry.transfers.retain(|e| {
+                        !(e.start == metadata.start
+                            && e.end == metadata.end
+                            && e.cookie == metadata.cookie)
+                    });
 
                     // add access to set
                     {
@@ -1057,6 +1058,11 @@ impl Client {
                         metadata.hash as i64,
                         &entry.progress_bar,
                     ) {
+                        {
+                            let mut accesses_lock = self.current_accesses.lock().await;
+                            accesses_lock.remove(&namehash);
+                        }
+
                         anyhow::bail!(
                             "xfer: failed to journal incoming block op {:?} [{}, {}] to file {}: {}",
                             op_type,
@@ -1114,7 +1120,30 @@ impl Client {
             }
         } else {
             // otherwise, we are fulfilling a data request
-            let data = self.fetch_block(&db, &filepath, namehash, metadata.clone())?;
+            let data = match self.fetch_block(&db, &filepath, namehash, metadata.clone()) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("{}", e.to_string());
+
+                    self.send_ch
+                        .as_ref()
+                        .map(|ch| {
+                            ch.send(Ch::OutPacket(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: Some(protocol::packet::Message::Transfer(
+                                    protocol::Transfer {
+                                        metadata: Some(metadata),
+                                        mode: protocol::DataMode::WholeUnspecified as i32,
+                                        data: None,
+                                    },
+                                )),
+                            }))
+                        })
+                        .ok_or(anyhow::anyhow!("failed to send transfer data"))??;
+
+                    return Ok(());
+                }
+            };
 
             self.send_ch
                 .as_ref()

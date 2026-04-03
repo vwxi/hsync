@@ -10,10 +10,28 @@ This script randomly mutates files by:
 """
 
 import argparse
+import hashlib
 import os
 import random
 import time
 from typing import Optional
+
+
+def calculate_file_hash(file_path: str) -> str:
+    """
+    Calculate SHA256 hash of a file.
+    
+    Args:
+        file_path: Path to the file
+        
+    Returns:
+        Hexadecimal hash string
+    """
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b''):
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
 
 def mutate_byte_range(
@@ -57,6 +75,9 @@ def mutate_byte_range(
         
         print(f"Mutated {actual_length} bytes at offset {offset}")
     
+    file_hash = calculate_file_hash(file_path)
+    print(f"Hash: {file_hash}")
+    
     time.sleep(pause_between)
 
 
@@ -97,6 +118,10 @@ def insert_data(
         f.write(tail_data)
     
     print(f"Inserted {size} bytes at offset {offset}")
+    
+    file_hash = calculate_file_hash(file_path)
+    print(f"Hash: {file_hash}")
+    
     time.sleep(pause_between)
 
 
@@ -140,6 +165,10 @@ def remove_data(
         f.truncate()
     
     print(f"Removed {actual_size} bytes at offset {offset}")
+    
+    file_hash = calculate_file_hash(file_path)
+    print(f"Hash: {file_hash}")
+    
     time.sleep(pause_between)
 
 
