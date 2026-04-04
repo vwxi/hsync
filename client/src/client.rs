@@ -24,7 +24,7 @@ use rustls::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
-    sync::{Mutex, MutexGuard, mpsc},
+    sync::{Mutex, MutexGuard, mpsc, oneshot},
 };
 use tracing::instrument;
 use xxhash_rust;
@@ -288,8 +288,6 @@ impl Client {
             match entry {
                 Ok(path) => {
                     Self::process_change_get_blocks(&path, current_timestamp, None, db)?;
-
-                    tracing::debug!("parsed blocks for file {}", path.to_string_lossy());
                 }
                 _ => continue,
             }
@@ -445,8 +443,8 @@ impl Client {
                         })))
                         .ok_or(anyhow::anyhow!("could not send block error"))??;
 
-                    anyhow::bail!("could not find block {}:{}:[{}, {}], {}",
-                        metadata.namehash(), metadata.hash, metadata.start, metadata.end, e.to_string());
+                    anyhow::bail!("could not find block {}:{}:[{}, {}] (ck: {:?}), {}",
+                        metadata.namehash(), metadata.hash, metadata.start, metadata.end, metadata.cookie, e.to_string());
                 }
             };
 
@@ -456,7 +454,8 @@ impl Client {
                 db.blob_open(rusqlite::MAIN_DB, "journal", "contents", res.0, true)?;
             contents.read_exact(&mut data)?;
 
-            metadata.hash = res.1 as u64;
+            // correct hash
+            metadata.hash = xxhash_rust::xxh3::xxh3_64(&data);
 
             // write journaled block to file
             {
@@ -475,7 +474,7 @@ impl Client {
                     namehash as i64,
                     metadata.start as i64,
                     metadata.end as i64,
-                    res.1,
+                    metadata.hash as i64,
                 ],
             )?;
 
@@ -783,7 +782,7 @@ impl Client {
                     }))
                 });
 
-                tracing::debug!("sending manifest for file {}", event_file);
+                tracing::debug!("sending manifest for file {} (ck: {})", event_file, cookie);
             }
             EventMask::DELETE_SELF | EventMask::IGNORED => {
                 // destroy client because folder is no longer watchable
@@ -799,28 +798,24 @@ impl Client {
         tracing::info!("connect to this room using this code: {}", room_info.code);
 
         let db = self.db_pool.get()?;
-        {
-            for file in room_info.files {
-                let mut stmt = db.prepare("SELECT * FROM filenames WHERE name = ?1")?;
+        for file in room_info.files {
+            let mut stmt = db.prepare("SELECT * FROM filenames WHERE name = ?1")?;
 
-                // if file does not exist, request manifest
-                if stmt.query_one([file.name.clone()], |_| Ok(())).is_err() {
-                    tracing::debug!("file {} does not exist, requesting manifest", file.name);
+            // if file does not exist, request manifest
+            if stmt.query_one([file.name.clone()], |_| Ok(())).is_err() {
+                tracing::debug!("file {} does not exist, requesting manifest", file.name);
 
-                    self.send_ch
-                        .as_ref()
-                        .map(|ch| {
-                            ch.send(Ch::OutPacket(protocol::Packet {
-                                code: protocol::Return::NoneUnspecified as i32,
-                                message: Some(protocol::packet::Message::Whatis(
-                                    protocol::WhatIs {
-                                        filename: file.name.clone(),
-                                    },
-                                )),
-                            }))
-                        })
-                        .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
-                }
+                self.send_ch
+                    .as_ref()
+                    .map(|ch| {
+                        ch.send(Ch::OutPacket(protocol::Packet {
+                            code: protocol::Return::NoneUnspecified as i32,
+                            message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
+                                filename: file.name.clone(),
+                            })),
+                        }))
+                    })
+                    .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
             }
         }
 
@@ -1691,6 +1686,67 @@ impl Client {
         Ok(())
     }
 
+    async fn handle_die(&mut self, die: protocol::Die) -> anyhow::Result<()> {
+        tracing::warn!("die: {:?}", die.reason);
+
+        Ok(())
+    }
+
+    async fn handle_whatis(&mut self, whatis: protocol::WhatIs) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+
+        let mut stmt = db.prepare("SELECT hash FROM filenames WHERE name = ?1")?;
+
+        stmt.query_one([whatis.filename.clone()], |row| {
+            let namehash = row.get::<_, i64>(0)?;
+
+            let mut blocks_stmt =
+                db.prepare("SELECT hash, start, end FROM blocks WHERE file = ?1")?;
+
+            let largest_end_offset = db.query_one(
+                "SELECT MAX(end) FROM blocks WHERE file = ?1",
+                [namehash],
+                |r| r.get::<_, i64>(0),
+            )? as u64;
+
+            let mut manifest = protocol::FileManifest {
+                filename: whatis.filename,
+                timestamp: Self::timestamp().map_err(|_| rusqlite::Error::UnwindingPanic)?,
+                size: largest_end_offset,
+                cookie: Some(rand::random()),
+                blocks: vec![],
+            };
+
+            let mut blocks = blocks_stmt.query([namehash])?;
+            while let Ok(Some(block)) = blocks.next() {
+                manifest.blocks.push(protocol::BlockMetadata {
+                    hash: block.get::<_, i64>(0)? as u64,
+                    start: block.get::<_, i64>(1)? as u64,
+                    end: block.get::<_, i64>(2)? as u64,
+                    cookie: manifest.cookie,
+                    namehash: None,
+                });
+            }
+
+            tracing::debug!("sending manifest for file {}", manifest.filename);
+
+            self.send_ch
+                .as_ref()
+                .map(|ch| {
+                    ch.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::Manifest(manifest)),
+                    }))
+                })
+                .ok_or(rusqlite::Error::UnwindingPanic)?
+                .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
     async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
         // responded to our heartbeat
         if packet.message.is_none() {
@@ -1701,6 +1757,10 @@ impl Client {
         let message = packet.message.unwrap();
 
         match message {
+            protocol::packet::Message::Die(die) => {
+                self.handle_die(die).await?;
+            }
+
             protocol::packet::Message::RoomInfo(room_info) => {
                 self.handle_roominfo(room_info).await?;
             }
@@ -1722,6 +1782,8 @@ impl Client {
             protocol::packet::Message::SendAgain(sendagain) => {
                 self.handle_sendagain(sendagain).await?
             }
+
+            protocol::packet::Message::Whatis(whatis) => self.handle_whatis(whatis).await?,
 
             _ => {}
         }
@@ -1830,6 +1892,13 @@ impl Client {
         let (mut client_, mut inotify_stream) = Self::new(config)?;
         let (_, mut send, mut recv) = client_.connect().await?;
 
+        let token = tokio_util::sync::CancellationToken::new();
+        let term_token = token.clone();
+        let hb_token = token.clone();
+        let rf_token = token.clone();
+        let in_token = token.clone();
+        let se_token = token.clone();
+
         let (send_ch, mut recv_ch) = mpsc::unbounded_channel::<Ch>();
 
         client_.send_ch = Some(send_ch.clone());
@@ -1840,6 +1909,11 @@ impl Client {
         let se_send_ch = send_ch.clone();
 
         let futs = vec![
+            // term thread
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                term_token.cancel();
+            }),
             // handle channel thread
             tokio::spawn(async move {
                 let mut client = client_;
@@ -1863,40 +1937,48 @@ impl Client {
                 }
 
                 loop {
-                    match recv_ch.recv().await {
-                        // packet coming in from the wire
-                        Some(Ch::InPacket(pkt)) => {
-                            if let Err(e) = client.handle_server_event(pkt).await {
-                                tracing::error!("server event error: {}", e.to_string(),);
+                    tokio::select! {
+                        r = recv_ch.recv() => {
+                            match r {
+                                // packet coming in from the wire
+                                Some(Ch::InPacket(pkt)) => {
+                                    if let Err(e) = client.handle_server_event(pkt).await {
+                                        tracing::error!("server event error: {}", e.to_string(),);
+                                    }
+                                }
+
+                                // we have to send this over the wire
+                                Some(Ch::OutPacket(pkt)) => {
+                                    if let Err(e) = Self::write_packet(&mut send, &pkt).await {
+                                        tracing::error!("write packet error: {}", e.to_string(),);
+                                    }
+                                }
+
+                                Some(Ch::Event(ev)) => {
+                                    if let Err(e) = client.handle_file_event(ev).await {
+                                        tracing::error!("handle event error: {}", e.to_string(),);
+                                    }
+                                }
+
+                                // check on outgoing transfer requests
+                                Some(Ch::Refresh) => {
+                                    if let Err(e) = client.check_queued_manifests().await {
+                                        tracing::error!("queued manifests check error: {}", e.to_string());
+                                    }
+
+                                    if let Err(e) = client.check_outgoing_transfers().await {
+                                        tracing::error!("outgoing transfer check error: {}", e.to_string());
+                                    }
+                                }
+
+                                None => {
+                                    tracing::error!("recv queue error");
+                                }
                             }
                         }
 
-                        // we have to send this over the wire
-                        Some(Ch::OutPacket(pkt)) => {
-                            if let Err(e) = Self::write_packet(&mut send, &pkt).await {
-                                tracing::error!("write packet error: {}", e.to_string(),);
-                            }
-                        }
-
-                        Some(Ch::Event(ev)) => {
-                            if let Err(e) = client.handle_file_event(ev).await {
-                                tracing::error!("handle event error: {}", e.to_string(),);
-                            }
-                        }
-
-                        // check on outgoing transfer requests
-                        Some(Ch::Refresh) => {
-                            if let Err(e) = client.check_queued_manifests().await {
-                                tracing::error!("queued manifests check error: {}", e.to_string());
-                            }
-
-                            if let Err(e) = client.check_outgoing_transfers().await {
-                                tracing::error!("outgoing transfer check error: {}", e.to_string());
-                            }
-                        }
-
-                        None => {
-                            tracing::error!("recv queue error");
+                        _ = token.cancelled() => {
+                            break;
                         }
                     }
                 }
@@ -1906,13 +1988,20 @@ impl Client {
                 tracing::debug!("starting heartbeat thread");
 
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL)) => {
+                            if let Err(e) = hb_send_ch.send(Ch::OutPacket(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: None,
+                            })) {
+                                tracing::error!("heartbeat send error: {}", e.to_string());
+                                break;
+                            }
+                        }
 
-                    if let Err(e) = hb_send_ch.send(Ch::OutPacket(protocol::Packet {
-                        code: protocol::Return::NoneUnspecified as i32,
-                        message: None,
-                    })) {
-                        tracing::error!("heartbeat send error: {}", e.to_string());
+                        _ = hb_token.cancelled() => {
+                            break;
+                        }
                     }
                 }
             }),
@@ -1921,10 +2010,17 @@ impl Client {
                 tracing::debug!("starting refresh thread");
 
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(REFRESH_INTERVAL)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL)) => {
+                            if let Err(e) = rf_send_ch.send(Ch::Refresh) {
+                                tracing::error!("refresh error: {}", e.to_string());
+                                break;
+                            }
+                        }
 
-                    if let Err(e) = rf_send_ch.send(Ch::Refresh) {
-                        tracing::error!("refresh error: {}", e.to_string());
+                        _ = rf_token.cancelled() => {
+                            break;
+                        }
                     }
                 }
             }),
@@ -1933,9 +2029,16 @@ impl Client {
                 tracing::debug!("starting inotify stream thread");
 
                 loop {
-                    if let Some(Ok(event)) = inotify_stream.next().await {
-                        if let Err(e) = in_send_ch.send(Ch::Event(event)) {
-                            tracing::error!("inotify send error: {}", e.to_string());
+                    tokio::select! {
+                        Some(Ok(event)) = inotify_stream.next() => {
+                            if let Err(e) = in_send_ch.send(Ch::Event(event)) {
+                                tracing::error!("inotify send error: {}", e.to_string());
+                                break;
+                            }
+                        }
+
+                        _ = in_token.cancelled() => {
+                            break;
                         }
                     }
                 }
@@ -1945,9 +2048,16 @@ impl Client {
                 tracing::debug!("starting server event thread");
 
                 loop {
-                    if let Ok(Some(pkt)) = Self::read_packet(&mut recv).await {
-                        if let Err(e) = se_send_ch.send(Ch::InPacket(pkt)) {
-                            tracing::error!("server event read error: {}", e.to_string());
+                    tokio::select! {
+                        Ok(Some(pkt)) = Self::read_packet(&mut recv) => {
+                            if let Err(e) = se_send_ch.send(Ch::InPacket(pkt)) {
+                                tracing::error!("server event read error: {}", e.to_string());
+                                break;
+                            }
+                        }
+
+                        _ = se_token.cancelled() => {
+                            break;
                         }
                     }
                 }

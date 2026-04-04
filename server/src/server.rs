@@ -34,7 +34,7 @@ const REFRESH_INTERVAL: u64 = 5;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
-const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT)";
+const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT, UNIQUE(code))";
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 
@@ -223,9 +223,15 @@ impl Server {
 
         let (send, mut recv) = unbounded_channel::<Ch>();
 
+        let token = tokio_util::sync::CancellationToken::new();
+        let ce_token = token.clone();
+        let rf_token = token.clone();
+
         let rf_send_ch = send.clone();
         let self_ = self.clone();
         let self2_ = self.clone();
+
+        let addr = conn.remote_address();
 
         {
             let mut lock = self.streams.write().await;
@@ -238,19 +244,36 @@ impl Server {
                 tracing::debug!("starting channel handler thread");
 
                 loop {
-                    match recv.recv().await {
-                        Some(Ch::OutPacket(pkt)) => {
-                            if let Err(e) = Self::write_packet(&mut conn_send, &pkt).await {
-                                tracing::error!("write to client error: {}", e.to_string());
+                    tokio::select! {
+                        m = recv.recv() => {
+                            match m {
+                                Some(Ch::OutPacket(pkt)) => {
+                                    match Self::write_packet(&mut conn_send, &pkt).await {
+                                        Err(e) => {
+                                            tracing::error!("write packet error: {}", e.to_string());
+
+                                            token.cancel();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Some(Ch::Refresh) => {
+                                    if let Err(e) = self_.check_outgoing_transfers().await {
+                                        tracing::error!("outgoing transfer check error: {}", e.to_string());
+                                    }
+                                }
+                                None => {
+                                    tracing::error!("recv queue error");
+                                }
                             }
                         }
-                        Some(Ch::Refresh) => {
-                            if let Err(e) = self_.check_outgoing_transfers().await {
-                                tracing::error!("outgoing transfer check error: {}", e.to_string());
-                            }
-                        }
-                        None => {
-                            tracing::error!("recv queue error");
+
+                        _ = token.cancelled() => {
+                            tracing::debug!("ending channel handler thread");
+
+                            let _ = self_.handle_die(addr, protocol::Die { reason: None }).await;
+
+                            break;
                         }
                     }
                 }
@@ -260,9 +283,25 @@ impl Server {
                 tracing::debug!("starting client event thread");
 
                 loop {
-                    if let Ok(Some(pkt)) = Self::read_packet(&mut conn_recv).await {
-                        if let Err(e) = self2_.handle_packet(conn.remote_address(), pkt).await {
-                            tracing::error!("packet handler: {}", e.to_string());
+                    tokio::select! {
+                        _ = ce_token.cancelled() => {
+                            break;
+                        }
+
+                        p = Self::read_packet(&mut conn_recv) => {
+                            match p {
+                                Ok(Some(pkt)) => {
+                                    if let Err(e) = self2_.handle_packet(conn.remote_address(), pkt).await {
+                                        tracing::error!("packet handler: {}", e.to_string());
+                                    }
+                                }
+
+                                _ => {
+                                    tracing::debug!("ending client event thread");
+
+                                    ce_token.cancel();
+                                }
+                            }
                         }
                     }
                 }
@@ -272,10 +311,18 @@ impl Server {
                 tracing::debug!("starting refresh thread");
 
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(REFRESH_INTERVAL)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(REFRESH_INTERVAL)) => {
+                            if let Err(e) = rf_send_ch.send(Ch::Refresh) {
+                                tracing::error!("refresh error: {}", e.to_string());
+                            }
+                        }
 
-                    if let Err(e) = rf_send_ch.send(Ch::Refresh) {
-                        tracing::error!("refresh error: {}", e.to_string());
+                        _ = rf_token.cancelled() => {
+                            tracing::debug!("ending refresh thread");
+
+                            break;
+                        }
                     }
                 }
             }),
@@ -479,26 +526,24 @@ impl Server {
                 message: Some(
                     if let Ok((folder_code, folder_id)) = {
                         // generate folder and return folder code
+
+                        let mut hasher = blake2::Blake2b512::new();
+                        hasher.update(&auth.password);
+                        let final_hash = hasher.finalize();
+                        let digest = base16ct::lower::encode_string(&final_hash);
+
                         let (folder_code, folder_id) = loop {
                             let folder_code = Self::generate_folder_code();
 
                             let mut stmt = db.prepare(
                                 "
                                 INSERT INTO folders (code, password)
-                                SELECT ?1, ?2
-                                WHERE NOT EXISTS (
-                                    SELECT 1 FROM folders WHERE code = ?1
-                                )
-                                RETURNING code, id;
+                                VALUES (?1, ?2)
+                                RETURNING code, id
                                 ",
                             )?;
 
-                            let mut hasher = blake2::Blake2b512::new();
-                            hasher.update(&auth.password);
-                            let final_hash = hasher.finalize();
-                            let digest = base16ct::lower::encode_string(&final_hash);
-
-                            if let Ok((code, id)) = stmt.query_one([&folder_code, &digest], |row| {
+                            if let Ok((code, id)) = stmt.query_row([&folder_code, &digest], |row| {
                                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                             }) {
                                 tracing::debug!("created new room {}", folder_code);
@@ -518,6 +563,7 @@ impl Server {
                     } {
                         let mut stmt =
                             db.prepare("SELECT name FROM filenames WHERE folder = ?1")?;
+
                         let files: Vec<protocol::room_info::File> = stmt
                             .query_map([folder_id], |row| {
                                 let name = row.get::<_, String>(0)?;
@@ -543,6 +589,48 @@ impl Server {
         Ok(())
     }
 
+    /// if a client disconnects before a delta xfer is complete,
+    /// the data will be corrupted. this routine allows a file to be restored
+    /// by clearing the files and requesting xfers from any other client
+    async fn clean_file(
+        self: &Arc<Self>,
+        db: PooledConnection<SqliteConnectionManager>,
+        ignore_addr: SocketAddr,
+        folder_id: i64,
+        namehash: i64,
+    ) -> anyhow::Result<()> {
+        let filename: String = db.query_one(
+            "SELECT name FROM filenames WHERE folder = ?1 AND namehash = ?2",
+            [folder_id, namehash],
+            |r| r.get(0),
+        )?;
+
+        db.execute(
+            "DELETE FROM blocks WHERE folder = ?1 AND name = ?2",
+            (folder_id, namehash),
+        )?;
+
+        let streams_lock = self.streams.read().await;
+        for stream in streams_lock.iter() {
+            if *stream.0 == ignore_addr {
+                continue;
+            }
+
+            tracing::debug!("trying to clean {} by asking {}", filename, stream.0);
+
+            stream.1.send(Ch::OutPacket(protocol::Packet {
+                code: protocol::Return::NoneUnspecified as i32,
+                message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
+                    filename,
+                })),
+            }))?;
+
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
     async fn handle_die(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -550,29 +638,47 @@ impl Server {
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
+        let folder_id = {
+            let mut stmt = db.prepare("SELECT current_folder FROM users WHERE addr = ?1")?;
+            stmt.query_one([addr.to_string()], |r| r.get::<_, i64>(0))?
+        };
+
+        // delete folder if last user left in folder
         db.execute(
-            "
-            DELETE FROM folders
-            WHERE id IN (
-                SELECT current_folder FROM users WHERE addr = ?1
-            )
-            AND (
-                SELECT COUNT(*) FROM users WHERE current_folder = (
-                    SELECT current_folder FROM users WHERE addr = ?1
-                )
-            ) = 1
-            ",
+            "DELETE FROM folders WHERE(SELECT COUNT(*)FROM users WHERE
+            current_folder=folders.id)=1 AND EXISTS(SELECT 1 FROM users WHERE
+            current_folder=folders.id AND addr=?1)",
             [addr.to_string()],
         )?;
 
         db.execute("DELETE FROM users WHERE addr = ?1", [addr.to_string()])?;
 
-        let mut streams_lock = self.streams.write().await;
-        streams_lock
-            .remove(&addr)
-            .ok_or(anyhow::anyhow!("tried to remove non-existant stream"))?;
+        // remove stream
+        {
+            let mut streams_lock = self.streams.write().await;
+            streams_lock
+                .remove(&addr)
+                .ok_or(anyhow::anyhow!("tried to remove non-existant stream"))?;
+        }
 
-        tracing::debug!("peer {} disconnected", addr);
+        // remove any deltas or xfer requests
+        {
+            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            if let Some((namehash, _)) = outgoing_lock.iter_mut().find(|(_, v)| v.who == addr) {
+                {
+                    let mut deltas_lock = self.pending_deltas.lock().await;
+                    deltas_lock.remove(namehash);
+                }
+
+                // TODO: MARK FILE AS "DIRTY" AND REQUEST FILE AGAIN FROM ANY OTHER USER
+                // IF NO OTHER USERS, DELETE FILE ENTRY
+                self.clean_file(db, addr, folder_id, *namehash).await?;
+            }
+
+            outgoing_lock.retain(|_, v| v.who != addr);
+        }
+
+        tracing::debug!("peer {} disconnected: {:?}", addr, die.reason);
 
         Ok(())
     }
@@ -767,13 +873,13 @@ impl Server {
         self: &Arc<Self>,
         folder_id: i64,
         name_string: &str,
-        name_hash: i64,
+        namehash: i64,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
         db.execute(
             "INSERT OR REPLACE INTO filenames (folder, name, namehash) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
-            (folder_id, name_string, name_hash),
+            (folder_id, name_string, namehash),
         )?;
 
         tracing::debug!("propagating create file {}", name_string);
@@ -800,30 +906,30 @@ impl Server {
     async fn delete_file_entry(
         self: &Arc<Self>,
         folder_id: i64,
-        name_hash: i64,
+        namehash: i64,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
         db.execute(
             "DELETE FROM blocks WHERE folder = ?1 AND name = ?2",
-            (folder_id, name_hash),
+            (folder_id, namehash),
         )?;
 
         tracing::debug!(
             "deleted all blocks related to file {} in folder {}",
-            name_hash,
+            namehash,
             folder_id
         );
 
         let filename = db.query_one(
             "DELETE FROM filenames WHERE folder = ?1 AND namehash = ?2 RETURNING name",
-            (folder_id, name_hash),
+            (folder_id, namehash),
             |r| r.get::<_, String>(0),
         )?;
 
         tracing::debug!(
             "deleted filename entry for namehash {} in folder {}",
-            name_hash,
+            namehash,
             folder_id
         );
 
@@ -1050,12 +1156,12 @@ impl Server {
 
                     blob.close()?;
 
-                    tracing::debug!(
-                        "got back data for {}:[{}, {}]",
-                        namehash,
-                        metadata.start,
-                        metadata.end
-                    );
+                    // tracing::debug!(
+                    //     "got back data for {}:[{}, {}]",
+                    //     namehash,
+                    //     metadata.start,
+                    //     metadata.end
+                    // );
                 }
 
                 entry
