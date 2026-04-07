@@ -40,11 +40,13 @@ message FileManifest {
   string filename = 1;
   uint64 timestamp = 2;
   uint64 size = 3;
+  // what final data hash should be after blocks
+  optional uint64 hash = 4;
   // no cookie means transfers will come from the main block table
   //
   // server->client ignores this, client->server requires this
-  optional uint64 cookie = 4;
-  repeated BlockMetadata blocks = 5;
+  optional uint64 cookie = 5;
+  repeated BlockMetadata blocks = 6;
 }
 
 // get the manifest for a file
@@ -70,7 +72,8 @@ message Delta {
   uint64 size = 1;
   string filename = 2;
   uint64 cookie = 3;
-  repeated Operation ops = 4;
+  uint64 hash = 4;
+  repeated Operation ops = 5;
 }
 
 enum DataMode {

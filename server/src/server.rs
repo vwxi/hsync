@@ -37,6 +37,7 @@ const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PR
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT, UNIQUE(code))";
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
+const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(name, start, end, hash, cookie))";
 
 #[derive(Debug, Clone)]
 enum Ch {
@@ -59,9 +60,9 @@ struct IncompleteTransfer {
     pub who: SocketAddr,
 }
 
-enum LockState {
-    Free,
-    LockedBy(SocketAddr),
+struct LockState {
+    pub by: SocketAddr,
+    pub cookie: u64,
 }
 
 pub struct Server {
@@ -159,6 +160,7 @@ impl Server {
             conn.execute(CREATE_FOLDERS_STMT, ())?;
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
+            conn.execute(CREATE_JOURNAL_STMT, ())?;
         }
 
         tracing::info!("initialized db");
@@ -448,11 +450,20 @@ impl Server {
     ) -> anyhow::Result<()> {
         let mut locks_lock = self.locks.lock().await;
 
-        // Release lock
-        if let Some(LockState::LockedBy(owner)) = locks_lock.get(&(done.namehash as i64)) {
-            if *owner == addr {
-                locks_lock.insert(done.namehash as i64, LockState::Free);
+        if let Some(lock_state) = locks_lock.get(&(done.namehash as i64)) {
+            if lock_state.by == addr {
+                locks_lock.remove(&(done.namehash as i64));
                 tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
+
+                {
+                    let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                    outgoing_lock.remove(&(done.namehash as i64));
+                }
+
+                {
+                    let mut deltas_lock = self.pending_deltas.lock().await;
+                    deltas_lock.remove(&(done.namehash as i64));
+                }
             }
         }
 
@@ -758,8 +769,8 @@ impl Server {
             let mut locks_lock = self.locks.lock().await;
             match locks_lock.get(&namehash) {
                 // if locked, reject
-                Some(LockState::LockedBy(owner)) => {
-                    tracing::debug!("file locked by {:?}, rejecting {:?}", owner, addr);
+                Some(lock_state) => {
+                    tracing::debug!("file locked by {:?}, rejecting {:?}", lock_state.by, addr);
                     stream.send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::TransfersPending as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
@@ -768,84 +779,76 @@ impl Server {
                 }
                 // otherwise
                 _ => {
-                    locks_lock.insert(namehash, LockState::LockedBy(addr));
+                    locks_lock.insert(
+                        namehash,
+                        LockState {
+                            by: addr,
+                            cookie: manifest.cookie(),
+                        },
+                    );
                     tracing::debug!("lock acquired by {:?} for file {}", addr, namehash);
                 }
             }
         }
 
-        {
-            let mut set: HashSet<TransferMetadata> = HashSet::new();
-            let timestamp = Self::timestamp()?;
+        let mut set: HashSet<TransferMetadata> = HashSet::new();
+        let timestamp = Self::timestamp()?;
 
-            manifest
-                .blocks
-                .iter()
-                .map(|block| {
-                    let mut stmt = db.prepare(
-                        "SELECT * FROM blocks WHERE hash = ?1 AND start = ?2 AND end = ?3",
-                    )?;
+        manifest
+            .blocks
+            .iter()
+            .map(|block| {
+                let mut stmt =
+                    db.prepare("SELECT * FROM blocks WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5")?;
 
-                    if stmt
-                        .query_one(
-                            (block.hash as i64, block.start as i64, block.end as i64),
-                            |_| Ok(()),
-                        )
-                        .is_err()
-                    {
-                        set.insert(TransferMetadata {
-                            start: block.start,
-                            end: block.end,
-                            timestamp,
-                            attempts: 0,
-                            cookie: block.cookie,
-                        });
+                if stmt
+                    .query_one(
+                        (folder_id, namehash, block.hash as i64, block.start as i64, block.end as i64),
+                        |_| Ok(()),
+                    )
+                    .is_err()
+                {
+                    set.insert(TransferMetadata {
+                        start: block.start,
+                        end: block.end,
+                        timestamp,
+                        attempts: 0,
+                        cookie: block.cookie,
+                    });
 
-                        let mut block_with_namehash = block.clone();
-                        block_with_namehash.namehash = Some(namehash as u64);
-                        block_with_namehash.cookie = block.cookie;
+                    let mut block_with_namehash = block.clone();
+                    block_with_namehash.namehash = Some(namehash as u64);
+                    block_with_namehash.cookie = block.cookie;
 
-                        stream.send(Ch::OutPacket(protocol::Packet {
-                            code: protocol::Return::NoneUnspecified as i32,
-                            message: Some(protocol::packet::Message::Transfer(
-                                protocol::Transfer {
-                                    metadata: Some(block_with_namehash),
-                                    mode: protocol::DataMode::WholeUnspecified as i32,
-                                    data: None,
-                                },
-                            )),
-                        }))?;
+                    stream.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                            metadata: Some(block_with_namehash),
+                            mode: protocol::DataMode::WholeUnspecified as i32,
+                            data: None,
+                        })),
+                    }))?;
 
-                        tracing::debug!(
-                            "requesting block [{}, {}] from client for file {}",
-                            block.start,
-                            block.end,
-                            manifest.filename
-                        );
-                    }
+                    tracing::debug!(
+                        "requesting block [{}, {}] from client for file {}",
+                        block.start,
+                        block.end,
+                        manifest.filename
+                    );
+                }
 
-                    Ok::<(), anyhow::Error>(())
-                })
-                .collect::<anyhow::Result<()>>()?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .collect::<anyhow::Result<()>>()?;
 
-            if set.is_empty() {
-                // ignore this, go away
-                tracing::debug!("manifest is identical, ignoring");
+        if set.is_empty() {
+            // ignore this, go away
+            tracing::debug!("manifest is identical, ignoring");
 
-                let mut locks_lock = self.locks.lock().await;
-                locks_lock.remove(&namehash);
+            let mut locks_lock = self.locks.lock().await;
+            locks_lock.remove(&namehash);
 
-                return Ok(());
-            }
-
-            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            outgoing_lock.insert(
-                namehash,
-                IncompleteTransfer {
-                    transfers: set,
-                    who: addr,
-                },
-            );
+            return Ok(());
         }
 
         {
@@ -855,13 +858,26 @@ impl Server {
                 .map(|m| (m.hash, m.start, m.end))
                 .collect();
 
+            let datahash = manifest
+                .hash
+                .ok_or(anyhow::anyhow!("manifest needs a data hash"))?;
+
             // delta has its own cookie
             let delta = self
-                .process_delta(db, folder_id, namehash, new_blocks)
+                .process_delta(db, folder_id, namehash, datahash, new_blocks)
                 .await?;
 
             let mut deltas_lock = self.pending_deltas.lock().await;
             deltas_lock.insert(namehash, delta);
+
+            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+            outgoing_lock.insert(
+                namehash,
+                IncompleteTransfer {
+                    transfers: set,
+                    who: addr,
+                },
+            );
         }
 
         tracing::debug!("received manifest for file {}", manifest.filename);
@@ -1008,6 +1024,7 @@ impl Server {
         db: PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
         namehash: i64,
+        datahash: u64,
         new_blocks: Vec<(u64, u64, u64)>,
     ) -> anyhow::Result<protocol::Delta> {
         let cookie = rand::random::<u64>();
@@ -1054,11 +1071,22 @@ impl Server {
                             similar::ChangeTag::Equal => protocol::delta::OpType::EqualUnspecified,
                             similar::ChangeTag::Insert => protocol::delta::OpType::Insert,
                             similar::ChangeTag::Delete => {
-                                db.execute("DELETE FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3 AND hash = ?4",
-                                    [namehash, start, end, hash])?;
+                                db.execute(
+                                    "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                    (
+                                        folder_id,
+                                        namehash,
+                                        start,
+                                        end,
+                                        hash,
+                                        cookie as i64,
+                                        protocol::delta::OpType::Delete as i64,
+                                        Option::<rusqlite::blob::ZeroBlob>::None,
+                                    )
+                                )?;
 
                                 protocol::delta::OpType::Delete
-                            },
+                            }
                         } as i32,
                         hash: hash as u64,
                         start: start as u64,
@@ -1090,10 +1118,87 @@ impl Server {
 
         Ok(protocol::Delta {
             size: largest_end_offset,
+            hash: datahash,
             filename,
             cookie,
             ops: final_ops,
         })
+    }
+
+    fn apply_journaled_delta(
+        self: &Arc<Self>,
+        db: PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        namehash: i64,
+        cookie: i64,
+    ) -> anyhow::Result<()> {
+        // fetch delta ops sorted in proper order
+        let mut stmt = db.prepare(
+            "SELECT hash, start, end, op FROM journal WHERE name = ?1 AND cookie = ?2
+             ORDER BY CASE WHEN op = 3 THEN 0 ELSE 1 END, CASE WHEN op = 3 THEN -start ELSE start END",
+        )?;
+
+        let mut ops = stmt.query([namehash, cookie])?;
+
+        while let Ok(Some(row)) = ops.next() {
+            let (hash, start, end, op) = (
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                protocol::delta::OpType::try_from(row.get::<_, i64>(3)? as i32)?,
+            );
+
+            match op {
+                protocol::delta::OpType::Delete => {
+                    db.execute(
+                        "DELETE FROM blocks
+                         WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
+                         (
+                             folder_id, namehash, hash as i64, start as i64, end, cookie
+                         ))?;
+                }
+
+                protocol::delta::OpType::Insert | protocol::delta::OpType::EqualUnspecified => {
+                    dbg!(db.execute(
+                        "INSERT INTO blocks
+                         SELECT folder, name, hash, start, end, contents FROM journal
+                         WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
+                         (
+                             folder_id, namehash, hash as i64, start as i64, end, cookie
+                         )))?;
+                }
+
+                protocol::delta::OpType::Modify => {
+                    dbg!(db.execute(
+                        "REPLACE INTO blocks
+                         SELECT folder, name, hash, start, end, contents FROM journal
+                         WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
+                         (
+                             folder_id, namehash, hash as i64, start as i64, end, cookie
+                         )))?;
+                }
+            }
+
+            db.execute(
+                "DELETE FROM journal
+                 WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
+                 (
+                     folder_id, namehash, hash as i64, start as i64, end, cookie
+                 ))?;
+
+            tracing::debug!(
+                "applied {:?} to file {}:{}:{}:[{}, {}] (ck: {})",
+                op,
+                folder_id,
+                namehash as u64,
+                hash as u64,
+                start as u64,
+                end as u64,
+                cookie as u64
+            );
+        }
+
+        Ok(())
     }
 
     async fn handle_transfer(
@@ -1121,12 +1226,10 @@ impl Server {
 
         // we are getting a response
         if let Some(data) = transfer.data {
-            {
-                let hash = xxhash_rust::xxh3::xxh3_64(&data);
-                if hash != metadata.hash {
-                    tracing::debug!("hash mismatch on transfer. skipping");
-                    return Ok(());
-                }
+            let hash = xxhash_rust::xxh3::xxh3_64(&data);
+            if hash != metadata.hash {
+                tracing::debug!("hash mismatch on transfer. skipping");
+                return Ok(());
             }
 
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
@@ -1142,13 +1245,22 @@ impl Server {
                     .is_some()
                 {
                     db.execute(
-                        "INSERT INTO blocks (folder, name, hash, start, end, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        (folder_id, namehash as i64, metadata.hash as i64, metadata.start as i64, metadata.end as i64, rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
+                        "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        (
+                            folder_id,
+                            namehash as i64,
+                            metadata.start as i64,
+                            metadata.end as i64,
+                            hash as i64,
+                            metadata.cookie() as i64,
+                            protocol::delta::OpType::Insert as i64,
+                            Some(rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
+                        )
                     )?;
 
                     let rowid = db.last_insert_rowid();
                     let mut blob =
-                        db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, false)?;
+                        db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
 
                     if blob.write(&data)? != data.len() {
                         anyhow::bail!("did not write full block to database");
@@ -1194,15 +1306,23 @@ impl Server {
 
                     let mut deltas_lock = self.pending_deltas.lock().await;
                     if let Some(delta) = deltas_lock.get(&(namehash as i64)) {
-                        tracing::info!(
-                            "transfer queue satisfied for file {namehash}. broadcasting delta"
-                        );
+                        // drain delta
+                        self.apply_journaled_delta(
+                            db,
+                            folder_id,
+                            namehash as i64,
+                            metadata.cookie() as i64,
+                        )?;
 
                         {
                             let mut locks_lock = self.locks.lock().await;
 
                             locks_lock.remove(&(namehash as i64));
                         }
+
+                        tracing::info!(
+                            "transfer queue satisfied for file {namehash}. broadcasting delta"
+                        );
 
                         streams_lock
                             .iter()
@@ -1237,8 +1357,8 @@ impl Server {
             // );
 
             let res: (i64, i64) = match db.query_row(
-                "SELECT ROWID, hash FROM blocks WHERE name = ?1 AND start = ?2 AND end = ?3 LIMIT 1",
-                [namehash as i64, metadata.start as i64, metadata.end as i64],
+                "SELECT ROWID, hash FROM blocks WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 LIMIT 1",
+                [folder_id, namehash as i64, metadata.start as i64, metadata.end as i64],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             ) {
                 Ok(r) => r,
@@ -1257,7 +1377,7 @@ impl Server {
                             )),
                         }))?;
 
-                    anyhow::bail!("could not find block, {}", e.to_string());
+                    anyhow::bail!("could not find block {}:[{}, {}]", metadata.namehash(), metadata.start, metadata.end);
                 }
             };
 
@@ -1267,7 +1387,13 @@ impl Server {
                 db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
             contents.read_exact(&mut data)?;
 
-            metadata.hash = res.1 as u64;
+            let block_hash = xxhash_rust::xxh3::xxh3_64(&data);
+
+            metadata.hash = if block_hash == res.1 as u64 {
+                res.1 as u64
+            } else {
+                block_hash
+            };
 
             streams_lock
                 .get(&addr)
@@ -1327,6 +1453,7 @@ impl Server {
                 filename: whatis.filename,
                 timestamp: Self::timestamp().map_err(|_| rusqlite::Error::UnwindingPanic)?,
                 size: largest_end_offset,
+                hash: None,
                 cookie: Some(rand::random()),
                 blocks: vec![],
             };

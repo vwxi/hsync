@@ -281,7 +281,8 @@ def main():
     # Set random seed if provided
     if args.seed is not None:
         random.seed(args.seed)
-    
+        print("seed:", args.seed)
+ 
     # Normalize probabilities
     total_prob = args.mutate_prob + args.insert_prob + args.remove_prob
     operation_mix = {
