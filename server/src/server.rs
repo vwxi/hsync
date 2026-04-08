@@ -897,7 +897,7 @@ impl Server {
             // add data hash to journal w/o any other data
             // no start,end,contents means full file data hash
             db.execute(
-                "INSERT INTO journal (folder, name, hash, cookie)
+                "INSERT OR REPLACE INTO journal (folder, name, hash, cookie)
                  VALUES (?1, ?2, ?3, ?4)",
                 (
                     folder_id,
@@ -1137,9 +1137,9 @@ impl Server {
         }
 
         // insert delta ops without data, transfers will fill these out
-        for op in dbg!(&final_ops) {
+        for op in final_ops {
             db.execute(
-                "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR REPLACE INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     folder_id,
                     namehash,
@@ -1227,13 +1227,13 @@ impl Server {
                 }
 
                 protocol::delta::OpType::Insert | protocol::delta::OpType::EqualUnspecified => {
-                    dbg!(db.execute(
-                        "INSERT INTO blocks
+                    db.execute(
+                        "INSERT OR REPLACE INTO blocks
                          SELECT folder, name, hash, start, end, contents FROM journal
                          WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
                          (
                              folder_id, namehash, hash as i64, start as i64, end, cookie
-                         )))?;
+                         ))?;
                 }
 
                 protocol::delta::OpType::Modify => {
@@ -1243,14 +1243,14 @@ impl Server {
                         (folder_id, namehash, start as i64, end),
                     )?;
 
-                    dbg!(db.execute(
+                    db.execute(
                         "INSERT INTO blocks (folder, name, hash, start, end, contents)
                          SELECT folder, name, hash, start, end, contents
                          FROM journal
                          WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 AND hash = ?5 AND cookie = ?6",
                         (
                              folder_id, namehash, start as i64, end, hash as i64, cookie
-                         )))?;
+                         ))?;
                 }
             }
 
@@ -1443,6 +1443,11 @@ impl Server {
                                 },
                             )),
                         }))?;
+
+                    {
+                        let mut locks_lock = self.locks.lock().await;
+                        locks_lock.remove(&(folder_id, namehash as i64));
+                    }
 
                     anyhow::bail!("could not find block {}:[{}, {}]", metadata.namehash(), metadata.start, metadata.end);
                 }

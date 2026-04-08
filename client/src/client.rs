@@ -521,83 +521,114 @@ impl Client {
         // if cookie is present, get from journal
         // otherwise, get it from the main table
         if let Some(cookie) = metadata.cookie {
-            let res: (i64, i64) = match db.query_one(
+            match db.query_one(
                 "SELECT ROWID, hash FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4 LIMIT 1",
                 [namehash, metadata.start as i64, metadata.end as i64, cookie as i64],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             ) {
-                Ok(r) => r,
-                Err(e) => {
-                    self.send_ch
-                        .as_ref()
-                        .map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
-                            code: protocol::Return::BlockNotFound as i32,
-                            message: Some(protocol::packet::Message::Transfer(
-                                protocol::Transfer {
-                                    metadata: Some(metadata),
-                                    mode: protocol::DataMode::WholeUnspecified as i32,
-                                    data: None,
-                                },
-                            )),
-                        })))
-                        .ok_or(anyhow::anyhow!("could not send block error"))??;
+                Ok((rowid, hash)) => {
+                    let size_to_read = (metadata.end - metadata.start) as usize;
+                    let mut data: Vec<u8> = vec![0u8; size_to_read];
+                    let mut contents =
+                        db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, true)?;
+                    contents.read_exact(&mut data)?;
 
-                    anyhow::bail!("miss {}:{}:[{}, {}] (ck: {:?})",
-                        metadata.namehash(), metadata.hash, metadata.start, metadata.end, metadata.cookie);
+                    // write journaled block to file
+                    {
+                        let mut file = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(filepath)?;
+
+                        Self::modify_block(&mut file, metadata.start, &data)?;
+                    }
+
+                    // insert into main block
+                    db.execute(
+                        "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                        [
+                            namehash as i64,
+                            metadata.start as i64,
+                            metadata.end as i64,
+                            metadata.hash as i64,
+                        ],
+                    )?;
+
+                    // delete from journal
+                    db.execute(
+                        "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 AND cookie = ?5",
+                        (
+                            namehash as i64,
+                            metadata.start as i64,
+                            metadata.end as i64,
+                            hash,
+                            metadata.cookie.map(|c| c as i64),
+                        ),
+                    )?;
+
+                    tracing::debug!(
+                        "journal: fetched block {}:[{}, {}] (ck: {:?})",
+                        namehash,
+                        metadata.start,
+                        metadata.end,
+                        metadata.cookie
+                    );
+
+                    Ok(data)
+                },
+                Err(_) => {
+                    // if not journaled then it was probably an unchanged block
+                    // try again and if fails again then it really does not exist
+                    if let Ok(block_data) = (|| {
+                        let mut file = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(false)
+                            .open(filepath)?;
+
+                        let mut block_data = vec![0u8; (metadata.end - metadata.start) as usize];
+                        file.seek(SeekFrom::Start(metadata.start))?;
+                        file.read_exact(&mut block_data)?;
+                        anyhow::Ok(block_data)
+                    })() {
+                        db.execute(
+                            "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                            [
+                                namehash as i64,
+                                metadata.start as i64,
+                                metadata.end as i64,
+                                metadata.hash as i64,
+                            ],
+                        )?;
+
+                        tracing::debug!(
+                            "fs: fetched block {}:[{}, {}] (ck: {:?})",
+                            namehash,
+                            metadata.start,
+                            metadata.end,
+                            metadata.cookie
+                        );
+
+                        Ok(block_data)
+                    } else {
+                        self.send_ch
+                            .as_ref()
+                            .map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
+                                code: protocol::Return::BlockNotFound as i32,
+                                message: Some(protocol::packet::Message::Transfer(
+                                    protocol::Transfer {
+                                        metadata: Some(metadata),
+                                        mode: protocol::DataMode::WholeUnspecified as i32,
+                                        data: None,
+                                    },
+                                )),
+                            })))
+                            .ok_or(anyhow::anyhow!("could not send block error"))??;
+
+                        anyhow::bail!("client miss {}:{}:[{}, {}] (ck: {:?})",
+                            metadata.namehash(), metadata.hash, metadata.start, metadata.end, metadata.cookie);
+                    }
                 }
-            };
-
-            let size_to_read = (metadata.end - metadata.start) as usize;
-            let mut data: Vec<u8> = vec![0u8; size_to_read];
-            let mut contents =
-                db.blob_open(rusqlite::MAIN_DB, "journal", "contents", res.0, true)?;
-            contents.read_exact(&mut data)?;
-
-            // correct hash
-            metadata.hash = xxhash_rust::xxh3::xxh3_64(&data);
-
-            // write journaled block to file
-            {
-                let mut file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(filepath)?;
-
-                Self::modify_block(&mut file, metadata.start, &data)?;
             }
-
-            // insert into main block
-            db.execute(
-                "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                [
-                    namehash as i64,
-                    metadata.start as i64,
-                    metadata.end as i64,
-                    metadata.hash as i64,
-                ],
-            )?;
-
-            // delete from journal
-            db.execute(
-                "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 AND cookie = ?5",
-                (
-                    namehash as i64,
-                    metadata.start as i64,
-                    metadata.end as i64,
-                    res.1,
-                    metadata.cookie.map(|c| c as i64),
-                ),
-            )?;
-
-            tracing::debug!(
-                "journal: fetched block {}:[{}, {}] (ck: {:?})",
-                namehash,
-                metadata.start,
-                metadata.end,
-                metadata.cookie
-            );
-
-            Ok(data)
         } else {
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
@@ -1103,8 +1134,8 @@ impl Client {
 
         match code {
             protocol::Return::BlockMismatch | protocol::Return::BlockNotFound => {
-                tracing::error!(
-                    "miss {}:[{}, {}] (ck: {})",
+                anyhow::bail!(
+                    "server miss {}:[{}, {}] (ck: {})",
                     namehash as u64,
                     metadata.start,
                     metadata.end,
@@ -1766,6 +1797,18 @@ impl Client {
                             timestamp,
                             cookie: block.cookie,
                         });
+
+                        Self::journal_block(
+                            &db,
+                            namehash,
+                            block.start as i64,
+                            block.end as i64,
+                            Some(block.cookie() as i64),
+                            Some(protocol::delta::OpType::EqualUnspecified),
+                            None,
+                            block.hash as i64,
+                            None,
+                        )?;
 
                         ot.progress_bar.inc(1);
 
