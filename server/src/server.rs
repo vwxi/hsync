@@ -37,7 +37,7 @@ const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PR
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT, UNIQUE(code))";
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
-const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(name, start, end, hash, cookie))";
+const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(folder, name, start, end, cookie))";
 
 #[derive(Debug, Clone)]
 enum Ch {
@@ -70,9 +70,8 @@ pub struct Server {
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
-    locks: Mutex<HashMap<i64, LockState>>,
+    locks: Mutex<HashMap<(i64, i64), LockState>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
-    pending_deltas: Mutex<HashMap<i64, protocol::Delta>>,
 }
 
 impl Server {
@@ -172,7 +171,6 @@ impl Server {
             streams: RwLock::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
-            pending_deltas: Mutex::new(HashMap::new()),
         })
     }
 
@@ -443,16 +441,59 @@ impl Server {
             .collect::<Vec<protocol::room_info::File>>())
     }
 
+    fn delete_delta(
+        db: &PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        namehash: i64,
+        cookie: Option<i64>,
+    ) -> anyhow::Result<()> {
+        if let Some(cookie) = cookie {
+            db.execute(
+                "DELETE FROM journal WHERE folder = ?1 AND name = ?2 AND cookie = ?3",
+                (folder_id, namehash, cookie),
+            )?;
+        } else {
+            db.execute(
+                "DELETE FROM journal WHERE folder = ?1 AND name = ?2",
+                (folder_id, namehash),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn any_pending_deltas(
+        db: &PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        namehash: i64,
+    ) -> anyhow::Result<bool> {
+        let count = db.query_row(
+            "SELECT COUNT(*) FROM journal WHERE folder = ?1 AND name = ?2",
+            [folder_id, namehash],
+            |r| r.get::<_, i64>(0),
+        )?;
+
+        Ok(count != 0)
+    }
+
     async fn handle_done(
         self: &Arc<Self>,
         addr: SocketAddr,
         done: protocol::TransferDone,
     ) -> anyhow::Result<()> {
         let mut locks_lock = self.locks.lock().await;
+        let db = self.db_pool.get()?;
 
-        if let Some(lock_state) = locks_lock.get(&(done.namehash as i64)) {
+        let folder_id = {
+            let mut stmt = db.prepare("SELECT current_folder FROM users WHERE addr = ?1")?;
+            stmt.query_one([addr.to_string()], |r| r.get::<_, i64>(0))?
+        };
+
+        if let Some(lock_state) = locks_lock.get(&(folder_id, done.namehash as i64)) {
             if lock_state.by == addr {
-                locks_lock.remove(&(done.namehash as i64));
+                let cookie = lock_state.cookie as i64;
+
+                locks_lock.remove(&(folder_id, done.namehash as i64));
                 tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
 
                 {
@@ -460,10 +501,7 @@ impl Server {
                     outgoing_lock.remove(&(done.namehash as i64));
                 }
 
-                {
-                    let mut deltas_lock = self.pending_deltas.lock().await;
-                    deltas_lock.remove(&(done.namehash as i64));
-                }
+                Self::delete_delta(&db, folder_id, done.namehash as i64, Some(cookie))?;
             }
         }
 
@@ -676,10 +714,7 @@ impl Server {
         {
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
             if let Some((namehash, _)) = outgoing_lock.iter_mut().find(|(_, v)| v.who == addr) {
-                {
-                    let mut deltas_lock = self.pending_deltas.lock().await;
-                    deltas_lock.remove(namehash);
-                }
+                Self::delete_delta(&db, folder_id, *namehash, None)?;
 
                 // TODO: MARK FILE AS "DIRTY" AND REQUEST FILE AGAIN FROM ANY OTHER USER
                 // IF NO OTHER USERS, DELETE FILE ENTRY
@@ -718,27 +753,6 @@ impl Server {
 
         let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
 
-        // if there are transfers from another manifest still pending,
-        // tell the client that they should send back later when it is done
-        {
-            let deltas_lock = self.pending_deltas.lock().await;
-            if deltas_lock.contains_key(&namehash) {
-                tracing::warn!(
-                    "already sent out deltas for {}, notifying",
-                    manifest.filename
-                );
-
-                stream.send(Ch::OutPacket(protocol::Packet {
-                    code: protocol::Return::TransfersPending as i32,
-                    message: Some(protocol::packet::Message::Manifest(manifest)),
-                }))?;
-
-                return Ok(());
-            } else {
-                tracing::warn!("not processing {}, chug on!", manifest.filename);
-            }
-        }
-
         let db = self.db_pool.get()?;
 
         let folder_id: i64 = db.query_row(
@@ -746,6 +760,24 @@ impl Server {
             [addr.to_string()],
             |row| row.get(0),
         )?;
+
+        // if there are transfers from another manifest still pending,
+        // tell the client that they should send back later when it is done
+        // if Self::any_pending_deltas(&db, folder_id, namehash)? {
+        //     tracing::warn!(
+        //         "already sent out deltas for {}, notifying",
+        //         manifest.filename
+        //     );
+
+        //     stream.send(Ch::OutPacket(protocol::Packet {
+        //         code: protocol::Return::TransfersPending as i32,
+        //         message: Some(protocol::packet::Message::Manifest(manifest)),
+        //     }))?;
+
+        //     return Ok(());
+        // } else {
+        //     tracing::warn!("not processing {}, chug on!", manifest.filename);
+        // }
 
         let exists_in_db: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
@@ -767,7 +799,7 @@ impl Server {
         // are other clients done transferring etc
         {
             let mut locks_lock = self.locks.lock().await;
-            match locks_lock.get(&namehash) {
+            match locks_lock.get(&(folder_id, namehash)) {
                 // if locked, reject
                 Some(lock_state) => {
                     tracing::debug!("file locked by {:?}, rejecting {:?}", lock_state.by, addr);
@@ -780,7 +812,7 @@ impl Server {
                 // otherwise
                 _ => {
                     locks_lock.insert(
-                        namehash,
+                        (folder_id, namehash),
                         LockState {
                             by: addr,
                             cookie: manifest.cookie(),
@@ -846,7 +878,7 @@ impl Server {
             tracing::debug!("manifest is identical, ignoring");
 
             let mut locks_lock = self.locks.lock().await;
-            locks_lock.remove(&namehash);
+            locks_lock.remove(&(folder_id, namehash));
 
             return Ok(());
         }
@@ -862,13 +894,28 @@ impl Server {
                 .hash
                 .ok_or(anyhow::anyhow!("manifest needs a data hash"))?;
 
-            // delta has its own cookie
-            let delta = self
-                .process_delta(db, folder_id, namehash, datahash, new_blocks)
-                .await?;
+            // add data hash to journal w/o any other data
+            // no start,end,contents means full file data hash
+            db.execute(
+                "INSERT INTO journal (folder, name, hash, cookie)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (
+                    folder_id,
+                    namehash,
+                    datahash as i64,
+                    manifest.cookie() as i64,
+                ),
+            )?;
 
-            let mut deltas_lock = self.pending_deltas.lock().await;
-            deltas_lock.insert(namehash, delta);
+            // delta has its own cookie and is stored in journal until it is time to apply
+            self.process_delta(
+                db,
+                folder_id,
+                namehash,
+                manifest.cookie() as i64,
+                new_blocks,
+            )
+            .await?;
 
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
             outgoing_lock.insert(
@@ -880,7 +927,11 @@ impl Server {
             );
         }
 
-        tracing::debug!("received manifest for file {}", manifest.filename);
+        tracing::debug!(
+            "received manifest for file {} cookie {}",
+            manifest.filename,
+            manifest.cookie()
+        );
 
         Ok(())
     }
@@ -1024,17 +1075,9 @@ impl Server {
         db: PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
         namehash: i64,
-        datahash: u64,
+        cookie: i64,
         new_blocks: Vec<(u64, u64, u64)>,
-    ) -> anyhow::Result<protocol::Delta> {
-        let cookie = rand::random::<u64>();
-
-        let filename: String = db.query_one(
-            "SELECT name FROM filenames WHERE folder = ?1 AND namehash = ?2",
-            [folder_id, namehash],
-            |r| r.get(0),
-        )?;
-
+    ) -> anyhow::Result<()> {
         let old_blocks: Vec<(u64, u64, u64)> = {
             let mut stmt = db.prepare(
                 "SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
@@ -1050,13 +1093,6 @@ impl Server {
             .collect::<Result<Vec<_>, _>>()?
         };
 
-        let largest_end_offset = new_blocks
-            .iter()
-            .map(|e| e.2)
-            .max()
-            .ok_or(anyhow::anyhow!("could not get largest size"))?
-            as u64;
-
         let diff_ops: Vec<protocol::delta::Operation> =
             similar::capture_diff_slices(similar::Algorithm::Myers, &old_blocks, &new_blocks)
                 .iter()
@@ -1070,23 +1106,7 @@ impl Server {
                         op_type: match x.tag() {
                             similar::ChangeTag::Equal => protocol::delta::OpType::EqualUnspecified,
                             similar::ChangeTag::Insert => protocol::delta::OpType::Insert,
-                            similar::ChangeTag::Delete => {
-                                db.execute(
-                                    "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                                    (
-                                        folder_id,
-                                        namehash,
-                                        start,
-                                        end,
-                                        hash,
-                                        cookie as i64,
-                                        protocol::delta::OpType::Delete as i64,
-                                        Option::<rusqlite::blob::ZeroBlob>::None,
-                                    )
-                                )?;
-
-                                protocol::delta::OpType::Delete
-                            }
+                            similar::ChangeTag::Delete => protocol::delta::OpType::Delete,
                         } as i32,
                         hash: hash as u64,
                         start: start as u64,
@@ -1116,13 +1136,24 @@ impl Server {
             }
         }
 
-        Ok(protocol::Delta {
-            size: largest_end_offset,
-            hash: datahash,
-            filename,
-            cookie,
-            ops: final_ops,
-        })
+        // insert delta ops without data, transfers will fill these out
+        for op in dbg!(&final_ops) {
+            db.execute(
+                "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    folder_id,
+                    namehash,
+                    op.start as i64,
+                    op.end as i64,
+                    op.hash as i64,
+                    cookie,
+                    op.op_type,
+                    Option::<rusqlite::blob::ZeroBlob>::None,
+                )
+            )?;
+        }
+
+        Ok(())
     }
 
     fn apply_journaled_delta(
@@ -1131,14 +1162,45 @@ impl Server {
         folder_id: i64,
         namehash: i64,
         cookie: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<protocol::Delta> {
         // fetch delta ops sorted in proper order
         let mut stmt = db.prepare(
             "SELECT hash, start, end, op FROM journal WHERE name = ?1 AND cookie = ?2
              ORDER BY CASE WHEN op = 3 THEN 0 ELSE 1 END, CASE WHEN op = 3 THEN -start ELSE start END",
         )?;
 
+        let filename: String = db.query_row(
+            "SELECT name FROM filenames WHERE folder = ?1 AND namehash = ?2",
+            [folder_id, namehash],
+            |r| r.get(0),
+        )?;
+
+        let largest_end_offset = match db.query_row(
+            "SELECT MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
+            [folder_id, namehash],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(eo) => eo as u64,
+            Err(_) => 0u64,
+        };
+
+        let datahash = db.query_row(
+            "DELETE FROM journal
+             WHERE folder = ?1 AND name = ?2 AND cookie = ?3
+             AND start IS NULL AND end IS NULL AND contents IS NULL
+             RETURNING hash",
+            (folder_id, namehash, cookie),
+            |r| r.get::<_, i64>(0),
+        )? as u64;
+
         let mut ops = stmt.query([namehash, cookie])?;
+        let mut delta = protocol::Delta {
+            size: largest_end_offset,
+            filename,
+            cookie: cookie as u64,
+            hash: datahash,
+            ops: vec![],
+        };
 
         while let Ok(Some(row)) = ops.next() {
             let (hash, start, end, op) = (
@@ -1148,14 +1210,20 @@ impl Server {
                 protocol::delta::OpType::try_from(row.get::<_, i64>(3)? as i32)?,
             );
 
+            delta.ops.push(protocol::delta::Operation {
+                op_type: op as i32,
+                start: start as u64,
+                end: end as u64,
+                hash: hash as u64,
+            });
+
             match op {
                 protocol::delta::OpType::Delete => {
                     db.execute(
                         "DELETE FROM blocks
-                         WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
-                         (
-                             folder_id, namehash, hash as i64, start as i64, end, cookie
-                         ))?;
+                         WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5",
+                        (folder_id, namehash, hash as i64, start as i64, end),
+                    )?;
                 }
 
                 protocol::delta::OpType::Insert | protocol::delta::OpType::EqualUnspecified => {
@@ -1169,12 +1237,19 @@ impl Server {
                 }
 
                 protocol::delta::OpType::Modify => {
+                    db.execute(
+                        "DELETE FROM blocks
+                              WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4",
+                        (folder_id, namehash, start as i64, end),
+                    )?;
+
                     dbg!(db.execute(
-                        "REPLACE INTO blocks
-                         SELECT folder, name, hash, start, end, contents FROM journal
-                         WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
-                         (
-                             folder_id, namehash, hash as i64, start as i64, end, cookie
+                        "INSERT INTO blocks (folder, name, hash, start, end, contents)
+                         SELECT folder, name, hash, start, end, contents
+                         FROM journal
+                         WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 AND hash = ?5 AND cookie = ?6",
+                        (
+                             folder_id, namehash, start as i64, end, hash as i64, cookie
                          )))?;
                 }
             }
@@ -1198,7 +1273,7 @@ impl Server {
             );
         }
 
-        Ok(())
+        Ok(delta)
     }
 
     async fn handle_transfer(
@@ -1233,6 +1308,7 @@ impl Server {
             }
 
             let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+
             if let Some(entry) = outgoing_lock.get_mut(&(namehash as i64)) {
                 if entry
                     .transfers
@@ -1244,8 +1320,11 @@ impl Server {
                     })
                     .is_some()
                 {
-                    db.execute(
-                        "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    let rowid = db.query_row(
+                        "UPDATE journal
+                         SET contents = ?7
+                         WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 AND hash = ?5 AND cookie = ?6
+                         RETURNING ROWID",
                         (
                             folder_id,
                             namehash as i64,
@@ -1253,12 +1332,13 @@ impl Server {
                             metadata.end as i64,
                             hash as i64,
                             metadata.cookie() as i64,
-                            protocol::delta::OpType::Insert as i64,
-                            Some(rusqlite::blob::ZeroBlob((metadata.end - metadata.start) as i32)),
-                        )
+                            Some(rusqlite::blob::ZeroBlob(
+                                (metadata.end - metadata.start) as i32,
+                            )),
+                        ),
+                        |r| r.get::<_, i64>(0)
                     )?;
 
-                    let rowid = db.last_insert_rowid();
                     let mut blob =
                         db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
 
@@ -1268,12 +1348,12 @@ impl Server {
 
                     blob.close()?;
 
-                    // tracing::debug!(
-                    //     "got back data for {}:[{}, {}]",
-                    //     namehash,
-                    //     metadata.start,
-                    //     metadata.end
-                    // );
+                    tracing::debug!(
+                        "got back data for {}:[{}, {}]",
+                        namehash,
+                        metadata.start,
+                        metadata.end
+                    );
                 }
 
                 entry
@@ -1289,61 +1369,48 @@ impl Server {
                         .remove(&(namehash as i64))
                         .ok_or(anyhow::anyhow!("what?"))?;
 
-                    // tell peer to send queued manifest again if necessary
-                    streams_lock
-                        .get(&who)
-                        .map(|s| {
-                            s.send(Ch::OutPacket(protocol::Packet {
-                                code: protocol::Return::NoneUnspecified as i32,
-                                message: Some(protocol::packet::Message::SendAgain(
-                                    protocol::SendAgain { namehash },
-                                )),
-                            }))
-                        })
-                        .ok_or(anyhow::anyhow!("failed to send sendagain"))??;
+                    let delta = self.apply_journaled_delta(
+                        db,
+                        folder_id,
+                        namehash as i64,
+                        metadata.cookie() as i64,
+                    )?;
 
-                    tracing::debug!("asking {} to send {} again", who, namehash);
+                    {
+                        let mut locks_lock = self.locks.lock().await;
 
-                    let mut deltas_lock = self.pending_deltas.lock().await;
-                    if let Some(delta) = deltas_lock.get(&(namehash as i64)) {
-                        // drain delta
-                        self.apply_journaled_delta(
-                            db,
-                            folder_id,
-                            namehash as i64,
-                            metadata.cookie() as i64,
-                        )?;
-
-                        {
-                            let mut locks_lock = self.locks.lock().await;
-
-                            locks_lock.remove(&(namehash as i64));
-                        }
-
-                        tracing::info!(
-                            "transfer queue satisfied for file {namehash}. broadcasting delta"
-                        );
-
-                        streams_lock
-                            .iter()
-                            .map(|s| {
-                                if *s.0 == who {
-                                    return Ok(());
-                                }
-
-                                if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
-                                    code: protocol::Return::NoneUnspecified as i32,
-                                    message: Some(protocol::packet::Message::Delta(delta.clone())),
-                                })) {
-                                    tracing::error!("delta broadcast error: {}", e.to_string());
-                                }
-
-                                Ok(())
-                            })
-                            .collect::<anyhow::Result<()>>()?;
-
-                        deltas_lock.remove(&(namehash as i64));
+                        locks_lock.remove(&(folder_id, namehash as i64));
                     }
+
+                    tracing::info!(
+                        "transfer queue satisfied for file {namehash}. broadcasting delta"
+                    );
+
+                    streams_lock
+                        .iter()
+                        .map(|s| {
+                            if *s.0 == who {
+                                // tell peer to send queued manifest again if necessary
+                                s.1.send(Ch::OutPacket(protocol::Packet {
+                                    code: protocol::Return::NoneUnspecified as i32,
+                                    message: Some(protocol::packet::Message::SendAgain(
+                                        protocol::SendAgain { namehash },
+                                    )),
+                                }))?;
+
+                                return Ok(());
+                            }
+
+                            if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: Some(protocol::packet::Message::Delta(delta.clone())),
+                            })) {
+                                tracing::error!("delta broadcast error: {}", e.to_string());
+                            }
+
+                            Ok(())
+                        })
+                        .collect::<anyhow::Result<()>>()?;
                 }
             }
         } else {
@@ -1443,11 +1510,14 @@ impl Server {
             let mut blocks_stmt =
                 db.prepare("SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2")?;
 
-            let largest_end_offset = db.query_one(
+            let largest_end_offset = match db.query_one(
                 "SELECT MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
                 [folder_id, filehash],
                 |r| r.get::<_, i64>(0),
-            )? as u64;
+            ) {
+                Ok(eo) => eo as u64,
+                Err(_) => 0u64,
+            };
 
             let mut manifest = protocol::FileManifest {
                 filename: whatis.filename,

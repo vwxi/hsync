@@ -413,7 +413,7 @@ impl Client {
         })
     }
 
-    // we store the block to be transferred later
+    // journal block for after modify etc
     fn journal_block(
         db: &PooledConnection<SqliteConnectionManager>,
         namehash: i64,
@@ -423,7 +423,7 @@ impl Client {
         op_type: Option<protocol::delta::OpType>,
         data: Option<&[u8]>,
         hash: i64,
-        progress_bar: &indicatif::ProgressBar,
+        progress_bar: Option<&indicatif::ProgressBar>,
     ) -> anyhow::Result<()> {
         if let Some(cookie) = cookie {
             db.execute(
@@ -451,18 +451,57 @@ impl Client {
                 blob.close()?;
             }
 
-            progress_bar.set_message(format!(
-                "journal: stored block {}:[{}, {}] (ck: {:?})",
-                namehash as u64, start, end, cookie
-            ));
+            progress_bar.map(|pb| {
+                pb.set_message(format!(
+                    "journal: stored block {}:[{}, {}] (ck: {:?})",
+                    namehash as u64, start, end, cookie
+                ));
 
-            progress_bar.inc(1);
+                pb.inc(1);
+            });
         } else {
             db.execute(
                 "INSERT OR IGNORE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
                 [namehash, start, end, hash],
             )?;
         }
+
+        Ok(())
+    }
+
+    // fill empty journal blocks with xfer data
+    fn fill_block(
+        db: &PooledConnection<SqliteConnectionManager>,
+        namehash: i64,
+        start: i64,
+        end: i64,
+        cookie: i64,
+        data: &[u8],
+        hash: i64,
+    ) -> anyhow::Result<()> {
+        let rowid = db.query_row(
+            "UPDATE journal
+             SET contents = ?6
+             WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 AND cookie = ?5
+             RETURNING ROWID",
+            (
+                namehash,
+                start,
+                end,
+                hash,
+                cookie,
+                Some(rusqlite::blob::ZeroBlob((end - start) as i32)),
+            ),
+            |r| r.get::<_, i64>(0),
+        )?;
+
+        let mut blob = db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
+
+        if blob.write(&data)? != data.len() {
+            anyhow::bail!("did not write full block to database");
+        }
+
+        blob.close()?;
 
         Ok(())
     }
@@ -648,7 +687,7 @@ impl Client {
                             None,
                             Some(&block.data),
                             block_hash as i64,
-                            &progress_bar,
+                            Some(&progress_bar),
                         )?;
                     } else {
                         progress_bar.set_message(format!(
@@ -682,7 +721,7 @@ impl Client {
                         Some(protocol::delta::OpType::Insert),
                         Some(&block.data),
                         block_hash as i64,
-                        &progress_bar,
+                        Some(&progress_bar),
                     )?;
                 }
 
@@ -904,15 +943,16 @@ impl Client {
 
         while let Ok(Some(row)) = files.next() {
             let filename = row.get::<_, String>(0)?;
-            let filehash = row.get::<_, i64>(1)?;
+            let namehash = row.get::<_, i64>(1)?;
 
             let mut manifest = protocol::FileManifest::default();
 
+            manifest.hash = Some(self.get_file_hash(&filename)?);
             manifest.filename = filename;
 
             let mut query_blocks =
                 conn.prepare("SELECT start, end, hash FROM blocks WHERE file = ?1")?;
-            let mut blocks = query_blocks.query([&filehash])?;
+            let mut blocks = query_blocks.query([&namehash])?;
 
             while let Ok(Some(block)) = blocks.next() {
                 let (start, end, hash) = (
@@ -1108,7 +1148,7 @@ impl Client {
                         && e.end == metadata.end
                         && e.cookie == metadata.cookie
                 }) {
-                    let op_type = t.op_type;
+                    let op = t.op_type;
 
                     entry.transfers.retain(|e| {
                         !(e.start == metadata.start
@@ -1122,35 +1162,19 @@ impl Client {
                         accesses_lock.insert(namehash);
                     }
 
-                    if let Err(e) = Self::journal_block(
+                    Self::fill_block(
                         &db,
                         namehash,
                         metadata.start as i64,
                         metadata.end as i64,
-                        metadata.cookie.map(|c| c as i64),
-                        Some(op_type),
-                        Some(&data),
+                        metadata.cookie() as i64,
+                        &data,
                         metadata.hash as i64,
-                        &entry.progress_bar,
-                    ) {
-                        {
-                            let mut accesses_lock = self.current_accesses.lock().await;
-                            accesses_lock.remove(&namehash);
-                        }
-
-                        anyhow::bail!(
-                            "xfer: failed to journal incoming block op {:?} [{}, {}] to file {}: {}",
-                            op_type,
-                            metadata.start,
-                            metadata.end,
-                            filepath.to_string_lossy(),
-                            e.to_string()
-                        );
-                    }
+                    )?;
 
                     entry.progress_bar.set_message(format!(
                         "xfer: journaled block op {:?} [{}, {}] to file {}, {}",
-                        op_type,
+                        op,
                         metadata.start,
                         metadata.end,
                         filepath.to_string_lossy(),
@@ -1343,9 +1367,12 @@ impl Client {
     async fn request_block(
         &mut self,
         namehash: i64,
+        cookie: i64,
         transfer_metadata: TransferMetadata,
     ) -> anyhow::Result<()> {
         // request transfer
+        let db = self.db_pool.get()?;
+
         let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
 
         outgoing_lock
@@ -1362,6 +1389,18 @@ impl Client {
                     progress_bar: make_progress_bar(),
                 }
             });
+
+        Self::journal_block(
+            &db,
+            namehash,
+            transfer_metadata.start as i64,
+            transfer_metadata.end as i64,
+            Some(cookie),
+            Some(transfer_metadata.op_type),
+            None,
+            transfer_metadata.hash as i64,
+            None,
+        )?;
 
         self.send_ch
             .as_ref()
@@ -1465,7 +1504,8 @@ impl Client {
 
                             progress_bar.inc(1);
 
-                            self.request_block(namehash, transfer_metadata).await?;
+                            self.request_block(namehash, delta.cookie as i64, transfer_metadata)
+                                .await?;
                         }
                     } else {
                         progress_bar.set_message(format!(
@@ -1475,7 +1515,8 @@ impl Client {
 
                         progress_bar.inc(1);
 
-                        self.request_block(namehash, transfer_metadata).await?;
+                        self.request_block(namehash, delta.cookie as i64, transfer_metadata)
+                            .await?;
                     }
                 }
 
@@ -1495,7 +1536,7 @@ impl Client {
                         Some(protocol::delta::OpType::Delete),
                         None,
                         op.hash as i64,
-                        &progress_bar,
+                        Some(&progress_bar),
                     )?;
 
                     {
