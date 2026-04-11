@@ -47,6 +47,7 @@ enum Ch {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct TransferMetadata {
+    pub hash: u64,
     pub start: u64,
     pub end: u64,
     pub attempts: u64,
@@ -841,6 +842,7 @@ impl Server {
                     .is_err()
                 {
                     set.insert(TransferMetadata {
+                        hash: block.hash,
                         start: block.start,
                         end: block.end,
                         timestamp,
@@ -862,7 +864,8 @@ impl Server {
                     }))?;
 
                     tracing::debug!(
-                        "requesting block [{}, {}] from client for file {}",
+                        "requesting block {}:[{}, {}] from client for file {}",
+                        block.hash,
                         block.start,
                         block.end,
                         manifest.filename
@@ -1303,7 +1306,7 @@ impl Server {
         if let Some(data) = transfer.data {
             let hash = xxhash_rust::xxh3::xxh3_64(&data);
             if hash != metadata.hash {
-                tracing::debug!("hash mismatch on transfer. skipping");
+                tracing::debug!("hash mismatch - {} != {}", hash, metadata.hash);
                 return Ok(());
             }
 
@@ -1587,7 +1590,7 @@ impl Server {
                         start: req.start,
                         end: req.end,
                         cookie: req.cookie,
-                        hash: 0,
+                        hash: req.hash,
                     };
 
                     tokio::task::block_in_place(|| {
@@ -1617,6 +1620,7 @@ impl Server {
                         attempts: req.attempts + 1,
                         timestamp: current_timestamp,
                         cookie: req.cookie,
+                        hash: req.hash,
                     });
 
                     // tracing::debug!(

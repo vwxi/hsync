@@ -516,7 +516,7 @@ impl Client {
         db: &PooledConnection<SqliteConnectionManager>,
         filepath: &PathBuf,
         namehash: i64,
-        mut metadata: protocol::BlockMetadata,
+        metadata: protocol::BlockMetadata,
     ) -> anyhow::Result<Vec<u8>> {
         // if cookie is present, get from journal
         // otherwise, get it from the main table
