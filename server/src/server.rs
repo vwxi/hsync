@@ -1382,12 +1382,6 @@ impl Server {
 
                     drop(outgoing_lock);
 
-                    {
-                        let mut locks_lock = self.locks.lock().await;
-
-                        locks_lock.remove(&(folder_id, namehash as i64));
-                    }
-
                     tracing::info!(
                         "transfer queue satisfied for file {namehash}. broadcasting delta"
                     );

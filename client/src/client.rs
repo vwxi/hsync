@@ -36,6 +36,8 @@ pub mod protocol {
 }
 
 const HEARTBEAT_INTERVAL: u64 = 5;
+const NOTIFY_TIMEOUT: u64 = 5000;
+const NOTIFY_TICK_RATE: u64 = 3000;
 const REFRESH_INTERVAL: u64 = 3;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
@@ -136,6 +138,7 @@ pub struct Client {
     db_pool: Arc<Pool<SqliteConnectionManager>>,
     endpoint: Endpoint,
     send_ch: Option<mpsc::UnboundedSender<Ch>>,
+    /// file access lock
     current_accesses: Mutex<HashSet<i64>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, OutgoingTransfers>>,
     outgoing_manifest_requests: Mutex<HashSet<i64>>,
@@ -204,8 +207,8 @@ impl Client {
         >();
 
         let mut watcher = notify_debouncer_full::new_debouncer_opt(
-            std::time::Duration::from_secs(2),
-            None,
+            std::time::Duration::from_millis(NOTIFY_TIMEOUT),
+            Some(std::time::Duration::from_millis(NOTIFY_TICK_RATE)),
             move |res| {
                 let _ = tx.send(res);
             },
