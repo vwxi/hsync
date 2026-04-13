@@ -482,7 +482,6 @@ impl Server {
         addr: SocketAddr,
         done: protocol::TransferDone,
     ) -> anyhow::Result<()> {
-        let mut locks_lock = self.locks.lock().await;
         let db = self.db_pool.get()?;
 
         let folder_id = {
@@ -490,20 +489,32 @@ impl Server {
             stmt.query_one([addr.to_string()], |r| r.get::<_, i64>(0))?
         };
 
-        if let Some(lock_state) = locks_lock.get(&(folder_id, done.namehash as i64)) {
-            if lock_state.by == addr {
-                let cookie = lock_state.cookie as i64;
+        let cookie: Option<i64> = {
+            let mut locks_lock = self.locks.lock().await;
+            if let Some(lock_state) = locks_lock.get(&(folder_id, done.namehash as i64)) {
+                if lock_state.by == addr {
+                    let c = lock_state.cookie as i64;
 
-                locks_lock.remove(&(folder_id, done.namehash as i64));
-                tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
+                    locks_lock.remove(&(folder_id, done.namehash as i64));
 
-                {
-                    let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-                    outgoing_lock.remove(&(done.namehash as i64));
+                    Some(c)
+                } else {
+                    None
                 }
-
-                Self::delete_delta(&db, folder_id, done.namehash as i64, Some(cookie))?;
+            } else {
+                None
             }
+        };
+
+        if let Some(cookie) = cookie {
+            tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
+
+            {
+                let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
+                outgoing_lock.remove(&(done.namehash as i64));
+            }
+
+            Self::delete_delta(&db, folder_id, done.namehash as i64, Some(cookie))?;
         }
 
         Ok(())
@@ -863,13 +874,13 @@ impl Server {
                         })),
                     }))?;
 
-                    tracing::debug!(
-                        "requesting block {}:[{}, {}] from client for file {}",
-                        block.hash,
-                        block.start,
-                        block.end,
-                        manifest.filename
-                    );
+                    // tracing::debug!(
+                    //     "requesting block {}:[{}, {}] from client for file {}",
+                    //     block.hash,
+                    //     block.start,
+                    //     block.end,
+                    //     manifest.filename
+                    // );
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -1306,7 +1317,12 @@ impl Server {
         if let Some(data) = transfer.data {
             let hash = xxhash_rust::xxh3::xxh3_64(&data);
             if hash != metadata.hash {
-                tracing::debug!("hash mismatch - {} != {}", hash, metadata.hash);
+                tracing::debug!(
+                    "hash mismatch - {} != {} (ck: {})",
+                    hash,
+                    metadata.hash,
+                    metadata.cookie()
+                );
                 return Ok(());
             }
 
@@ -1319,11 +1335,13 @@ impl Server {
                     .find(|e| {
                         e.start == metadata.start
                             && e.end == metadata.end
-                            && e.cookie.zip(metadata.cookie).map_or(true, |(a, b)| a == b)
+                            && e.cookie == metadata.cookie
+                            && e.hash == metadata.hash
                     })
                     .is_some()
                 {
-                    let rowid = db.query_row(
+                    if hash == metadata.hash {
+                        let rowid = db.query_row(
                         "UPDATE journal
                          SET contents = ?7
                          WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 AND hash = ?5 AND cookie = ?6
@@ -1342,26 +1360,32 @@ impl Server {
                         |r| r.get::<_, i64>(0)
                     )?;
 
-                    let mut blob =
-                        db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
+                        let mut blob =
+                            db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
 
-                    if blob.write(&data)? != data.len() {
-                        anyhow::bail!("did not write full block to database");
+                        if blob.write(&data)? != data.len() {
+                            anyhow::bail!("did not write full block to database");
+                        }
+
+                        blob.close()?;
+
+                        tracing::debug!(
+                            "got back data for {}:[{}, {}]",
+                            namehash,
+                            metadata.start,
+                            metadata.end
+                        );
+                    } else {
+                        tracing::debug!("hash mismatch - {} != {}", hash, metadata.hash);
                     }
-
-                    blob.close()?;
-
-                    tracing::debug!(
-                        "got back data for {}:[{}, {}]",
-                        namehash,
-                        metadata.start,
-                        metadata.end
-                    );
                 }
 
-                entry
-                    .transfers
-                    .retain(|e| !(e.start == metadata.start && e.end == metadata.end));
+                entry.transfers.retain(|e| {
+                    !(e.start == metadata.start
+                        && e.end == metadata.end
+                        && e.cookie == metadata.cookie
+                        && e.hash == metadata.hash)
+                });
 
                 if entry.transfers.is_empty() {
                     let who = entry.who;
@@ -1372,12 +1396,23 @@ impl Server {
                         .remove(&(namehash as i64))
                         .ok_or(anyhow::anyhow!("what?"))?;
 
+                    if hash != metadata.hash {
+                        {
+                            let mut locks_lock = self.locks.lock().await;
+                            locks_lock.remove(&(folder_id, namehash as i64));
+                        }
+
+                        return Ok(());
+                    }
+
                     let delta = self.apply_journaled_delta(
                         db,
                         folder_id,
                         namehash as i64,
                         metadata.cookie() as i64,
                     )?;
+
+                    drop(outgoing_lock);
 
                     {
                         let mut locks_lock = self.locks.lock().await;
@@ -1401,6 +1436,8 @@ impl Server {
                                     )),
                                 }))?;
 
+                                tracing::debug!("send {} to send {} again", s.0, namehash);
+
                                 return Ok(());
                             }
 
@@ -1410,6 +1447,8 @@ impl Server {
                             })) {
                                 tracing::error!("delta broadcast error: {}", e.to_string());
                             }
+
+                            tracing::debug!("sent delta to {}", addr);
 
                             Ok(())
                         })
