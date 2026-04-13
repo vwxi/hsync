@@ -627,7 +627,13 @@ impl Client {
                         let mut block_data = vec![0u8; (metadata.end - metadata.start) as usize];
                         file.seek(SeekFrom::Start(metadata.start))?;
                         file.read_exact(&mut block_data)?;
-                        anyhow::Ok(block_data)
+
+                        let datahash = xxhash_rust::xxh3::xxh3_64(&block_data);
+                        if datahash == metadata.hash {
+                            anyhow::Ok(block_data)
+                        } else {
+                            anyhow::bail!("bad datahash in fetch_block");
+                        }
                     })() {
                         db.execute(
                             "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",

@@ -463,20 +463,6 @@ impl Server {
         Ok(())
     }
 
-    fn any_pending_deltas(
-        db: &PooledConnection<SqliteConnectionManager>,
-        folder_id: i64,
-        namehash: i64,
-    ) -> anyhow::Result<bool> {
-        let count = db.query_row(
-            "SELECT COUNT(*) FROM journal WHERE folder = ?1 AND name = ?2",
-            [folder_id, namehash],
-            |r| r.get::<_, i64>(0),
-        )?;
-
-        Ok(count != 0)
-    }
-
     async fn handle_done(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -772,24 +758,6 @@ impl Server {
             [addr.to_string()],
             |row| row.get(0),
         )?;
-
-        // if there are transfers from another manifest still pending,
-        // tell the client that they should send back later when it is done
-        // if Self::any_pending_deltas(&db, folder_id, namehash)? {
-        //     tracing::warn!(
-        //         "already sent out deltas for {}, notifying",
-        //         manifest.filename
-        //     );
-
-        //     stream.send(Ch::OutPacket(protocol::Packet {
-        //         code: protocol::Return::TransfersPending as i32,
-        //         message: Some(protocol::packet::Message::Manifest(manifest)),
-        //     }))?;
-
-        //     return Ok(());
-        // } else {
-        //     tracing::warn!("not processing {}, chug on!", manifest.filename);
-        // }
 
         let exists_in_db: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
