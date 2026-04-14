@@ -742,7 +742,7 @@ impl Server {
             stream.send(Ch::OutPacket(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Die(protocol::Die {
-                    reason: Some(String::from("failed to authenticate")),
+                    reason: Some(String::from("rejecting empty manifest")),
                 })),
             }))?;
 
@@ -992,7 +992,7 @@ impl Server {
                 s.1.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(protocol::Event {
-                        event: protocol::FileEvent::CreateUnspecified as i32,
+                        event: protocol::FileEvent::Delete as i32,
                         filename: filename.clone(),
                     })),
                 }))?;
@@ -1028,24 +1028,28 @@ impl Server {
             })?;
 
         let streams_lock = self.streams.read().await;
-        streams_lock
+        let _ = streams_lock
             .iter()
             .map(|s| {
+                if *s.0 == addr {
+                    return Ok(());
+                }
+
                 s.1.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(event.clone())),
                 }))
             })
-            .collect::<Result<(), _>>()?;
+            .collect::<Result<(), _>>();
 
-        match event.event() {
+        let _ = match event.event() {
             protocol::FileEvent::CreateUnspecified => {
                 self.create_file_entry(folder_id, &event.filename, file_namehash)
                     .await
             }
 
             protocol::FileEvent::Delete => self.delete_file_entry(folder_id, file_namehash).await,
-        }?;
+        };
 
         Ok(())
     }
@@ -1386,7 +1390,7 @@ impl Server {
                         "transfer queue satisfied for file {namehash}. broadcasting delta"
                     );
 
-                    streams_lock
+                    let _ = streams_lock
                         .iter()
                         .map(|s| {
                             if *s.0 == who {
@@ -1414,7 +1418,7 @@ impl Server {
 
                             Ok(())
                         })
-                        .collect::<anyhow::Result<()>>()?;
+                        .collect::<anyhow::Result<()>>();
                 }
             }
         } else {

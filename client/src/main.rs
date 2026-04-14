@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Err(e) = Client::client_main(config) {
-        tracing::error!("client error:\n{}", e.backtrace());
+        tracing::error!("client error: {}\n{}", e.to_string(), e.backtrace());
     }
 
     Ok(())

@@ -94,6 +94,12 @@ enum FileEvent {
   FILE_EVENT_DELETE = 1;
 }
 
+// filename field refers to a relative path (i.e. `foo/bar/baz.jpg`).
+// if field ends with a slash then it refers to a directory.
+//
+// file events are always on files. client should handle directories
+// accordingly. client should refuse any events with special directory
+// names like `~` or `..`
 message Event {
   FileEvent event = 1;
   string filename = 2;

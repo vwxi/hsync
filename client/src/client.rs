@@ -36,8 +36,8 @@ pub mod protocol {
 }
 
 const HEARTBEAT_INTERVAL: u64 = 5;
-const NOTIFY_TIMEOUT: u64 = 5000;
-const NOTIFY_TICK_RATE: u64 = 3000;
+const NOTIFY_TIMEOUT: u64 = 2000;
+const NOTIFY_TICK_RATE: u64 = 1500;
 const REFRESH_INTERVAL: u64 = 3;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
@@ -177,7 +177,7 @@ impl Drop for Client {
 
 impl Client {
     pub fn new(
-        config: Config,
+        mut config: Config,
     ) -> anyhow::Result<(
         Client,
         tokio::sync::mpsc::UnboundedReceiver<
@@ -185,9 +185,14 @@ impl Client {
         >,
     )> {
         // process all files currently in folder
-        let current_folder = PathBuf::from(".");
+        let current_folder = std::env::current_dir()?;
+
+        if config.folder.is_none() {
+            config.folder = Some(current_folder.clone());
+        }
 
         let folder = config.folder.as_ref().unwrap_or(&current_folder);
+
         let manager = if let Some(ref db) = config.db {
             SqliteConnectionManager::file(db)
         } else {
@@ -213,10 +218,10 @@ impl Client {
                 let _ = tx.send(res);
             },
             notify_debouncer_full::RecommendedCache::new(),
-            notify::Config::default().with_compare_contents(true),
+            notify::Config::default(),
         )?;
 
-        watcher.watch(folder, notify::RecursiveMode::NonRecursive)?;
+        watcher.watch(folder, notify::RecursiveMode::Recursive)?;
 
         tracing::info!("created notify for folder {}", folder.to_string_lossy());
 
@@ -291,6 +296,21 @@ impl Client {
         Ok(folder.join(name))
     }
 
+    fn resolve_relative_path(&self, path: &PathBuf) -> anyhow::Result<String> {
+        let relative_path = String::from(
+            path.strip_prefix(
+                self.config
+                    .folder
+                    .as_ref()
+                    .ok_or(anyhow::anyhow!("no folder found"))?,
+            )?
+            .to_str()
+            .ok_or(anyhow::anyhow!("relative path encode error"))?,
+        );
+
+        Ok(relative_path)
+    }
+
     fn timestamp() -> anyhow::Result<u64> {
         Ok(std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
@@ -313,15 +333,19 @@ impl Client {
         for entry in glob(&folder_glob)? {
             match entry {
                 Ok(path) => {
-                    let current_datahash = self.get_file_hash(&path)? as i64;
+                    if path.is_file() {
+                        let current_datahash = self.get_file_hash(&path)? as i64;
 
-                    self.process_change_get_blocks(
-                        db,
-                        &path,
-                        current_datahash,
-                        current_timestamp,
-                        None,
-                    )?;
+                        self.process_change_get_blocks(
+                            db,
+                            &path,
+                            current_datahash,
+                            current_timestamp,
+                            None,
+                        )?;
+                    } else if path.is_dir() {
+                        self.process_files_into_db(&path, db)?;
+                    }
                 }
                 _ => continue,
             }
@@ -379,12 +403,8 @@ impl Client {
         path: &PathBuf,
         datahash: Option<u64>,
     ) -> anyhow::Result<bool> {
-        let filename = path
-            .file_name()
-            .ok_or(anyhow::anyhow!("cannot request a directory object"))?
-            .to_str()
-            .ok_or(anyhow::anyhow!("cannot re-encode file path"))?;
-        let namehash = xxhash_rust::xxh3::xxh3_64(filename.as_bytes()) as i64;
+        let relative_path = self.resolve_relative_path(path)?;
+        let namehash = xxhash_rust::xxh3::xxh3_64(relative_path.as_bytes()) as i64;
 
         let transfers_waiting = {
             let outgoing_lock = self.outgoing_transfer_requests.lock().await;
@@ -401,20 +421,20 @@ impl Client {
                         ch.send(Ch::OutPacket(protocol::Packet {
                             code: protocol::Return::NoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
-                                filename: String::from(filename),
+                                filename: relative_path.clone(),
                             })),
                         }))
                     })
-                    .ok_or(anyhow::anyhow!("could not request file {}", filename))??;
+                    .ok_or(anyhow::anyhow!("could not request file {}", relative_path))??;
 
-                tracing::debug!("delta: data hash mismatch, re-requesting {}", filename);
+                tracing::debug!("delta: data hash mismatch, re-requesting {}", relative_path);
 
                 return Ok(false);
             }
 
             true
         } else if !path.exists() {
-            tracing::debug!("sending whatis for file {}", filename);
+            tracing::debug!("sending whatis for file {}", relative_path);
 
             if !self
                 .outgoing_manifest_requests
@@ -432,11 +452,11 @@ impl Client {
                     ch.send(Ch::OutPacket(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
-                            filename: String::from(filename),
+                            filename: relative_path.clone(),
                         })),
                     }))
                 })
-                .ok_or(anyhow::anyhow!("could not request file {}", filename))??;
+                .ok_or(anyhow::anyhow!("could not request file {}", relative_path))??;
 
             false
         } else {
@@ -702,18 +722,16 @@ impl Client {
     ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
         let progress_bar = make_progress_bar();
 
-        let filename = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .ok_or(anyhow::anyhow!("malformed filename"))?;
-        let namehash = xxhash_rust::xxh3::xxh3_64(filename.as_bytes()) as i64;
+        let relative_path = self.resolve_relative_path(path)?;
 
-        progress_bar.set_message(format!("begin checking blocks for {}", filename));
+        let namehash = xxhash_rust::xxh3::xxh3_64(relative_path.as_bytes()) as i64;
+
+        progress_bar.set_message(format!("begin checking blocks for {}", relative_path));
 
         db.execute(
             "INSERT INTO filenames (name, hash, timestamp, datahash) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(name) DO UPDATE SET timestamp=excluded.timestamp, datahash=excluded.datahash",
-            (filename, namehash, current_timestamp, current_datahash),
+            (&relative_path, namehash, current_timestamp, current_datahash),
         )?;
 
         if let Ok(file) = std::fs::File::open(&path) {
@@ -809,13 +827,15 @@ impl Client {
                 blocks.push((block.offset, block.offset + block.length as u64, block_hash));
             }
 
-            progress_bar.finish_with_message(format!("processed change for file {}", filename));
+            progress_bar
+                .finish_with_message(format!("processed change for file {}", relative_path));
 
             Ok(blocks)
         } else {
             let mut stmt = db.prepare("SELECT start, end, hash FROM blocks WHERE file = ?1")?;
 
-            progress_bar.finish_with_message(format!("processed change for file {}", filename));
+            progress_bar
+                .finish_with_message(format!("processed change for file {}", relative_path));
 
             Ok(stmt
                 .query([namehash])?
@@ -863,18 +883,26 @@ impl Client {
             .first()
             .ok_or(anyhow::anyhow!("no event file found"))?;
 
-        let file_name = event_path
-            .file_name()
-            .ok_or(anyhow::anyhow!("file name error"))?
-            .to_str()
-            .ok_or(anyhow::anyhow!("file name error"))?;
+        let relative_path = self.resolve_relative_path(event_path)?;
 
-        let namehash = xxhash_rust::xxh3::xxh3_64(file_name.as_bytes()) as i64;
+        let namehash = xxhash_rust::xxh3::xxh3_64(relative_path.as_bytes()) as i64;
 
-        // TODO: one of the biggest issues is that this wont support
-        //       files in subfolders. we will fix this eventually.
+        // ignore any events relating to a directory
+        if event_path.is_dir() {
+            return Ok(());
+        }
 
-        tracing::debug!("{event:?}");
+        // if accessed then this is triggered by an external file event
+        match event.event.kind {
+            notify::event::EventKind::Remove(notify::event::RemoveKind::File)
+            | notify::event::EventKind::Create(notify::event::CreateKind::File) => {
+                let mut accesses_lock = self.current_accesses.lock().await;
+                if accesses_lock.remove(&namehash) {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
 
         match event.event.kind {
             notify::event::EventKind::Remove(notify::event::RemoveKind::File) => {
@@ -885,7 +913,7 @@ impl Client {
                             code: protocol::Return::NoneUnspecified as i32,
                             message: Some(protocol::packet::Message::Event(protocol::Event {
                                 event: protocol::FileEvent::Delete as i32,
-                                filename: String::from(file_name),
+                                filename: String::from(relative_path),
                             })),
                         }))
                     })
@@ -916,7 +944,7 @@ impl Client {
                 let cookie = rand::random::<i64>();
 
                 let mut manifest = protocol::FileManifest {
-                    filename: String::from(file_name),
+                    filename: relative_path.clone(),
                     timestamp: current_timestamp as u64,
                     size: metadata.len(),
                     hash: Some(current_datahash as u64),
@@ -949,7 +977,7 @@ impl Client {
 
                     tracing::debug!(
                         "queueing manifest for file {} (ck: {})",
-                        file_name,
+                        relative_path,
                         cookie as u64,
                     );
                 } else {
@@ -962,7 +990,7 @@ impl Client {
 
                     tracing::debug!(
                         "sending manifest for file {} (ck: {})",
-                        file_name,
+                        relative_path,
                         cookie as u64
                     );
                 }
@@ -1072,12 +1100,7 @@ impl Client {
             |r| r.get(0),
         )?;
 
-        let folder = self
-            .config
-            .folder
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let filepath = folder.join(&filename);
+        let filepath = self.resolve_file(&filename)?;
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -1188,12 +1211,7 @@ impl Client {
             _ => {}
         };
 
-        let folder = self
-            .config
-            .folder
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let filepath = folder.join(&filename);
+        let filepath = self.resolve_file(&filename)?;
 
         // maybe we do not have the file yet, we should not satisfy a transfer for
         // a file we do not have.
@@ -1670,21 +1688,31 @@ impl Client {
         name_string: &str,
         namehash: i64,
     ) -> anyhow::Result<()> {
-        let folder = self
-            .config
-            .folder
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let filepath = folder.join(name_string);
+        let filepath = self.resolve_file(name_string)?;
+        let parent = filepath.parent().ok_or(anyhow::anyhow!("no path parent"))?;
+
+        if filepath.is_dir() {
+            anyhow::bail!("cannot process a directory path");
+        }
+
+        if filepath.exists() {
+            return Ok(());
+        }
 
         db.execute(
             "INSERT OR REPLACE INTO filenames (name, hash, timestamp) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
             (name_string, namehash, Self::timestamp()? as i64),
         )?;
 
+        if !parent.exists() {
+            std::fs::create_dir(parent)?;
+        }
+
         if metadata(&filepath).is_err() {
             std::fs::File::create_new(filepath)?;
         }
+
+        tracing::debug!("created file {}", name_string);
 
         Ok(())
     }
@@ -1694,29 +1722,32 @@ impl Client {
         db: &PooledConnection<SqliteConnectionManager>,
         namehash: i64,
     ) -> anyhow::Result<()> {
-        db.execute("DELETE FROM blocks WHERE file = ?1", [namehash])?;
-
-        tracing::debug!("deleted all blocks related to file {} in folder", namehash,);
-
         let filename: String = db.query_one(
             "SELECT name FROM filenames WHERE hash = ?1",
             [namehash],
             |r| r.get(0),
         )?;
 
+        let filepath = self.resolve_file(&filename)?;
+        let parent = filepath.parent().ok_or(anyhow::anyhow!("no path parent"))?;
+
+        if !filepath.exists() {
+            return Ok(());
+        }
+
+        db.execute("DELETE FROM blocks WHERE file = ?1", [namehash])?;
         db.execute("DELETE FROM filenames WHERE hash = ?1", [namehash])?;
+
+        tracing::debug!("deleted all blocks related to file {} in folder", namehash,);
+
+        std::fs::remove_file(&filepath)?;
 
         tracing::debug!("deleted filename entry for namehash {} in folder", namehash,);
 
-        let folder = self
-            .config
-            .folder
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let filepath = folder.join(&filename);
-
-        if metadata(&filepath).is_ok() {
-            std::fs::remove_file(&filepath)?;
+        // if directory is empty, delete it
+        if parent.read_dir()?.peekable().peek().is_none() {
+            tracing::debug!("deleted empty folder {}", parent.to_string_lossy());
+            std::fs::remove_dir(&parent)?;
         }
 
         Ok(())
@@ -1727,13 +1758,6 @@ impl Client {
 
         let namehash = xxhash_rust::xxh3::xxh3_64(event.filename.as_bytes()) as i64;
 
-        tracing::debug!("ext file event: {:?} {}", event.event(), event.filename);
-
-        {
-            let mut accesses_lock = self.current_accesses.lock().await;
-            accesses_lock.insert(namehash);
-        }
-
         match event.event() {
             protocol::FileEvent::CreateUnspecified => {
                 self.create_file_entry(&db, &event.filename, namehash)?;
@@ -1742,11 +1766,6 @@ impl Client {
             protocol::FileEvent::Delete => {
                 self.delete_file_by_hash(&db, namehash)?;
             }
-        }
-
-        {
-            let mut accesses_lock = self.current_accesses.lock().await;
-            accesses_lock.remove(&namehash);
         }
 
         Ok(())
