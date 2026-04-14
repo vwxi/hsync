@@ -36,8 +36,8 @@ pub mod protocol {
 }
 
 const HEARTBEAT_INTERVAL: u64 = 5;
-const NOTIFY_TIMEOUT: u64 = 2000;
-const NOTIFY_TICK_RATE: u64 = 1500;
+const NOTIFY_TIMEOUT: u64 = 3000;
+const NOTIFY_TICK_RATE: u64 = 2000;
 const REFRESH_INTERVAL: u64 = 3;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
