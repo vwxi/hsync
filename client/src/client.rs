@@ -21,6 +21,7 @@ use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     select,
@@ -36,12 +37,13 @@ pub mod protocol {
 }
 
 const HEARTBEAT_INTERVAL: u64 = 5;
-const NOTIFY_TIMEOUT: u64 = 3000;
+const NOTIFY_TIMEOUT: u64 = 2000;
 const NOTIFY_TICK_RATE: u64 = 2000;
 const REFRESH_INTERVAL: u64 = 3;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const BUF_SIZE: usize = 16384;
+const EV_BUF_SIZE: usize = 32;
 
 /// name string <-> name hash
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (name TEXT PRIMARY KEY, hash INTEGER, timestamp INTEGER, datahash INTEGER, UNIQUE(name, hash))";
@@ -243,9 +245,16 @@ impl Client {
 
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config)?))
         } else {
-            tracing::warn!("running in secure mode.");
+            tracing::warn!("running with TLS");
 
-            quinn::ClientConfig::try_with_platform_verifier()?
+            let mut rustls_config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()?
+                .with_platform_verifier()?
+                .with_no_client_auth();
+
+            rustls_config.alpn_protocols = ALPN_QUIC_HSYNC.iter().map(|p| p.to_vec()).collect();
+
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config)?))
         });
 
         let db_pool = Pool::new(manager)?;
@@ -2203,6 +2212,7 @@ impl Client {
             // handle channel thread
             tokio::spawn(async move {
                 let mut client = client_;
+                let mut event_buffer = vec![];
 
                 tracing::debug!("starting channel handler thread");
 
@@ -2224,39 +2234,39 @@ impl Client {
 
                 loop {
                     tokio::select! {
-                        r = recv_ch.recv() => {
-                            match r {
-                                // packet coming in from the wire
-                                Some(Ch::InPacket(pkt)) => {
-                                    if let Err(e) = client.handle_server_event(pkt).await {
-                                        tracing::error!("server event error: {}", e.to_string(),);
+                        sz = recv_ch.recv_many(&mut event_buffer, EV_BUF_SIZE) => {
+                            for i in event_buffer.drain(..sz) {
+                                match i {
+                                    // packet coming in from the wire
+                                    Ch::InPacket(pkt) => {
+                                        if let Err(e) = client.handle_server_event(pkt).await {
+                                            tracing::error!("server event error: {}", e.to_string(),);
+                                        }
                                     }
-                                }
 
-                                // we have to send this over the wire
-                                Some(Ch::OutPacket(pkt)) => {
-                                    if let Err(e) = Self::write_packet(&mut send, &pkt).await {
-                                        tracing::error!("write packet error: {}", e.to_string(),);
+                                    // we have to send this over the wire
+                                    Ch::OutPacket(pkt) => {
+                                        if let Err(e) = Self::write_packet(&mut send, &pkt).await {
+                                            tracing::error!("write packet error: {}", e.to_string(),);
+                                        }
                                     }
-                                }
 
-                                Some(Ch::Event(ev)) => {
-                                    if let Err(e) = client.handle_file_event(ev).await {
-                                        tracing::error!("handle event error: {}", e.to_string(),);
+                                    Ch::Event(ev) => {
+                                        if let Err(e) = client.handle_file_event(ev).await {
+                                            tracing::error!("handle event error: {}", e.to_string(),);
+                                        }
                                     }
-                                }
 
-                                // check on outgoing transfer requests
-                                Some(Ch::Refresh) => {
-                                    if let Err(e) = client.check_outgoing_transfers().await {
-                                        tracing::error!("outgoing transfer check error: {}", e.to_string());
+                                    // check on outgoing transfer requests
+                                    Ch::Refresh => {
+                                        if let Err(e) = client.check_outgoing_transfers().await {
+                                            tracing::error!("outgoing transfer check error: {}", e.to_string());
+                                        }
                                     }
-                                }
-
-                                None => {
-                                    tracing::error!("recv queue error");
                                 }
                             }
+
+                            event_buffer.clear();
                         }
 
                         _ = token.cancelled() => {

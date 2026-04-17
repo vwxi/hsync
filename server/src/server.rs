@@ -38,6 +38,7 @@ const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGE
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(folder, name, start, end, cookie))";
+const EV_BUF_SIZE: usize = 32;
 
 #[derive(Debug, Clone)]
 enum Ch {
@@ -242,31 +243,34 @@ impl Server {
         let futs = vec![
             // handle channel thread
             tokio::spawn(async move {
+                let mut event_buffer = vec![];
+
                 tracing::debug!("starting channel handler thread");
 
                 loop {
                     tokio::select! {
-                        m = recv.recv() => {
-                            match m {
-                                Some(Ch::OutPacket(pkt)) => {
-                                    match Self::write_packet(&mut conn_send, &pkt).await {
-                                        Err(e) => {
-                                            tracing::error!("write packet error: {}", e.to_string());
+                        sz = recv.recv_many(&mut event_buffer, EV_BUF_SIZE) => {
+                            for e in event_buffer.drain(..sz) {
+                                match e {
+                                    Ch::OutPacket(pkt) => {
+                                        match Self::write_packet(&mut conn_send, &pkt).await {
+                                            Err(e) => {
+                                                tracing::error!("write packet error: {}", e.to_string());
 
-                                            token.cancel();
+                                                token.cancel();
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
-                                }
-                                Some(Ch::Refresh) => {
-                                    if let Err(e) = self_.check_outgoing_transfers().await {
-                                        tracing::error!("outgoing transfer check error: {}", e.to_string());
+                                    Ch::Refresh => {
+                                        if let Err(e) = self_.check_outgoing_transfers().await {
+                                            tracing::error!("outgoing transfer check error: {}", e.to_string());
+                                        }
                                     }
-                                }
-                                None => {
-                                    tracing::error!("recv queue error");
                                 }
                             }
+
+                            event_buffer.clear();
                         }
 
                         _ = token.cancelled() => {
