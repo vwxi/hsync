@@ -1,12 +1,4 @@
-/// the syncing server only servers to mediate between
-/// peers wrt events and resolving edit conflicts.
-///
-/// that being said, all state is temporary.
-///
-/// issues that have to be thought through:
-/// 1. bootstrapping: how does the client on first connect get what it is missing from the server/other clients?
-///                   does the server send an entry directory? (that seems like it won't scale at all)
-///
+mod fs;
 mod server;
 
 use clap::Parser;

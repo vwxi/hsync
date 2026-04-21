@@ -207,8 +207,6 @@ impl Client {
         );
 
         // create notify stream
-        // TODO: for subfolders we need to abstract out this part into something
-        //       you can deploy for any number of folders
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
             Result<Vec<notify_debouncer_full::DebouncedEvent>, Vec<notify::Error>>,
         >();

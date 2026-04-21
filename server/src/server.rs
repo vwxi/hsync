@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::Config;
+use crate::fs::Fs;
 use anyhow::Context;
 use blake2::Digest;
 use prost::Message;
@@ -71,6 +72,7 @@ pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
+    fs_handle: tokio::task::JoinHandle<()>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
     locks: Mutex<HashMap<(i64, i64), LockState>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
@@ -166,10 +168,19 @@ impl Server {
 
         tracing::info!("initialized db");
 
+        let rootpath = config
+            .db
+            .as_ref()
+            .map(|p| p.parent())
+            .flatten()
+            .map(|p| p.into())
+            .unwrap_or(std::env::current_dir()?);
+
         Ok(Server {
             config,
             endpoint,
-            db_pool: pool,
+            db_pool: pool.clone(),
+            fs_handle: tokio::spawn(crate::fs::hsyncfs_create(rootpath, pool)),
             streams: RwLock::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
