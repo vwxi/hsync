@@ -28,16 +28,26 @@ pub struct Fs {
     counter: AtomicU64,
 }
 
+#[derive(Debug)]
 struct FileInfo {
+    pub ino: u64,
     pub folder_id: i64,
     pub namehash: i64,
+    pub name: String,
     pub size: i64,
     pub num_blocks: i64,
 }
 
+#[derive(Debug)]
 struct FolderInfo {
     pub name: String,
     pub ino: u64,
+}
+
+#[derive(Debug)]
+struct FolderContents {
+    pub info: FolderInfo,
+    pub files: Vec<FileInfo>,
 }
 
 impl Fs {
@@ -52,8 +62,8 @@ impl Fs {
         let db = self.db_pool.get()?;
 
         Ok(db.query_row(
-            "SELECT COUNT(*) FROM folders WHERE id = ?1",
-            [dir_ino],
+            "SELECT DISTINCT COUNT(*) FROM filenames WHERE folder = ?1",
+            [((dir_ino as u64 >> 48) & 0xffff) as i64],
             |r| r.get::<_, i64>(0),
         )? > 0)
     }
@@ -61,34 +71,29 @@ impl Fs {
     fn file_info(&self, file_ino: i64) -> anyhow::Result<FileInfo> {
         let db = self.db_pool.get()?;
 
-        let (folder_id, namehash) = db
-            .query_row(
-                "SELECT folder, namehash FROM filenames WHERE id = ?1",
-                [file_ino],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+        let folder_id = ((file_ino as u64) >> 48) & 0xffff;
+        let file_id = (file_ino as u64) & 0xffffffffffff;
 
-        let (size, num_blocks) = db
-            .query_row(
-                "SELECT DISTINCT COUNT(*), MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
-                [folder_id, namehash],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+        let (name, namehash) = db.query_row(
+            "SELECT name, namehash FROM filenames WHERE folder = ?1 AND ROWID = ?2",
+            [folder_id as i64, file_id as i64],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+
+        let (size, num_blocks) = db.query_row(
+            "SELECT DISTINCT COUNT(*), MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
+            [folder_id as i64, namehash],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
 
         Ok(FileInfo {
-            folder_id,
+            ino: file_ino as u64,
+            folder_id: folder_id as i64,
+            name,
             namehash,
             size,
             num_blocks,
         })
-    }
-
-    fn file_lookup(&self, name: &str) -> anyhow::Result<()> {
-        let db = self.db_pool.get()?;
-
-        Ok(())
     }
 
     fn list_root_folders(&self) -> anyhow::Result<Vec<FolderInfo>> {
@@ -102,11 +107,40 @@ impl Fs {
             let id = entry.get::<_, i64>(0)? as u64;
             folders.push(FolderInfo {
                 name: String::from(format!("{}", id)),
-                ino: (id & 0xffff) << 32,
+                ino: (id & 0xffff) << 48,
             });
         }
 
         Ok(folders)
+    }
+
+    fn list_folder_contents(&self, folder_id: i64) -> anyhow::Result<FolderContents> {
+        let db = self.db_pool.get()?;
+        let mut stmt = db.prepare("SELECT ROWID FROM filenames WHERE folder = ?1")?;
+        let mut entries = stmt.query([folder_id])?;
+
+        let mut contents = FolderContents {
+            info: FolderInfo {
+                name: (folder_id as u64).to_string(),
+                ino: (folder_id as u64 & 0xffff) << 48,
+            },
+            files: vec![],
+        };
+
+        while let Ok(Some(entry)) = entries.next() {
+            let rowid = entry.get::<_, i64>(0)?;
+
+            let ino = ((rowid as u64) & 0xffffffffffff) | (((folder_id as u64) & 0xffff) << 48);
+
+            match dbg!(self.file_info(ino as i64)) {
+                Ok(fi) => {
+                    contents.files.push(dbg!(fi));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(contents)
     }
 
     fn mk_fileattr(
@@ -146,8 +180,8 @@ impl fuser::Filesystem for Fs {
         _fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
-        let folder_id = u64::from(ino) >> 48;
-        let file_id = (u64::from(ino) << 16) >> 16;
+        let folder_id = (u64::from(ino) >> 48) & 0xffff;
+        let file_id = u64::from(ino) & 0xffffffffffff;
 
         let folder_exists = match self.dir_exists(folder_id as i64) {
             Ok(e) => e,
@@ -192,9 +226,7 @@ impl fuser::Filesystem for Fs {
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        let folder_id = u64::from(ino) >> 48;
-
-        match self.dir_exists(folder_id as i64) {
+        match self.dir_exists(u64::from(ino) as i64) {
             Ok(e) if !e && ino != fuser::INodeNo::ROOT => {
                 reply.error(fuser::Errno::ENOTDIR);
                 return;
@@ -215,7 +247,7 @@ impl fuser::Filesystem for Fs {
 
     fn lookup(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         parent: fuser::INodeNo,
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
@@ -246,10 +278,32 @@ impl fuser::Filesystem for Fs {
                 } else {
                     // otherwise it should be a folder id which is just a number
                     // because we are still in root folder
-                    let folder_id = u64::try_from(name)? as i64;
+                    let folder_num = match name.parse::<u64>() {
+                        Ok(f) => f,
+                        _ => {
+                            reply.error(fuser::Errno::ENOENT);
+                            anyhow::bail!("non-id folders do not exist in root");
+                        }
+                    };
 
-                    match self.dir_exists(folder_id) {
-                        Ok(e) if e => {}
+                    let folder_id = (folder_num & 0xffff) << 48;
+
+                    match self.dir_exists(folder_id as i64) {
+                        Ok(e) if e => {
+                            let attr = Self::mk_fileattr(
+                                req,
+                                fuser::INodeNo(folder_id),
+                                0,
+                                0,
+                                fuser::FileType::Directory,
+                                2,
+                                512,
+                            );
+
+                            tracing::debug!("opendir {:#x}", folder_id);
+
+                            reply.entry(&Duration::from_secs(1), &attr, fuser::Generation(0));
+                        }
 
                         _ => {
                             reply.error(fuser::Errno::ENOENT);
@@ -303,20 +357,41 @@ impl fuser::Filesystem for Fs {
                     return;
                 }
             }
+
+            reply.ok();
         } else {
             // not a root dir, let's read folder id
-            let folder_id = u64::from(ino) >> 48;
+            let folder_id = (u64::from(ino) >> 48) & 0xffff;
 
-            match self.dir_exists(folder_id as i64) {
-                Ok(e) if e => {}
+            match dbg!(self.dir_exists(u64::from(ino) as i64)) {
+                Ok(e) if e => match dbg!(self.list_folder_contents(folder_id as i64)) {
+                    Ok(contents) => {
+                        for (index, file) in contents.files.iter().skip(offset as usize).enumerate()
+                        {
+                            if reply.add(
+                                fuser::INodeNo(file.ino),
+                                offset + index as u64 + 1,
+                                fuser::FileType::RegularFile,
+                                &file.name,
+                            ) {
+                                break;
+                            }
+                        }
+
+                        reply.ok();
+                    }
+
+                    _ => {
+                        reply.error(fuser::Errno::ENOENT);
+                        return;
+                    }
+                },
 
                 _ => {
                     reply.error(fuser::Errno::ENOENT);
                 }
             }
         }
-
-        reply.ok();
     }
 }
 
