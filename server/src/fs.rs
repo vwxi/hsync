@@ -9,10 +9,12 @@ use std::{
 /// why? enabling a new type of topology where the server is actually
 /// an active user in a folder that can push changes
 ///
+/// inode format:
+/// [upper 16 bits folder id][lower 48 bits filenames rowid]
 /// structure:
 /// root
-/// |_ <folder id>
-///     |_ <files>
+/// |_ <folder id> (inodes will correspond)
+///     |_ <files> ()
 ///
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -26,6 +28,13 @@ pub struct Fs {
     counter: AtomicU64,
 }
 
+struct FileInfo {
+    pub folder_id: i64,
+    pub namehash: i64,
+    pub size: i64,
+    pub num_blocks: i64,
+}
+
 impl Fs {
     fn get_handle(&self) -> u64 {
         self.counter
@@ -34,14 +43,41 @@ impl Fs {
             | FILE_HANDLE_WRITE_BIT
     }
 
-    fn dir_exists(&self, dir_name: i64) -> anyhow::Result<bool> {
+    fn dir_exists(&self, dir_ino: i64) -> anyhow::Result<bool> {
         let db = self.db_pool.get()?;
 
         Ok(db.query_row(
             "SELECT COUNT(*) FROM folders WHERE id = ?1",
-            [dir_name],
+            [dir_ino],
             |r| r.get::<_, i64>(0),
         )? > 0)
+    }
+
+    fn file_info(&self, file_ino: i64) -> anyhow::Result<FileInfo> {
+        let db = self.db_pool.get()?;
+
+        let (folder_id, namehash) = db
+            .query_row(
+                "SELECT folder, namehash FROM filenames WHERE id = ?1",
+                [file_ino],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+
+        let (size, num_blocks) = db
+            .query_row(
+                "SELECT DISTINCT COUNT(*), MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
+                [folder_id, namehash],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+
+        Ok(FileInfo {
+            folder_id,
+            namehash,
+            size,
+            num_blocks,
+        })
     }
 
     fn file_lookup(&mut self, name: &str) -> anyhow::Result<()> {
@@ -54,13 +90,24 @@ impl Fs {
 impl fuser::Filesystem for Fs {
     fn getattr(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         ino: fuser::INodeNo,
         fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
         // is this fs root
-        if ino == fuser::INodeNo::ROOT {
+        let folder_id = u64::from(ino) >> 48;
+        let file_id = (u64::from(ino) << 16) >> 16;
+
+        let folder_exists = match self.dir_exists(folder_id as i64) {
+            Ok(e) => e,
+            Err(_) => {
+                reply.error(fuser::Errno::ENOENT);
+                return;
+            }
+        };
+
+        if ino == fuser::INodeNo::ROOT || folder_exists {
             let attr = fuser::FileAttr {
                 ino,
                 size: 0,
@@ -81,7 +128,33 @@ impl fuser::Filesystem for Fs {
 
             reply.attr(&Duration::from_secs(1), &attr);
         } else {
-            reply.error(fuser::Errno::ENOENT);
+            let file_info = match self.file_info(file_id as i64) {
+                Ok(e) => e,
+                Err(_) => {
+                    reply.error(fuser::Errno::ENOENT);
+                    return;
+                }
+            };
+
+            let attr = fuser::FileAttr {
+                ino,
+                size: file_info.size as u64,
+                blocks: file_info.num_blocks as u64,
+                atime: UNIX_EPOCH,
+                mtime: UNIX_EPOCH,
+                ctime: UNIX_EPOCH,
+                crtime: UNIX_EPOCH,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o755,
+                nlink: 2,
+                uid: req.uid(),
+                gid: req.gid(),
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            };
+
+            reply.attr(&Duration::from_secs(1), &attr);
         }
     }
 
