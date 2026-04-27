@@ -3,14 +3,14 @@
 /// why? enabling a new type of topology where the server is actually
 /// an active user in a folder that can push changes
 ///
-/// inode format:
-/// [upper 16 bits folder id][lower 48 bits filenames rowid]
-/// when lower 48 bits are zero this means that the ino belongs to a folder
-/// but this does not matter because readdir callback ignores lower bits anyway
-///
 /// current issue: how to represent subfolders knowing only that
 ///                         file names in subfolders contain slash characters
+/// thought process:
+/// caching directory structures in memory,
+/// when listing out folder contents, process folder
 use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     path::PathBuf,
     sync::atomic::AtomicU64,
     time::{Duration, UNIX_EPOCH},
@@ -22,6 +22,41 @@ use r2d2_sqlite::SqliteConnectionManager;
 const FS_NAME: &str = "hsyncfs";
 const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
 const FILE_HANDLE_WRITE_BIT: u64 = 1 << 62;
+const SUBDIR_CACHE_SIZE: usize = 2048;
+
+/// inode format:
+/// MSB ---> LSB
+/// [16 bits folder id] [16 bits internal folder id] [32 bits filenames rowid]
+///
+/// internal folder id is completely seperate from filenames rowid.
+/// that is to say that the rowid is from the greater filenames table and
+/// the internal folder id is only for FUSE accounting
+///
+/// examples:
+/// [folder id] [16 bits zero] [32 bits zero] - main project folders on root dir
+/// [folder id] [internal folder id] [32 bits zero] - project subfolder entity
+/// [folder id] [16 bits zero] [rowid] - project file in project root
+/// [folder id] [internal folder id] [rowid] - project file in subfolder
+///
+#[bitfields::bitfield(u64, order = msb)]
+#[derive(Clone, Copy)]
+struct Inode {
+    pub folder_id: u16,
+    pub internal_folder_id: u16,
+    pub rowid: u32,
+}
+
+impl From<fuser::INodeNo> for Inode {
+    fn from(value: fuser::INodeNo) -> Self {
+        Inode(value.0)
+    }
+}
+
+impl From<Inode> for fuser::INodeNo {
+    fn from(value: Inode) -> Self {
+        fuser::INodeNo(value.0)
+    }
+}
 
 pub struct Fs {
     pub db_pool: Pool<SqliteConnectionManager>,
@@ -45,9 +80,15 @@ struct FolderInfo {
 }
 
 #[derive(Debug)]
+enum FolderItem {
+    Directory(FolderContents),
+    File(FileInfo),
+}
+
+#[derive(Debug)]
 struct FolderContents {
     pub info: FolderInfo,
-    pub files: Vec<FileInfo>,
+    pub items: Vec<FolderItem>,
 }
 
 impl Fs {
@@ -58,37 +99,34 @@ impl Fs {
             | FILE_HANDLE_WRITE_BIT
     }
 
-    fn dir_exists(&self, dir_ino: i64) -> anyhow::Result<bool> {
+    fn dir_exists(&self, dir_ino: Inode) -> anyhow::Result<bool> {
         let db = self.db_pool.get()?;
 
         Ok(db.query_row(
             "SELECT DISTINCT COUNT(*) FROM filenames WHERE folder = ?1",
-            [((dir_ino as u64 >> 48) & 0xffff) as i64],
+            [dir_ino.folder_id() as i64],
             |r| r.get::<_, i64>(0),
         )? > 0)
     }
 
-    fn file_info(&self, file_ino: i64) -> anyhow::Result<FileInfo> {
+    fn file_info(&self, file_ino: Inode) -> anyhow::Result<FileInfo> {
         let db = self.db_pool.get()?;
-
-        let folder_id = ((file_ino as u64) >> 48) & 0xffff;
-        let file_id = (file_ino as u64) & 0xffffffffffff;
 
         let (name, namehash) = db.query_row(
             "SELECT name, namehash FROM filenames WHERE folder = ?1 AND ROWID = ?2",
-            [folder_id as i64, file_id as i64],
+            [file_ino.folder_id() as i64, file_ino.rowid() as i64],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         )?;
 
         let (size, num_blocks) = db.query_row(
             "SELECT DISTINCT COUNT(*), MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
-            [folder_id as i64, namehash],
+            [file_ino.folder_id() as i64, namehash],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )?;
 
         Ok(FileInfo {
-            ino: file_ino as u64,
-            folder_id: folder_id as i64,
+            ino: file_ino.into(),
+            folder_id: file_ino.folder_id() as i64,
             name,
             namehash,
             size,
@@ -104,37 +142,73 @@ impl Fs {
         let mut folder_entries = stmt.query([])?;
 
         while let Ok(Some(entry)) = folder_entries.next() {
-            let id = entry.get::<_, i64>(0)? as u64;
+            let mut ino = Inode(0);
+            ino.set_folder_id(entry.get::<_, i64>(0)? as u16);
+
             folders.push(FolderInfo {
-                name: String::from(format!("{}", id)),
-                ino: (id & 0xffff) << 48,
+                name: String::from(format!("{}", ino.folder_id())),
+                ino: ino.into(),
             });
         }
 
         Ok(folders)
     }
 
-    fn list_folder_contents(&self, folder_id: i64) -> anyhow::Result<FolderContents> {
+    fn list_folder_contents(
+        &self,
+        folder_id: i64,
+        internal_folder_id: i64,
+    ) -> anyhow::Result<FolderContents> {
         let db = self.db_pool.get()?;
-        let mut stmt = db.prepare("SELECT ROWID FROM filenames WHERE folder = ?1")?;
-        let mut entries = stmt.query([folder_id])?;
+
+        // get root files first. if directory, list as directory
+        let mut stmt =
+            db.prepare("SELECT ROWID, name FROM filenames WHERE folder = ?1 AND subdir = ?2")?;
+        let mut entries = stmt.query((
+            folder_id,
+            if internal_folder_id == 0 {
+                None
+            } else {
+                Some(internal_folder_id)
+            },
+        ))?;
 
         let mut contents = FolderContents {
             info: FolderInfo {
                 name: (folder_id as u64).to_string(),
-                ino: (folder_id as u64 & 0xffff) << 48,
+                ino: {
+                    let mut i = Inode(0);
+                    i.set_folder_id(folder_id as u16);
+                    i.into()
+                },
             },
-            files: vec![],
+            items: vec![],
         };
 
         while let Ok(Some(entry)) = entries.next() {
-            let rowid = entry.get::<_, i64>(0)?;
+            let (rowid, name) = (entry.get::<_, i64>(0)?, entry.get::<_, String>(1)?);
 
-            let ino = ((rowid as u64) & 0xffffffffffff) | (((folder_id as u64) & 0xffff) << 48);
+            let mut ino = Inode(0);
+            ino.set_folder_id(folder_id as u16);
 
-            match dbg!(self.file_info(ino as i64)) {
+            // check if need to set internal folder id
+            {
+                if let Some(subfolder) = name.rsplit_once("/").map(|f| f.0) {
+                    let internal_folder_id = db.query_row(
+                        "SELECT ROWID FROM subdirs WHERE folder = ?1 AND path = ?2 LIMIT 1",
+                        (folder_id, subfolder),
+                        |r| r.get::<_, i64>(0),
+                    )?;
+
+                    ino.set_internal_folder_id(internal_folder_id as u16);
+                }
+            }
+
+            ino.set_rowid(rowid as u32);
+
+            match dbg!(self.file_info(ino)) {
                 Ok(fi) => {
-                    contents.files.push(dbg!(fi));
+                    contents.items.push(FolderItem::File(fi));
                 }
                 _ => {}
             }
@@ -180,10 +254,7 @@ impl fuser::Filesystem for Fs {
         _fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
-        let folder_id = (u64::from(ino) >> 48) & 0xffff;
-        let file_id = u64::from(ino) & 0xffffffffffff;
-
-        let folder_exists = match self.dir_exists(folder_id as i64) {
+        let folder_exists = match self.dir_exists(ino.into()) {
             Ok(e) => e,
             Err(_) => {
                 reply.error(fuser::Errno::ENOENT);
@@ -197,7 +268,7 @@ impl fuser::Filesystem for Fs {
 
             reply.attr(&Duration::from_secs(1), &attr);
         } else {
-            let file_info = match self.file_info(file_id as i64) {
+            let file_info = match self.file_info(ino.into()) {
                 Ok(fi) => fi,
                 Err(_) => {
                     reply.error(fuser::Errno::ENOENT);
@@ -226,12 +297,23 @@ impl fuser::Filesystem for Fs {
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        match self.dir_exists(u64::from(ino) as i64) {
-            Ok(e) if !e && ino != fuser::INodeNo::ROOT => {
+        if ino == fuser::INodeNo::ROOT {
+            reply.opened(
+                fuser::FileHandle(self.get_handle()),
+                fuser::FopenFlags::all() & !fuser::FopenFlags::FOPEN_PASSTHROUGH,
+            );
+
+            return;
+        }
+
+        match self.dir_exists(ino.into()) {
+            Ok(e) if !e => {
+                tracing::error!("opendir: {} does not exist", ino);
                 reply.error(fuser::Errno::ENOTDIR);
                 return;
             }
             Err(_) => {
+                tracing::error!("opendir: error checking {}", ino);
                 reply.error(fuser::Errno::ENOTDIR);
                 return;
             }
@@ -286,21 +368,20 @@ impl fuser::Filesystem for Fs {
                         }
                     };
 
-                    let folder_id = (folder_num & 0xffff) << 48;
+                    let mut i = Inode(0);
+                    i.set_folder_id(dbg!(folder_num) as u16);
 
-                    match self.dir_exists(folder_id as i64) {
+                    match self.dir_exists(i) {
                         Ok(e) if e => {
                             let attr = Self::mk_fileattr(
                                 req,
-                                fuser::INodeNo(folder_id),
+                                i.into(),
                                 0,
                                 0,
                                 fuser::FileType::Directory,
                                 2,
                                 512,
                             );
-
-                            tracing::debug!("opendir {:#x}", folder_id);
 
                             reply.entry(&Duration::from_secs(1), &attr, fuser::Generation(0));
                         }
@@ -361,20 +442,29 @@ impl fuser::Filesystem for Fs {
             reply.ok();
         } else {
             // not a root dir, let's read folder id
-            let folder_id = (u64::from(ino) >> 48) & 0xffff;
-
-            match dbg!(self.dir_exists(u64::from(ino) as i64)) {
-                Ok(e) if e => match dbg!(self.list_folder_contents(folder_id as i64)) {
+            let ino: Inode = ino.into();
+            match self.dir_exists(ino) {
+                Ok(e) if e => match dbg!(self.list_folder_contents(
+                    ino.folder_id() as i64,
+                    dbg!(ino.internal_folder_id()) as i64
+                )) {
                     Ok(contents) => {
-                        for (index, file) in contents.files.iter().skip(offset as usize).enumerate()
+                        for (index, item) in contents.items.iter().skip(offset as usize).enumerate()
                         {
-                            if reply.add(
-                                fuser::INodeNo(file.ino),
-                                offset + index as u64 + 1,
-                                fuser::FileType::RegularFile,
-                                &file.name,
-                            ) {
-                                break;
+                            match item {
+                                FolderItem::File(file) => {
+                                    if reply.add(
+                                        fuser::INodeNo(file.ino),
+                                        offset + index as u64 + 1,
+                                        fuser::FileType::RegularFile,
+                                        &file.name,
+                                    ) {
+                                        tracing::debug!("FULL!!! FUL!!!");
+                                        break;
+                                    }
+                                }
+
+                                _ => {}
                             }
                         }
 
