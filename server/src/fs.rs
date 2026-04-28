@@ -81,7 +81,7 @@ struct FolderInfo {
 
 #[derive(Debug)]
 enum FolderItem {
-    Directory(FolderContents),
+    Directory(FolderInfo),
     File(FileInfo),
 }
 
@@ -99,14 +99,85 @@ impl Fs {
             | FILE_HANDLE_WRITE_BIT
     }
 
-    fn dir_exists(&self, dir_ino: Inode) -> anyhow::Result<bool> {
+    // check if inode represents a project folder / subfolder
+    fn is_dir(&self, ino: Inode) -> anyhow::Result<bool> {
         let db = self.db_pool.get()?;
 
-        Ok(db.query_row(
-            "SELECT DISTINCT COUNT(*) FROM filenames WHERE folder = ?1",
-            [dir_ino.folder_id() as i64],
+        // folder
+        Ok(ino.rowid() == 0
+            && (db.query_row(
+            "SELECT DISTINCT COUNT(*) FROM filenames WHERE folder = ?1 AND subdir IS NULL",
+            [ino.folder_id() as i64],
             |r| r.get::<_, i64>(0),
-        )? > 0)
+            )? > 0
+        // subfolder
+            || db.query_row(
+                "SELECT DISTINCT COUNT(*) FROM filenames WHERE folder = ?1 AND subdir = ?2",
+                [ino.folder_id() as i64, ino.internal_folder_id() as i64],
+                |r| r.get::<_, i64>(0),
+            )? > 0))
+    }
+
+    fn entry_info(&self, parent_ino: Inode, name: &str) -> anyhow::Result<FolderItem> {
+        let db = self.db_pool.get()?;
+
+        // entry is a file
+        if let Ok(rowid) = db.query_row(
+            "SELECT ROWID FROM filenames WHERE folder = ?1 AND name LIKE ?2 AND subdir IS ?3 LIMIT 1",
+            (
+                parent_ino.folder_id() as i64,
+                if parent_ino.internal_folder_id() == 0 {
+                    String::from(name)
+                } else {
+                    "%/".to_owned() + name
+                },
+                if parent_ino.internal_folder_id() == 0 {
+                    None
+                } else {
+                    Some(parent_ino.internal_folder_id() as i64)
+                },
+            ),
+            |r| r.get::<_, i64>(0),
+        ) {
+            return Ok(FolderItem::File(
+                self.file_info(
+                    InodeBuilder::new()
+                        .with_folder_id(parent_ino.folder_id())
+                        .with_internal_folder_id(parent_ino.internal_folder_id())
+                        .with_rowid(rowid as u32)
+                        .build(),
+                )?,
+            ));
+        }
+
+        // entry is a subfolder
+        Ok(FolderItem::Directory(FolderInfo {
+            name: String::from(name),
+            ino: InodeBuilder::new()
+                .with_folder_id(parent_ino.folder_id())
+                .with_internal_folder_id(if parent_ino.internal_folder_id() == 0 {
+                    // is subfolder in project root?
+                    tracing::debug!("subfolder in project root");
+
+                    db.query_row(
+                        "SELECT ROWID FROM subdirs WHERE folder = ?1 AND path = ?2 LIMIT 1",
+                        (parent_ino.folder_id() as i64, name),
+                        |r| r.get::<_, i64>(0),
+                    )? as u16
+                } else {
+                    // subfolder is under another subfolder in project root
+                    tracing::debug!("subfolder in another subfolder in project root");
+
+                    db.query_row(
+                        "SELECT ROWID FROM subdirs WHERE folder = ?1 AND parent = ?2 AND path LIKE ?3 LIMIT 1",
+                        (parent_ino.folder_id() as i64, parent_ino.internal_folder_id() as i64, "%/".to_owned() + name),
+                        |r| r.get::<_, i64>(0),
+                    )? as u16
+                })
+                .with_rowid(0)
+                .build()
+                .0,
+        }))
     }
 
     fn file_info(&self, file_ino: Inode) -> anyhow::Result<FileInfo> {
@@ -161,28 +232,61 @@ impl Fs {
     ) -> anyhow::Result<FolderContents> {
         let db = self.db_pool.get()?;
 
-        // get root files first. if directory, list as directory
-        let mut stmt =
-            db.prepare("SELECT ROWID, name FROM filenames WHERE folder = ?1 AND subdir = ?2")?;
-        let mut entries = stmt.query((
-            folder_id,
-            if internal_folder_id == 0 {
-                None
-            } else {
-                Some(internal_folder_id)
-            },
-        ))?;
-
         let mut contents = FolderContents {
             info: FolderInfo {
                 name: (folder_id as u64).to_string(),
                 ino: {
                     let mut i = Inode(0);
                     i.set_folder_id(folder_id as u16);
+                    i.set_internal_folder_id(internal_folder_id as u16);
                     i.into()
                 },
             },
             items: vec![],
+        };
+
+        // find all subdirectories of current folder and add them first
+        let mut stmt = db.prepare(if internal_folder_id == 0 {
+            "SELECT ROWID, path FROM subdirs WHERE folder = ?1 AND parent IS NULL"
+        } else {
+            "SELECT ROWID, LTRIM(path, (SELECT path FROM subdirs WHERE ROWID = ?2)) FROM subdirs WHERE folder = ?1 AND parent = ?2"
+        })?;
+
+        let mut entries = if internal_folder_id == 0 {
+            stmt.query([folder_id])?
+        } else {
+            stmt.query([folder_id, internal_folder_id])?
+        };
+
+        while let Ok(Some(row)) = entries.next() {
+            contents.items.push(FolderItem::Directory(FolderInfo {
+                // first layer folders do not need string stripping
+                name: if internal_folder_id == 0 {
+                    row.get::<_, String>(1)?
+                } else {
+                    let raw = row.get::<_, String>(1)?;
+                    String::from(&raw[1..])
+                },
+                ino: InodeBuilder::new()
+                    .with_folder_id(folder_id as u16)
+                    .with_internal_folder_id(row.get::<_, i64>(0)? as u16)
+                    .with_rowid(0)
+                    .build()
+                    .0,
+            }))
+        }
+
+        // get root files first. if directory, list as directory
+        let mut stmt = db.prepare(if internal_folder_id == 0 {
+            "SELECT ROWID, name FROM filenames WHERE folder = ?1 AND subdir IS NULL"
+        } else {
+            "SELECT ROWID, name FROM filenames WHERE folder = ?1 AND subdir = ?2"
+        })?;
+
+        let mut entries = if internal_folder_id == 0 {
+            stmt.query([folder_id])?
+        } else {
+            stmt.query([folder_id, internal_folder_id])?
         };
 
         while let Ok(Some(entry)) = entries.next() {
@@ -206,7 +310,7 @@ impl Fs {
 
             ino.set_rowid(rowid as u32);
 
-            match dbg!(self.file_info(ino)) {
+            match self.file_info(ino) {
                 Ok(fi) => {
                     contents.items.push(FolderItem::File(fi));
                 }
@@ -235,7 +339,7 @@ impl Fs {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind,
-            perm: 0o755,
+            perm: 0o666,
             nlink,
             uid: req.uid(),
             gid: req.gid(),
@@ -254,7 +358,7 @@ impl fuser::Filesystem for Fs {
         _fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
-        let folder_exists = match self.dir_exists(ino.into()) {
+        let folder_exists = match self.is_dir(ino.into()) {
             Ok(e) => e,
             Err(_) => {
                 reply.error(fuser::Errno::ENOENT);
@@ -264,7 +368,7 @@ impl fuser::Filesystem for Fs {
 
         // if directory/root
         if ino == fuser::INodeNo::ROOT || folder_exists {
-            let attr = Self::mk_fileattr(req, ino, 0, 0, fuser::FileType::Directory, 2, 512);
+            let attr = Self::mk_fileattr(req, ino, 0, 0, fuser::FileType::Directory, 0, 512);
 
             reply.attr(&Duration::from_secs(1), &attr);
         } else {
@@ -282,7 +386,7 @@ impl fuser::Filesystem for Fs {
                 file_info.size as u64,
                 file_info.num_blocks as u64,
                 fuser::FileType::RegularFile,
-                2,
+                0,
                 512,
             );
 
@@ -306,7 +410,7 @@ impl fuser::Filesystem for Fs {
             return;
         }
 
-        match self.dir_exists(ino.into()) {
+        match self.is_dir(ino.into()) {
             Ok(e) if !e => {
                 tracing::error!("opendir: {} does not exist", ino);
                 reply.error(fuser::Errno::ENOTDIR);
@@ -323,7 +427,8 @@ impl fuser::Filesystem for Fs {
 
         reply.opened(
             fuser::FileHandle(self.get_handle()),
-            fuser::FopenFlags::all() & !fuser::FopenFlags::FOPEN_PASSTHROUGH,
+            fuser::FopenFlags::all()
+                & !(fuser::FopenFlags::FOPEN_PASSTHROUGH | fuser::FopenFlags::FOPEN_CACHE_DIR),
         );
     }
 
@@ -334,8 +439,6 @@ impl fuser::Filesystem for Fs {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        tracing::debug!("lookup {} (parent: {})", name.to_string_lossy(), parent);
-
         if let Err(e) = (|| {
             let name = name
                 .to_str()
@@ -343,7 +446,7 @@ impl fuser::Filesystem for Fs {
                 .to_string();
 
             if parent == fuser::INodeNo::ROOT {
-                // lookup hsycnfs (parent: 1)
+                // lookup self (parent: 1)
                 if name == FS_NAME {
                     let attr = Self::mk_fileattr(
                         req,
@@ -351,7 +454,7 @@ impl fuser::Filesystem for Fs {
                         0,
                         0,
                         fuser::FileType::Directory,
-                        2,
+                        0,
                         512,
                     );
 
@@ -369,9 +472,9 @@ impl fuser::Filesystem for Fs {
                     };
 
                     let mut i = Inode(0);
-                    i.set_folder_id(dbg!(folder_num) as u16);
+                    i.set_folder_id(folder_num as u16);
 
-                    match self.dir_exists(i) {
+                    match self.is_dir(i) {
                         Ok(e) if e => {
                             let attr = Self::mk_fileattr(
                                 req,
@@ -379,7 +482,7 @@ impl fuser::Filesystem for Fs {
                                 0,
                                 0,
                                 fuser::FileType::Directory,
-                                2,
+                                0,
                                 512,
                             );
 
@@ -389,6 +492,49 @@ impl fuser::Filesystem for Fs {
                         _ => {
                             reply.error(fuser::Errno::ENOENT);
                             anyhow::bail!("directory does not exist");
+                        }
+                    }
+                }
+            } else {
+                // item is in a subfolder
+                let parent_ino: Inode = parent.into();
+
+                if self.is_dir(parent_ino)? {
+                    match self.entry_info(parent_ino, &name)? {
+                        FolderItem::Directory(dir) => {
+                            let attr = Self::mk_fileattr(
+                                req,
+                                fuser::INodeNo(dir.ino),
+                                0,
+                                0,
+                                fuser::FileType::Directory,
+                                0,
+                                512,
+                            );
+
+                            tracing::debug!(
+                                "lookup: {} is a folder (ino: {:#x})",
+                                dir.name,
+                                dir.ino
+                            );
+
+                            reply.entry(&Duration::from_secs(1), &attr, fuser::Generation(0));
+                        }
+
+                        FolderItem::File(file) => {
+                            let attr = Self::mk_fileattr(
+                                req,
+                                fuser::INodeNo(file.ino),
+                                file.size as u64,
+                                file.num_blocks as u64,
+                                fuser::FileType::RegularFile,
+                                0,
+                                512,
+                            );
+
+                            tracing::debug!("lookup: {} is a file", name);
+
+                            reply.entry(&Duration::from_secs(1), &attr, fuser::Generation(0));
                         }
                     }
                 }
@@ -412,7 +558,7 @@ impl fuser::Filesystem for Fs {
         if ino == fuser::INodeNo::ROOT {
             match self.list_root_folders() {
                 Ok(folders) => {
-                    for (index, folder) in folders.iter().skip(offset as usize).enumerate() {
+                    for (index, folder) in folders.iter().enumerate() {
                         let res = reply.add(
                             fuser::INodeNo(folder.ino),
                             offset + index as u64 + 1,
@@ -443,43 +589,56 @@ impl fuser::Filesystem for Fs {
         } else {
             // not a root dir, let's read folder id
             let ino: Inode = ino.into();
-            match self.dir_exists(ino) {
-                Ok(e) if e => match dbg!(self.list_folder_contents(
-                    ino.folder_id() as i64,
-                    dbg!(ino.internal_folder_id()) as i64
-                )) {
-                    Ok(contents) => {
-                        for (index, item) in contents.items.iter().skip(offset as usize).enumerate()
-                        {
-                            match item {
-                                FolderItem::File(file) => {
-                                    if reply.add(
-                                        fuser::INodeNo(file.ino),
-                                        offset + index as u64 + 1,
-                                        fuser::FileType::RegularFile,
-                                        &file.name,
-                                    ) {
-                                        tracing::debug!("FULL!!! FUL!!!");
-                                        break;
-                                    }
-                                }
 
-                                _ => {}
+            if let Err(e) = (move || {
+                if self.is_dir(ino)? {
+                    for (index, entry) in self
+                        .list_folder_contents(
+                            ino.folder_id() as i64,
+                            ino.internal_folder_id() as i64,
+                        )?
+                        .items
+                        .iter()
+                        .skip(offset as usize)
+                        .enumerate()
+                    {
+                        match entry {
+                            FolderItem::Directory(dir) => {
+                                if reply.add(
+                                    fuser::INodeNo(dir.ino),
+                                    offset + index as u64 + 1,
+                                    fuser::FileType::Directory,
+                                    &dir.name,
+                                ) {
+                                    break;
+                                }
+                            }
+
+                            FolderItem::File(file) => {
+                                if reply.add(
+                                    fuser::INodeNo(file.ino),
+                                    offset + index as u64 + 1,
+                                    fuser::FileType::RegularFile,
+                                    &file
+                                        .name
+                                        .rsplit_once("/")
+                                        .map_or_else(|| file.name.clone(), |p| String::from(p.1)),
+                                ) {
+                                    break;
+                                }
                             }
                         }
-
-                        reply.ok();
                     }
 
-                    _ => {
-                        reply.error(fuser::Errno::ENOENT);
-                        return;
-                    }
-                },
-
-                _ => {
+                    reply.ok();
+                } else {
+                    // readdir should only read directories
                     reply.error(fuser::Errno::ENOENT);
                 }
+
+                anyhow::Ok(())
+            })() {
+                tracing::error!("readdir: {}", e.to_string());
             }
         }
     }

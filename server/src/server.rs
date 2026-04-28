@@ -1001,7 +1001,7 @@ impl Server {
                         (folder_id, subfolder, parent_rowid),
                     )?;
 
-                    return Ok(parent_rowid);
+                    return Ok(db.last_insert_rowid());
                 }
 
                 Err(e) => anyhow::bail!(e),
@@ -1014,7 +1014,13 @@ impl Server {
                 (folder_id, subfolder),
             )?;
 
-            Ok(db.last_insert_rowid())
+            let rowid = db.query_row(
+                "SELECT ROWID FROM subdirs WHERE folder = ?1 AND path = ?2 LIMIT 1",
+                (folder_id, subfolder),
+                |r| r.get::<_, i64>(0),
+            )?;
+
+            Ok(rowid)
         }
     }
 
@@ -1035,11 +1041,20 @@ impl Server {
         #[cfg(feature = "hsyncfs")]
         {
             if let Some(subfolder) = name_string.rsplit_once("/").map(|f| f.0) {
-                let insert_rowid = Self::cache_subdir(&db, folder_id, subfolder)?;
+                let insert_rowid = db
+                    .query_one(
+                        "SELECT ROWID FROM subdirs WHERE folder = ?1 AND path = ?2",
+                        (folder_id, subfolder),
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .or_else(|_| Self::cache_subdir(&db, folder_id, subfolder))?;
+
                 db.execute(
                     "UPDATE filenames SET subdir = ?1 WHERE folder = ?2 AND namehash = ?3",
                     [insert_rowid, folder_id, namehash],
                 )?;
+
+                tracing::debug!("file {} is in subdir rowid {}", name_string, insert_rowid);
             }
         }
 
