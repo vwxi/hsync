@@ -382,7 +382,7 @@ impl Fs {
              (SELECT start FROM blocks WHERE folder = ?1 AND name = ?2
               AND start BETWEEN 0 AND ?3 AND end BETWEEN ?3 AND ?4 LIMIT 1),
              (SELECT end FROM blocks WHERE folder = ?1 AND name = ?2
-              AND start BETWEEN ?3 AND ?4 AND end BETWEEN ?5 AND ?4 LIMIT 1)
+              AND start BETWEEN 0 AND ?4 AND end BETWEEN ?5 AND ?4 LIMIT 1)
              LIMIT 1",
             [folder_id, namehash, start as i64, max_end, end as i64],
             |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),

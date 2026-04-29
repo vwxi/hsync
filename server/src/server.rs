@@ -34,7 +34,7 @@ const REFRESH_INTERVAL: u64 = 5;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
-const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT, UNIQUE(code))";
+const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, password TEXT)";
 
 #[cfg(feature = "hsyncfs")]
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE, subdir INTEGER)";
@@ -618,22 +618,23 @@ impl Server {
                         let final_hash = hasher.finalize();
                         let digest = base16ct::lower::encode_string(&final_hash);
 
+                        // in debug mode this will hang if there are more than two folders
+                        // because every folder code is "code"
                         let (folder_code, folder_id) = loop {
                             let folder_code = Self::generate_folder_code();
 
-                            let mut stmt = db.prepare(
-                                "
-                                INSERT INTO folders (code, password)
-                                VALUES (?1, ?2)
-                                RETURNING code, id
-                                ",
-                            )?;
-
-                            if let Ok((code, id)) = stmt.query_row([&folder_code, &digest], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                            }) {
+                            if db
+                                .execute(
+                                    "INSERT INTO folders (code, password) VALUES (?1, ?2)",
+                                    [&folder_code, &digest],
+                                )
+                                .is_ok()
+                            {
                                 tracing::debug!("created new room {}", folder_code);
-                                break Ok::<(String, i64), anyhow::Error>((code, id));
+                                break Ok::<(String, i64), anyhow::Error>((
+                                    folder_code,
+                                    db.last_insert_rowid(),
+                                ));
                             }
                         }?;
 
@@ -650,6 +651,8 @@ impl Server {
                         let mut stmt =
                             db.prepare("SELECT name FROM filenames WHERE folder = ?1")?;
 
+                        tracing::debug!("gg3");
+
                         let files: Vec<protocol::room_info::File> = stmt
                             .query_map([folder_id], |row| {
                                 let name = row.get::<_, String>(0)?;
@@ -658,6 +661,8 @@ impl Server {
                             })?
                             .filter_map(|r| r.ok())
                             .collect();
+
+                        tracing::debug!("gg4");
 
                         protocol::packet::Message::RoomInfo(protocol::RoomInfo {
                             id: folder_id as u64,
