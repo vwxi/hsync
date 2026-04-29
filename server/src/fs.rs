@@ -10,6 +10,7 @@
 /// when listing out folder contents, process folder
 use std::{
     collections::{HashMap, HashSet},
+    io::{Read, Seek, SeekFrom},
     num::NonZeroUsize,
     path::PathBuf,
     sync::atomic::AtomicU64,
@@ -348,6 +349,99 @@ impl Fs {
             flags: 0,
         }
     }
+
+    fn read_range(
+        &self,
+        folder_id: i64,
+        fn_rowid: i64,
+        start: u64,
+        mut end: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let db = self.db_pool.get()?;
+
+        let namehash = db.query_row(
+            "SELECT namehash FROM filenames WHERE folder = ?1 AND ROWID = ?2",
+            [folder_id, fn_rowid],
+            |r| r.get::<_, i64>(0),
+        )?;
+
+        let max_end = db.query_row(
+            "SELECT MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
+            [folder_id, namehash],
+            |r| r.get::<_, i64>(0),
+        )?;
+
+        if end as i64 >= max_end {
+            end = max_end as u64;
+        }
+
+        let mut data = vec![0u8; (end - start) as usize];
+
+        let (real_start, real_end) = db.query_row(
+            "SELECT start, end FROM
+             (SELECT start FROM blocks WHERE folder = ?1 AND name = ?2
+              AND start BETWEEN 0 AND ?3 AND end BETWEEN ?3 AND ?4 LIMIT 1),
+             (SELECT end FROM blocks WHERE folder = ?1 AND name = ?2
+              AND start BETWEEN ?3 AND ?4 AND end BETWEEN ?5 AND ?4 LIMIT 1)
+             LIMIT 1",
+            [folder_id, namehash, start as i64, max_end, end as i64],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?;
+
+        let mut stmt = db.prepare(
+            "SELECT ROWID, start, end FROM blocks
+             WHERE folder = ?1 AND name = ?2
+             AND start >= ?3 AND end <= ?4",
+        )?;
+
+        let mut blocks = stmt.query([folder_id, namehash, real_start as i64, real_end as i64])?;
+
+        let mut ctr = 0usize;
+
+        while let Ok(Some(r)) = blocks.next() {
+            let (rowid, mut b_start, mut b_end) = (
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+            );
+
+            tracing::debug!("PRE b_start {} b_end {}", b_start, b_end);
+
+            let mut blob = db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, true)?;
+
+            if b_start >= end {
+                blob.close()?;
+                return Ok(data);
+            }
+
+            if start > b_start {
+                blob.seek(SeekFrom::Start(start - b_start))?;
+                b_start = start;
+            }
+
+            if b_end > end {
+                b_end = end;
+            }
+
+            tracing::debug!("b_start {} b_end {}", b_start, b_end);
+
+            let range = (b_end - b_start) as usize;
+
+            let read = blob.read(&mut data[ctr..(ctr + range)])?;
+
+            tracing::debug!("range {}", range);
+
+            if read != range {
+                anyhow::bail!("could not fill range");
+            }
+
+            ctr += range;
+
+            blob.close()?;
+        }
+
+        Ok(data)
+    }
 }
 
 impl fuser::Filesystem for Fs {
@@ -550,7 +644,7 @@ impl fuser::Filesystem for Fs {
         &self,
         _req: &fuser::Request,
         ino: fuser::INodeNo,
-        fh: fuser::FileHandle,
+        _fh: fuser::FileHandle,
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
@@ -558,19 +652,12 @@ impl fuser::Filesystem for Fs {
         if ino == fuser::INodeNo::ROOT {
             match self.list_root_folders() {
                 Ok(folders) => {
-                    for (index, folder) in folders.iter().enumerate() {
+                    for (index, folder) in folders.iter().skip(offset as usize).enumerate() {
                         let res = reply.add(
                             fuser::INodeNo(folder.ino),
                             offset + index as u64 + 1,
                             fuser::FileType::Directory,
                             &folder.name,
-                        );
-
-                        tracing::debug!(
-                            "\tfolder ino {} name {}: {}",
-                            folder.ino,
-                            folder.name,
-                            res
                         );
 
                         if res {
@@ -639,6 +726,45 @@ impl fuser::Filesystem for Fs {
                 anyhow::Ok(())
             })() {
                 tracing::error!("readdir: {}", e.to_string());
+            }
+        }
+    }
+
+    fn open(
+        &self,
+        _req: &fuser::Request,
+        ino: fuser::INodeNo,
+        _flags: fuser::OpenFlags,
+        reply: fuser::ReplyOpen,
+    ) {
+        reply.opened(fuser::FileHandle(0), fuser::FopenFlags::FOPEN_DIRECT_IO);
+    }
+
+    fn read(
+        &self,
+        _req: &fuser::Request,
+        ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyData,
+    ) {
+        let ino: Inode = ino.into();
+
+        match self.read_range(
+            ino.folder_id() as i64,
+            ino.rowid() as i64,
+            offset,
+            offset + size as u64,
+        ) {
+            Ok(data) => {
+                reply.data(&data);
+            }
+            Err(e) => {
+                tracing::error!("read: {}", e.to_string());
+                reply.data(&vec![]);
             }
         }
     }
