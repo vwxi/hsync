@@ -405,8 +405,6 @@ impl Fs {
                 r.get::<_, i64>(2)? as u64,
             );
 
-            tracing::debug!("PRE b_start {} b_end {}", b_start, b_end);
-
             let mut blob = db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", rowid, true)?;
 
             if b_start >= end {
@@ -423,13 +421,9 @@ impl Fs {
                 b_end = end;
             }
 
-            tracing::debug!("b_start {} b_end {}", b_start, b_end);
-
             let range = (b_end - b_start) as usize;
 
             let read = blob.read(&mut data[ctr..(ctr + range)])?;
-
-            tracing::debug!("range {}", range);
 
             if read != range {
                 anyhow::bail!("could not fill range");
