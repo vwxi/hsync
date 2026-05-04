@@ -10,15 +10,17 @@
 /// when listing out folder contents, process folder
 use std::{
     collections::{HashMap, HashSet},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::atomic::AtomicU64,
+    sync::{atomic::AtomicU64, mpsc},
     time::{Duration, UNIX_EPOCH},
 };
 
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
+
+use crate::server::{FsEvent, protocol};
 
 const FS_NAME: &str = "hsyncfs";
 const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
@@ -62,6 +64,7 @@ impl From<Inode> for fuser::INodeNo {
 pub struct Fs {
     pub db_pool: Pool<SqliteConnectionManager>,
     counter: AtomicU64,
+    send: mpsc::Sender<FsEvent>,
 }
 
 #[derive(Debug)]
@@ -350,6 +353,26 @@ impl Fs {
         }
     }
 
+    fn real_range(
+        db: &PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        namehash: i64,
+        start: u64,
+        end: u64,
+        max_end: i64,
+    ) -> anyhow::Result<(u64, u64)> {
+        Ok(db.query_row(
+            "SELECT start, end FROM
+             (SELECT start FROM blocks WHERE folder = ?1 AND name = ?2
+              AND start BETWEEN 0 AND ?3 AND end BETWEEN ?3 AND ?4 LIMIT 1),
+             (SELECT end FROM blocks WHERE folder = ?1 AND name = ?2
+              AND start BETWEEN 0 AND ?4 AND end BETWEEN ?5 AND ?4 LIMIT 1)
+             LIMIT 1",
+            [folder_id, namehash, start as i64, max_end, end as i64],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?)
+    }
+
     fn read_range(
         &self,
         folder_id: i64,
@@ -377,16 +400,8 @@ impl Fs {
 
         let mut data = vec![0u8; (end - start) as usize];
 
-        let (real_start, real_end) = db.query_row(
-            "SELECT start, end FROM
-             (SELECT start FROM blocks WHERE folder = ?1 AND name = ?2
-              AND start BETWEEN 0 AND ?3 AND end BETWEEN ?3 AND ?4 LIMIT 1),
-             (SELECT end FROM blocks WHERE folder = ?1 AND name = ?2
-              AND start BETWEEN 0 AND ?4 AND end BETWEEN ?5 AND ?4 LIMIT 1)
-             LIMIT 1",
-            [folder_id, namehash, start as i64, max_end, end as i64],
-            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-        )?;
+        let (real_start, real_end) =
+            Self::real_range(&db, folder_id, namehash, start, end, max_end)?;
 
         let mut stmt = db.prepare(
             "SELECT ROWID, start, end FROM blocks
@@ -435,6 +450,72 @@ impl Fs {
         }
 
         Ok(data)
+    }
+
+    // journal the new data and signal the main logic to
+    // transmit a delta
+    fn write_range(
+        &self,
+        folder_id: i64,
+        fn_rowid: i64,
+        start: u64,
+        data: &[u8],
+    ) -> anyhow::Result<u32> {
+        let cookie = rand::random::<i64>();
+
+        let db = self.db_pool.get()?;
+
+        let end = start + data.len() as u64;
+
+        let namehash = db.query_row(
+            "SELECT namehash FROM filenames WHERE folder = ?1 AND ROWID = ?2",
+            [folder_id, fn_rowid],
+            |r| r.get::<_, i64>(0),
+        )?;
+
+        let (max_start, max_end) = db.query_row(
+            "SELECT MAX(start), MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
+            [folder_id, namehash],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+
+        tracing::debug!("writing [{}, {}]", start, end);
+
+        // block is completely outside of file
+        if start >= max_end as u64 {
+            // create new block
+            tracing::debug!("\tblock is completely outside");
+
+            let hash = xxhash_rust::xxh3::xxh3_64(&data);
+
+            db.execute(
+                "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    folder_id,
+                    namehash,
+                    start as i64,
+                    end as i64,
+                    hash as i64,
+                    cookie,
+                    protocol::delta::OpType::Insert as i64,
+                    rusqlite::blob::ZeroBlob((end - start) as i32),
+                )
+            )?;
+
+            let rowid = db.last_insert_rowid();
+
+            // write data now
+            let mut blob = db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
+            blob.write_all(&data)?;
+            blob.close()?;
+
+            // notify main thread
+            self.send.send(FsEvent { folder_id, namehash, cookie })?;
+
+            return Ok(data.len() as u32);
+        }
+
+        Ok(data.len() as u32)
     }
 }
 
@@ -762,14 +843,44 @@ impl fuser::Filesystem for Fs {
             }
         }
     }
+
+    fn write(
+        &self,
+        _req: &fuser::Request,
+        ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let ino: Inode = ino.into();
+
+        match self.write_range(ino.folder_id() as i64, ino.rowid() as i64, offset, data) {
+            Ok(written) => {
+                reply.written(written);
+            }
+
+            Err(e) => {
+                tracing::error!("write: {}", e.to_string());
+                reply.written(0);
+            }
+        }
+    }
 }
 
-pub async fn hsyncfs_create(rootpath: PathBuf, db_pool: Pool<SqliteConnectionManager>) {
+pub async fn hsyncfs_create(
+    rootpath: PathBuf,
+    db_pool: Pool<SqliteConnectionManager>,
+    send: mpsc::Sender<FsEvent>,
+) {
     let path = rootpath.join(std::path::PathBuf::from(format!("{}/", FS_NAME)));
 
     let mut options = fuser::Config::default();
     options.mount_options = vec![
-        fuser::MountOption::RO,
+        fuser::MountOption::RW,
         fuser::MountOption::FSName(FS_NAME.to_string()),
     ];
     options.acl = fuser::SessionACL::Owner;
@@ -780,6 +891,7 @@ pub async fn hsyncfs_create(rootpath: PathBuf, db_pool: Pool<SqliteConnectionMan
     let fs = Fs {
         db_pool,
         counter: AtomicU64::new(0),
+        send,
     };
 
     if !path.exists() {

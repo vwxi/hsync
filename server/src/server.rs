@@ -1,3 +1,5 @@
+#[cfg(feature = "hsyncfs")]
+use std::sync::{Weak, mpsc};
 use std::{
     collections::{HashMap, HashSet},
     io::{Read, Seek, Write},
@@ -76,19 +78,29 @@ struct LockState {
     pub cookie: u64,
 }
 
+#[cfg(feature = "hsyncfs")]
+#[derive(Debug)]
+pub(crate) struct FsEvent {
+    pub folder_id: i64,
+    pub namehash: i64,
+    pub cookie: i64,
+}
+
 pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
     #[cfg(feature = "hsyncfs")]
     fs_handle: tokio::task::JoinHandle<()>,
+    #[cfg(feature = "hsyncfs")]
+    fs_recv_handle: tokio::task::JoinHandle<()>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
     locks: Mutex<HashMap<(i64, i64), LockState>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
 }
 
 impl Server {
-    pub fn new(config: Config) -> anyhow::Result<Server> {
+    pub fn new(config: Config) -> anyhow::Result<Arc<Server>> {
         // INIT QUIC ENDPOINT
 
         // if no path is provided, generate a selfsigned key-cert pair to use
@@ -189,26 +201,44 @@ impl Server {
             .map(|p| p.into())
             .unwrap_or(std::env::current_dir()?);
 
+        // create fs update channel
+
         #[cfg(feature = "hsyncfs")]
-        return Ok(Server {
-            config,
-            endpoint,
-            db_pool: pool.clone(),
-            fs_handle: tokio::spawn(crate::fs::hsyncfs_create(rootpath, pool)),
-            streams: RwLock::new(HashMap::new()),
-            locks: Mutex::new(HashMap::new()),
-            outgoing_transfer_requests: Mutex::new(HashMap::new()),
-        });
+        {
+            use std::sync::mpsc;
+
+            let (send, recv) = mpsc::channel::<FsEvent>();
+
+            return Ok(Arc::new_cyclic(|gadget| Server {
+                config,
+                endpoint,
+                db_pool: pool.clone(),
+                fs_handle: tokio::spawn(crate::fs::hsyncfs_create(rootpath, pool, send)),
+                fs_recv_handle: tokio::spawn(Self::hsyncfs_listen_changes(gadget.clone(), recv)),
+                streams: RwLock::new(HashMap::new()),
+                locks: Mutex::new(HashMap::new()),
+                outgoing_transfer_requests: Mutex::new(HashMap::new()),
+            }));
+        }
 
         #[cfg(not(feature = "hsyncfs"))]
-        return Ok(Server {
+        return Ok(Arc::new(Server {
             config,
             endpoint,
             db_pool: pool.clone(),
             streams: RwLock::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
-        });
+        }));
+    }
+
+    #[cfg(feature = "hsyncfs")]
+    async fn hsyncfs_listen_changes(gadget: Weak<Server>, recv: mpsc::Receiver<FsEvent>) {
+        let server = gadget.upgrade().expect("weak reference error");
+
+        while let Ok(event) = recv.recv() {
+            tracing::debug!("change from hsyncfs: {:?}", event);
+        }
     }
 
     fn timestamp() -> anyhow::Result<u64> {
@@ -1411,6 +1441,52 @@ impl Server {
         Ok(delta)
     }
 
+    // apply and broadcast delta
+    async fn consume_delta(
+        self: &Arc<Self>,
+        db: PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        namehash: i64,
+        cookie: i64,
+        origin: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let streams_lock = self.streams.read().await;
+
+        let delta = self.apply_journaled_delta(db, folder_id, namehash, cookie)?;
+
+        let _ = streams_lock
+            .iter()
+            .map(|s| {
+                if *s.0 == origin {
+                    // tell peer to send queued manifest again if necessary
+                    s.1.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::SendAgain(protocol::SendAgain {
+                            namehash: namehash as u64,
+                        })),
+                    }))?;
+
+                    tracing::debug!("send {} to send {} again", s.0, namehash);
+
+                    return Ok(());
+                }
+
+                if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Delta(delta.clone())),
+                })) {
+                    tracing::error!("delta broadcast error: {}", e.to_string());
+                }
+
+                tracing::debug!("sent delta to {}", *s.0);
+
+                Ok(())
+            })
+            .collect::<anyhow::Result<()>>();
+
+        Ok(())
+    }
+
     async fn handle_transfer(
         self: Arc<Self>,
         addr: SocketAddr,
@@ -1526,48 +1602,21 @@ impl Server {
                         return Ok(());
                     }
 
-                    let delta = self.apply_journaled_delta(
-                        db,
-                        folder_id,
-                        namehash as i64,
-                        metadata.cookie() as i64,
-                    )?;
-
                     drop(outgoing_lock);
+                    drop(streams_lock);
 
                     tracing::info!(
                         "transfer queue satisfied for file {namehash}. broadcasting delta"
                     );
 
-                    let _ = streams_lock
-                        .iter()
-                        .map(|s| {
-                            if *s.0 == who {
-                                // tell peer to send queued manifest again if necessary
-                                s.1.send(Ch::OutPacket(protocol::Packet {
-                                    code: protocol::Return::NoneUnspecified as i32,
-                                    message: Some(protocol::packet::Message::SendAgain(
-                                        protocol::SendAgain { namehash },
-                                    )),
-                                }))?;
-
-                                tracing::debug!("send {} to send {} again", s.0, namehash);
-
-                                return Ok(());
-                            }
-
-                            if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
-                                code: protocol::Return::NoneUnspecified as i32,
-                                message: Some(protocol::packet::Message::Delta(delta.clone())),
-                            })) {
-                                tracing::error!("delta broadcast error: {}", e.to_string());
-                            }
-
-                            tracing::debug!("sent delta to {}", addr);
-
-                            Ok(())
-                        })
-                        .collect::<anyhow::Result<()>>();
+                    self.consume_delta(
+                        db,
+                        folder_id,
+                        namehash as i64,
+                        metadata.cookie() as i64,
+                        who,
+                    )
+                    .await?;
                 }
             }
         } else {

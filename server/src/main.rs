@@ -47,7 +47,7 @@ fn main() {
 
 #[tokio::main]
 async fn run(config: Config) -> anyhow::Result<()> {
-    let server = Arc::new(Server::new(config)?);
+    let server = Server::new(config)?;
     let span = info_span!("run thread");
 
     let span2 = span.clone();
