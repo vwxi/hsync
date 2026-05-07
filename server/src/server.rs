@@ -205,9 +205,7 @@ impl Server {
 
         #[cfg(feature = "hsyncfs")]
         {
-            use std::sync::mpsc;
-
-            let (send, recv) = mpsc::channel::<FsEvent>();
+            let (send, recv) = tokio::sync::mpsc::channel::<FsEvent>(EV_BUF_SIZE);
 
             return Ok(Arc::new_cyclic(|gadget| Server {
                 config,
@@ -233,11 +231,16 @@ impl Server {
     }
 
     #[cfg(feature = "hsyncfs")]
-    async fn hsyncfs_listen_changes(gadget: Weak<Server>, recv: mpsc::Receiver<FsEvent>) {
+    async fn hsyncfs_listen_changes(gadget: Weak<Server>, recv: tokio::sync::mpsc::Receiver<FsEvent>) {
         let server = gadget.upgrade().expect("weak reference error");
+        let mut events: Vec<FsEvent> = vec![];
 
-        while let Ok(event) = recv.recv() {
-            tracing::debug!("change from hsyncfs: {:?}", event);
+        // TODO: events should coalesce cookies if possible
+        loop {
+            let size = recv.recv_many(&mut events, EV_BUF_SIZE).await;
+            use std::net::{Ipv4Addr, SocketAddrV4};
+
+            tracing::debug!("events: {:?}", events[..size]);
         }
     }
 

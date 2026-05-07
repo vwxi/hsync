@@ -13,10 +13,11 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{atomic::AtomicU64, mpsc},
+    sync::{atomic::AtomicU64},
     time::{Duration, UNIX_EPOCH},
 };
 
+use tokio::sync::mpsc;
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 
@@ -368,7 +369,7 @@ impl Fs {
              (SELECT end FROM blocks WHERE folder = ?1 AND name = ?2
               AND start BETWEEN 0 AND ?4 AND end BETWEEN ?5 AND ?4 LIMIT 1)
              LIMIT 1",
-            [folder_id, namehash, start as i64, max_end, end as i64],
+            dbg!([folder_id, namehash, start as i64, max_end, end as i64]),
             |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
         )?)
     }
@@ -473,10 +474,10 @@ impl Fs {
             |r| r.get::<_, i64>(0),
         )?;
 
-        let (max_start, max_end) = db.query_row(
-            "SELECT MAX(start), MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
+        let max_end = db.query_row(
+            "SELECT MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
             [folder_id, namehash],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            |r| r.get::<_, i64>(0),
         )?;
 
         tracing::debug!("writing [{}, {}]", start, end);
@@ -508,12 +509,156 @@ impl Fs {
             let mut blob = db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
             blob.write_all(&data)?;
             blob.close()?;
+        } else {
+            // within file
+            let (real_start, real_end) = Self::real_range(
+                &db,
+                folder_id,
+                namehash,
+                start,
+                if end > max_end as u64 {
+                    max_end as u64
+                } else {
+                    end
+                },
+                max_end,
+            )?;
 
-            // notify main thread
-            self.send.send(FsEvent { folder_id, namehash, cookie })?;
+            let mut stmt = db.prepare(
+                "SELECT ROWID, start, end FROM blocks
+                 WHERE folder = ?1 AND name = ?2
+                 AND start >= ?3 AND end <= ?4",
+            )?;
 
-            return Ok(data.len() as u32);
+            let mut blocks =
+                stmt.query([folder_id, namehash, real_start as i64, real_end as i64])?;
+
+            let mut ctr = 0usize;
+
+            while let Ok(Some(row)) = blocks.next() {
+                let (b_rowid, mut b_start, mut b_end) = (
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                );
+
+                // don't bother copying a whole block if we don't do anything to it
+                tracing::debug!("ctr: {}, b_start: {}, b_end: {}", ctr, b_start, b_end);
+
+                if start >= b_end {
+                    tracing::debug!("skipping block");
+                    continue;
+                }
+
+                if b_start >= end {
+                    return Ok(ctr as u32);
+                }
+
+                // copy the block contents into the journal
+                // NOTE: this is terrible and i should maybe figure out something better
+                let mut old_blob =
+                    db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", b_rowid, true)?;
+
+                db.execute(
+                    "INSERT INTO journal (folder, name, start, end, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (
+                        folder_id,
+                        namehash,
+                        b_start as i64,
+                        b_end as i64,
+                        cookie,
+                        protocol::delta::OpType::Modify as i64,
+                        rusqlite::blob::ZeroBlob((b_end - b_start) as i32)
+                    )
+                )?;
+
+                let n_rowid = db.last_insert_rowid();
+
+                let mut new_blob =
+                    db.blob_open(rusqlite::MAIN_DB, "journal", "contents", n_rowid, false)?;
+
+                let mut buf = vec![0u8; old_blob.len()];
+                old_blob.read_exact(&mut buf)?;
+
+                tracing::debug!("wrote old block data to journal, {}", new_blob.write(&buf)?);
+
+                new_blob.seek(SeekFrom::Start(if start > b_start {
+                    let o = start - b_start;
+                    b_start = start;
+                    o
+                } else {
+                    0
+                }))?;
+
+                if b_end > end {
+                    b_end = end;
+                }
+
+                let range = (b_end - b_start) as usize;
+
+                tracing::debug!(
+                    "({}) writing part of journal block with new region [{}, {}], {}",
+                    new_blob.stream_position()?,
+                    ctr,
+                    ctr + range,
+                    new_blob.write(&data[ctr..(ctr + range)])?
+                );
+
+                // return to start, read whole buffer again for the hash
+                // TODO: really, figure out how to avoid this
+                new_blob.seek(SeekFrom::Start(0))?;
+                new_blob.read_exact(&mut buf)?;
+
+                new_blob.close()?;
+
+                db.execute(
+                    "UPDATE journal SET hash = ?1 WHERE ROWID = ?2",
+                    [xxhash_rust::xxh3::xxh3_64(&buf) as i64, n_rowid],
+                )?;
+
+                tracing::debug!("new ctr: {}", ctr + range);
+
+                ctr += range;
+            }
+
+            // if ctr < data.len(), we need to create new blocks
+            // NOTE: maybe consider clumping into last block if small enough
+            if ctr < data.len() {
+                // create new block
+                tracing::debug!("runoff of {}, new block", data.len() - ctr);
+
+                let hash = xxhash_rust::xxh3::xxh3_64(&data[ctr..]);
+
+                db.execute(
+                    "INSERT INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (
+                        folder_id,
+                        namehash,
+                        (start + ctr as u64) as i64,
+                        end as i64,
+                        hash as i64,
+                        cookie,
+                        protocol::delta::OpType::Insert as i64,
+                        rusqlite::blob::ZeroBlob((end - start) as i32),
+                    )
+                )?;
+
+                let rowid = db.last_insert_rowid();
+
+                // write data now
+                let mut blob =
+                    db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
+                blob.write_all(&data[ctr..])?;
+                blob.close()?;
+            }
         }
+
+        // notify main thread
+        self.send.send(FsEvent {
+            folder_id,
+            namehash,
+            cookie,
+        })?;
 
         Ok(data.len() as u32)
     }
