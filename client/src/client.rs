@@ -742,7 +742,6 @@ impl Client {
         )?;
 
         if let Ok(file) = std::fs::File::open(&path) {
-            // TODO: adapt this for subfolders when it gets implemented
             let mut blocks: Vec<(u64, u64, u64)> = vec![];
 
             // NOTE: files are addressed in the block store by hash(filename).

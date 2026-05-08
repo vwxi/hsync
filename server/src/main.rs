@@ -1,5 +1,3 @@
-#[cfg(feature = "hsyncfs")]
-mod fs;
 mod server;
 
 use clap::Parser;

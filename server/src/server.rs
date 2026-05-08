@@ -1,5 +1,3 @@
-#[cfg(feature = "hsyncfs")]
-use std::sync::{Weak, mpsc};
 use std::{
     collections::{HashMap, HashSet},
     io::{Read, Seek, Write},
@@ -37,17 +35,9 @@ const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, password TEXT)";
-
-#[cfg(feature = "hsyncfs")]
-const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE, subdir INTEGER)";
-#[cfg(not(feature = "hsyncfs"))]
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
-
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(folder, name, start, end, cookie))";
-#[cfg(feature = "hsyncfs")]
-const CREATE_SUBDIR_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS subdirs (folder INTEGER, path TEXT UNIQUE, parent INTEGER)";
 
 const EV_BUF_SIZE: usize = 32;
 
@@ -78,22 +68,10 @@ struct LockState {
     pub cookie: u64,
 }
 
-#[cfg(feature = "hsyncfs")]
-#[derive(Debug)]
-pub(crate) struct FsEvent {
-    pub folder_id: i64,
-    pub namehash: i64,
-    pub cookie: i64,
-}
-
 pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
-    #[cfg(feature = "hsyncfs")]
-    fs_handle: tokio::task::JoinHandle<()>,
-    #[cfg(feature = "hsyncfs")]
-    fs_recv_handle: tokio::task::JoinHandle<()>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
     locks: Mutex<HashMap<(i64, i64), LockState>>,
     outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
@@ -185,10 +163,6 @@ impl Server {
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
             conn.execute(CREATE_JOURNAL_STMT, ())?;
-            #[cfg(feature = "hsyncfs")]
-            {
-                conn.execute(CREATE_SUBDIR_STMT, ())?;
-            }
         }
 
         tracing::info!("initialized db");
@@ -202,24 +176,6 @@ impl Server {
             .unwrap_or(std::env::current_dir()?);
 
         // create fs update channel
-
-        #[cfg(feature = "hsyncfs")]
-        {
-            let (send, recv) = tokio::sync::mpsc::channel::<FsEvent>(EV_BUF_SIZE);
-
-            return Ok(Arc::new_cyclic(|gadget| Server {
-                config,
-                endpoint,
-                db_pool: pool.clone(),
-                fs_handle: tokio::spawn(crate::fs::hsyncfs_create(rootpath, pool, send)),
-                fs_recv_handle: tokio::spawn(Self::hsyncfs_listen_changes(gadget.clone(), recv)),
-                streams: RwLock::new(HashMap::new()),
-                locks: Mutex::new(HashMap::new()),
-                outgoing_transfer_requests: Mutex::new(HashMap::new()),
-            }));
-        }
-
-        #[cfg(not(feature = "hsyncfs"))]
         return Ok(Arc::new(Server {
             config,
             endpoint,
@@ -228,20 +184,6 @@ impl Server {
             locks: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
         }));
-    }
-
-    #[cfg(feature = "hsyncfs")]
-    async fn hsyncfs_listen_changes(gadget: Weak<Server>, recv: tokio::sync::mpsc::Receiver<FsEvent>) {
-        let server = gadget.upgrade().expect("weak reference error");
-        let mut events: Vec<FsEvent> = vec![];
-
-        // TODO: events should coalesce cookies if possible
-        loop {
-            let size = recv.recv_many(&mut events, EV_BUF_SIZE).await;
-            use std::net::{Ipv4Addr, SocketAddrV4};
-
-            tracing::debug!("events: {:?}", events[..size]);
-        }
     }
 
     fn timestamp() -> anyhow::Result<u64> {
@@ -684,8 +626,6 @@ impl Server {
                         let mut stmt =
                             db.prepare("SELECT name FROM filenames WHERE folder = ?1")?;
 
-                        tracing::debug!("gg3");
-
                         let files: Vec<protocol::room_info::File> = stmt
                             .query_map([folder_id], |row| {
                                 let name = row.get::<_, String>(0)?;
@@ -694,8 +634,6 @@ impl Server {
                             })?
                             .filter_map(|r| r.ok())
                             .collect();
-
-                        tracing::debug!("gg4");
 
                         protocol::packet::Message::RoomInfo(protocol::RoomInfo {
                             id: folder_id as u64,
@@ -995,73 +933,6 @@ impl Server {
         Ok(())
     }
 
-    // recursively cache upwards
-    #[cfg(feature = "hsyncfs")]
-    fn cache_subdir(
-        db: &PooledConnection<SqliteConnectionManager>,
-        folder_id: i64,
-        subfolder: &str,
-    ) -> anyhow::Result<i64> {
-        if let Some(parent) = subfolder.rsplit_once("/").map(|f| f.0) {
-            tracing::debug!("subfolder {} has string parent {}", subfolder, parent);
-
-            match db.query_row(
-                "SELECT ROWID FROM subdirs WHERE folder = ?1 AND path = ?2 LIMIT 1",
-                (folder_id, parent),
-                |r| r.get::<_, i64>(0),
-            ) {
-                Ok(parent_rowid) => {
-                    tracing::debug!(
-                        "subfolder {} has a db parent at rowid {}",
-                        subfolder,
-                        parent_rowid
-                    );
-
-                    db.execute(
-                        "INSERT OR IGNORE INTO subdirs (folder, path, parent) VALUES (?1, ?2, ?3)",
-                        (folder_id, subfolder, parent_rowid),
-                    )?;
-
-                    return Ok(parent_rowid);
-                }
-
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    tracing::debug!(
-                        "subfolder {} has no db parent for {}, moving up a dir",
-                        subfolder,
-                        parent,
-                    );
-
-                    let parent_rowid = Self::cache_subdir(db, folder_id, parent)?;
-
-                    db.execute(
-                        "INSERT OR IGNORE INTO subdirs (folder, path, parent) VALUES (?1, ?2, ?3)",
-                        (folder_id, subfolder, parent_rowid),
-                    )?;
-
-                    return Ok(db.last_insert_rowid());
-                }
-
-                Err(e) => anyhow::bail!(e),
-            };
-        } else {
-            tracing::debug!("subfolder {} is at project root", subfolder);
-
-            db.execute(
-                "INSERT OR IGNORE INTO subdirs (folder, path) VALUES (?1, ?2)",
-                (folder_id, subfolder),
-            )?;
-
-            let rowid = db.query_row(
-                "SELECT ROWID FROM subdirs WHERE folder = ?1 AND path = ?2 LIMIT 1",
-                (folder_id, subfolder),
-                |r| r.get::<_, i64>(0),
-            )?;
-
-            Ok(rowid)
-        }
-    }
-
     async fn create_file_entry(
         self: &Arc<Self>,
         folder_id: i64,
@@ -1074,27 +945,6 @@ impl Server {
             "INSERT OR REPLACE INTO filenames (folder, name, namehash) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE folder = ?1 AND name = ?2)",
             (folder_id, name_string, namehash),
         )?;
-
-        // add subfolder if exists
-        #[cfg(feature = "hsyncfs")]
-        {
-            if let Some(subfolder) = name_string.rsplit_once("/").map(|f| f.0) {
-                let insert_rowid = db
-                    .query_one(
-                        "SELECT ROWID FROM subdirs WHERE folder = ?1 AND path = ?2",
-                        (folder_id, subfolder),
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .or_else(|_| Self::cache_subdir(&db, folder_id, subfolder))?;
-
-                db.execute(
-                    "UPDATE filenames SET subdir = ?1 WHERE folder = ?2 AND namehash = ?3",
-                    [insert_rowid, folder_id, namehash],
-                )?;
-
-                tracing::debug!("file {} is in subdir rowid {}", name_string, insert_rowid);
-            }
-        }
 
         tracing::debug!("propagating create file {}", name_string);
 
@@ -1140,23 +990,6 @@ impl Server {
             (folder_id, namehash),
             |r| r.get::<_, String>(0),
         )?;
-
-        // remove subfolder if no other with that subfolder
-        #[cfg(feature = "hsyncfs")]
-        {
-            if let Some(subfolder) = filename.rsplit_once("/").map(|r| r.0) {
-                if let Err(rusqlite::Error::QueryReturnedNoRows) = db.query_one(
-                    "SELECT COUNT(*) FROM filenames WHERE folder = ?1 AND name LIKE '%?2%'",
-                    (),
-                    |r| r.get::<_, i64>(0),
-                ) {
-                    db.execute(
-                        "DELETE FROM subdirs WHERE folder = ?1 AND path = ?2",
-                        (folder_id, subfolder),
-                    )?;
-                }
-            }
-        }
 
         tracing::debug!(
             "deleted filename entry for namehash {} in folder {}",
