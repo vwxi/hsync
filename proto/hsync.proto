@@ -113,6 +113,8 @@ message TransferDone {
   uint64 namehash = 1;
 }
 
+message Whoami {}
+
 enum Return {
   RETURN_NONE_UNSPECIFIED = 0;
   RETURN_BLOCK_MISMATCH = 1;

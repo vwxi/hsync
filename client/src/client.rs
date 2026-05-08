@@ -207,8 +207,6 @@ impl Client {
         );
 
         // create notify stream
-        // TODO: for subfolders we need to abstract out this part into something
-        //       you can deploy for any number of folders
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
             Result<Vec<notify_debouncer_full::DebouncedEvent>, Vec<notify::Error>>,
         >();
@@ -744,7 +742,6 @@ impl Client {
         )?;
 
         if let Ok(file) = std::fs::File::open(&path) {
-            // TODO: adapt this for subfolders when it gets implemented
             let mut blocks: Vec<(u64, u64, u64)> = vec![];
 
             // NOTE: files are addressed in the block store by hash(filename).

@@ -34,10 +34,11 @@ const REFRESH_INTERVAL: u64 = 5;
 const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
-const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, password TEXT, UNIQUE(code))";
+const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, password TEXT)";
 const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
 const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(folder, name, start, end, cookie))";
+
 const EV_BUF_SIZE: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -77,7 +78,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(config: Config) -> anyhow::Result<Server> {
+    pub fn new(config: Config) -> anyhow::Result<Arc<Server>> {
         // INIT QUIC ENDPOINT
 
         // if no path is provided, generate a selfsigned key-cert pair to use
@@ -166,14 +167,23 @@ impl Server {
 
         tracing::info!("initialized db");
 
-        Ok(Server {
+        let rootpath = config
+            .db
+            .as_ref()
+            .map(|p| p.parent())
+            .flatten()
+            .map(|p| p.into())
+            .unwrap_or(std::env::current_dir()?);
+
+        // create fs update channel
+        return Ok(Arc::new(Server {
             config,
             endpoint,
-            db_pool: pool,
+            db_pool: pool.clone(),
             streams: RwLock::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             outgoing_transfer_requests: Mutex::new(HashMap::new()),
-        })
+        }));
     }
 
     fn timestamp() -> anyhow::Result<u64> {
@@ -583,22 +593,23 @@ impl Server {
                         let final_hash = hasher.finalize();
                         let digest = base16ct::lower::encode_string(&final_hash);
 
+                        // in debug mode this will hang if there are more than two folders
+                        // because every folder code is "code"
                         let (folder_code, folder_id) = loop {
                             let folder_code = Self::generate_folder_code();
 
-                            let mut stmt = db.prepare(
-                                "
-                                INSERT INTO folders (code, password)
-                                VALUES (?1, ?2)
-                                RETURNING code, id
-                                ",
-                            )?;
-
-                            if let Ok((code, id)) = stmt.query_row([&folder_code, &digest], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                            }) {
+                            if db
+                                .execute(
+                                    "INSERT INTO folders (code, password) VALUES (?1, ?2)",
+                                    [&folder_code, &digest],
+                                )
+                                .is_ok()
+                            {
                                 tracing::debug!("created new room {}", folder_code);
-                                break Ok::<(String, i64), anyhow::Error>((code, id));
+                                break Ok::<(String, i64), anyhow::Error>((
+                                    folder_code,
+                                    db.last_insert_rowid(),
+                                ));
                             }
                         }?;
 
@@ -1266,6 +1277,52 @@ impl Server {
         Ok(delta)
     }
 
+    // apply and broadcast delta
+    async fn consume_delta(
+        self: &Arc<Self>,
+        db: PooledConnection<SqliteConnectionManager>,
+        folder_id: i64,
+        namehash: i64,
+        cookie: i64,
+        origin: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let streams_lock = self.streams.read().await;
+
+        let delta = self.apply_journaled_delta(db, folder_id, namehash, cookie)?;
+
+        let _ = streams_lock
+            .iter()
+            .map(|s| {
+                if *s.0 == origin {
+                    // tell peer to send queued manifest again if necessary
+                    s.1.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::SendAgain(protocol::SendAgain {
+                            namehash: namehash as u64,
+                        })),
+                    }))?;
+
+                    tracing::debug!("send {} to send {} again", s.0, namehash);
+
+                    return Ok(());
+                }
+
+                if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Delta(delta.clone())),
+                })) {
+                    tracing::error!("delta broadcast error: {}", e.to_string());
+                }
+
+                tracing::debug!("sent delta to {}", *s.0);
+
+                Ok(())
+            })
+            .collect::<anyhow::Result<()>>();
+
+        Ok(())
+    }
+
     async fn handle_transfer(
         self: Arc<Self>,
         addr: SocketAddr,
@@ -1381,48 +1438,21 @@ impl Server {
                         return Ok(());
                     }
 
-                    let delta = self.apply_journaled_delta(
-                        db,
-                        folder_id,
-                        namehash as i64,
-                        metadata.cookie() as i64,
-                    )?;
-
                     drop(outgoing_lock);
+                    drop(streams_lock);
 
                     tracing::info!(
                         "transfer queue satisfied for file {namehash}. broadcasting delta"
                     );
 
-                    let _ = streams_lock
-                        .iter()
-                        .map(|s| {
-                            if *s.0 == who {
-                                // tell peer to send queued manifest again if necessary
-                                s.1.send(Ch::OutPacket(protocol::Packet {
-                                    code: protocol::Return::NoneUnspecified as i32,
-                                    message: Some(protocol::packet::Message::SendAgain(
-                                        protocol::SendAgain { namehash },
-                                    )),
-                                }))?;
-
-                                tracing::debug!("send {} to send {} again", s.0, namehash);
-
-                                return Ok(());
-                            }
-
-                            if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
-                                code: protocol::Return::NoneUnspecified as i32,
-                                message: Some(protocol::packet::Message::Delta(delta.clone())),
-                            })) {
-                                tracing::error!("delta broadcast error: {}", e.to_string());
-                            }
-
-                            tracing::debug!("sent delta to {}", addr);
-
-                            Ok(())
-                        })
-                        .collect::<anyhow::Result<()>>();
+                    self.consume_delta(
+                        db,
+                        folder_id,
+                        namehash as i64,
+                        metadata.cookie() as i64,
+                        who,
+                    )
+                    .await?;
                 }
             }
         } else {

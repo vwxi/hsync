@@ -16,7 +16,6 @@ struct Config {
     /// if present, it will initiate with the server as
     /// a new folder.
     ///
-    // TODO: make this optional so we can do either or
     #[arg(short, long, value_name = "FOLDER")]
     folder: Option<PathBuf>,
 
