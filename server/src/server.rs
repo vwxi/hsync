@@ -264,6 +264,9 @@ impl Server {
                         }
 
                         // TODO: handle a new bidi pipe stream
+                        Ok((mut aux_send, mut aux_recv)) = conn.accept_bi() => {
+                            tracing::debug!("accepted aux stream {}", aux_send.id());
+                        }
 
                         p = Self::read_packet(&mut conn_recv) => {
                             match p {
@@ -431,34 +434,39 @@ impl Server {
             stmt.query_one([addr.to_string()], |r| r.get::<_, i64>(0))?
         };
 
-        let cookie: Option<i64> = {
-            let mut locks_lock = self.locks.lock().await;
-            if let Some(lock_state) = locks_lock.get_mut(&(folder_id, done.namehash as i64)) {
-                if lock_state.by == addr {
-                    let c = lock_state.cookie as i64;
+        let mut locks_lock = self.locks.lock().await;
+        if let Some(lock_state) = locks_lock.get_mut(&(folder_id, done.namehash as i64)) {
+            lock_state.waiting.remove(&addr);
 
-                    // remove done for this user
-                    lock_state.waiting.remove(&addr);
+            if lock_state.waiting.is_empty() {
+                let (b, c) = (lock_state.by, lock_state.cookie as i64);
 
-                    if lock_state.waiting.is_empty() {
-                        locks_lock.remove(&(folder_id, done.namehash as i64));
+                tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
 
-                        Some(c)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                locks_lock.remove(&(folder_id, done.namehash as i64));
+
+                // tell origin to delete journaled blocks
+                {
+                    let streams_lock = self.streams.read().await;
+                    streams_lock
+                        .get(&b)
+                        .map(|s| {
+                            s.send(protocol::Packet {
+                                code: protocol::Return::NoneUnspecified as i32,
+                                message: Some(protocol::packet::Message::Done(
+                                    protocol::TransferDone {
+                                        namehash: done.namehash,
+                                        cookie: Some(c as u64),
+                                    },
+                                )),
+                            })
+                            .ok()
+                        })
+                        .ok_or(anyhow::anyhow!("origin gc fail"))?;
                 }
-            } else {
-                None
+
+                tracing::debug!("gc: told {} to release {}:{}", b, done.namehash, c);
             }
-        };
-
-        if let Some(cookie) = cookie {
-            tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
-
-            Self::delete_delta(&db, folder_id, done.namehash as i64, Some(cookie))?;
         }
 
         Ok(())
@@ -602,11 +610,6 @@ impl Server {
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
-        let folder_id = {
-            let mut stmt = db.prepare("SELECT current_folder FROM users WHERE addr = ?1")?;
-            stmt.query_one([addr.to_string()], |r| r.get::<_, i64>(0))?
-        };
-
         // delete folder if last user left in folder
         db.execute(
             "DELETE FROM folders WHERE(SELECT COUNT(*)FROM users WHERE
@@ -696,12 +699,14 @@ impl Server {
             let mut locks_lock = self.locks.lock().await;
             match locks_lock.get(&(folder_id, namehash)) {
                 // if locked, reject
-                Some(lock_state) => {
-                    tracing::debug!("file locked by {:?}, rejecting {:?}", lock_state.by, addr);
+                Some(_) => {
+                    tracing::debug!("file locked, rejecting {:?}", addr);
+
                     stream.send(protocol::Packet {
                         code: protocol::Return::TransfersPending as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
                     })?;
+
                     return Ok(());
                 }
                 // otherwise
