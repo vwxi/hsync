@@ -14,6 +14,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::prelude::*;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rusqlite::fallible_iterator::FallibleIterator;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -35,46 +36,24 @@ const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, password TEXT)";
-const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE)";
-const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, contents BLOB)";
-const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, contents BLOB, UNIQUE(folder, name, start, end, cookie))";
+const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE, datahash INTEGER)";
+const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, origin INTEGER)";
+const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, origin INTEGER, UNIQUE(folder, name, start, end, cookie))";
 
 const EV_BUF_SIZE: usize = 32;
-
-#[derive(Debug, Clone)]
-enum Ch {
-    OutPacket(protocol::Packet),
-    Refresh,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct TransferMetadata {
-    pub hash: u64,
-    pub start: u64,
-    pub end: u64,
-    pub attempts: u64,
-    pub timestamp: u64,
-    pub cookie: Option<u64>,
-}
-
-#[derive(Debug)]
-struct IncompleteTransfer {
-    pub transfers: HashSet<TransferMetadata>,
-    pub who: SocketAddr,
-}
 
 struct LockState {
     pub by: SocketAddr,
     pub cookie: u64,
+    pub waiting: HashSet<SocketAddr>,
 }
 
 pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
-    streams: RwLock<HashMap<SocketAddr, UnboundedSender<Ch>>>,
+    streams: RwLock<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
     locks: Mutex<HashMap<(i64, i64), LockState>>,
-    outgoing_transfer_requests: Mutex<HashMap<i64, IncompleteTransfer>>,
 }
 
 impl Server {
@@ -167,23 +146,13 @@ impl Server {
 
         tracing::info!("initialized db");
 
-        let rootpath = config
-            .db
-            .as_ref()
-            .map(|p| p.parent())
-            .flatten()
-            .map(|p| p.into())
-            .unwrap_or(std::env::current_dir()?);
-
-        // create fs update channel
-        return Ok(Arc::new(Server {
+        Ok(Arc::new(Server {
             config,
             endpoint,
             db_pool: pool.clone(),
             streams: RwLock::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
-            outgoing_transfer_requests: Mutex::new(HashMap::new()),
-        }));
+        }))
     }
 
     fn timestamp() -> anyhow::Result<u64> {
@@ -233,7 +202,7 @@ impl Server {
             Err(_) => anyhow::bail!("bidi stream could not be accepted"),
         };
 
-        let (send, mut recv) = unbounded_channel::<Ch>();
+        let (send, mut recv) = unbounded_channel::<protocol::Packet>();
 
         let token = tokio_util::sync::CancellationToken::new();
         let ce_token = token.clone();
@@ -260,23 +229,14 @@ impl Server {
                 loop {
                     tokio::select! {
                         sz = recv.recv_many(&mut event_buffer, EV_BUF_SIZE) => {
-                            for e in event_buffer.drain(..sz) {
-                                match e {
-                                    Ch::OutPacket(pkt) => {
-                                        match Self::write_packet(&mut conn_send, &pkt).await {
-                                            Err(e) => {
-                                                tracing::error!("write packet error: {}", e.to_string());
+                            for pkt in event_buffer.drain(..sz) {
+                                match Self::write_packet(&mut conn_send, &pkt).await {
+                                    Err(e) => {
+                                        tracing::error!("write packet error: {}", e.to_string());
 
-                                                token.cancel();
-                                            }
-                                            _ => {}
-                                        }
+                                        token.cancel();
                                     }
-                                    Ch::Refresh => {
-                                        if let Err(e) = self_.check_outgoing_transfers().await {
-                                            tracing::error!("outgoing transfer check error: {}", e.to_string());
-                                        }
-                                    }
+                                    _ => {}
                                 }
                             }
 
@@ -303,6 +263,8 @@ impl Server {
                             break;
                         }
 
+                        // TODO: handle a new bidi pipe stream
+
                         p = Self::read_packet(&mut conn_recv) => {
                             match p {
                                 Ok(Some(pkt)) => {
@@ -317,26 +279,6 @@ impl Server {
                                     ce_token.cancel();
                                 }
                             }
-                        }
-                    }
-                }
-            }),
-            // refresh thread
-            tokio::spawn(async move {
-                tracing::debug!("starting refresh thread");
-
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(REFRESH_INTERVAL)) => {
-                            if let Err(e) = rf_send_ch.send(Ch::Refresh) {
-                                tracing::error!("refresh error: {}", e.to_string());
-                            }
-                        }
-
-                        _ = rf_token.cancelled() => {
-                            tracing::debug!("ending refresh thread");
-
-                            break;
                         }
                     }
                 }
@@ -381,10 +323,10 @@ impl Server {
             streams_lock
                 .get(&addr)
                 .ok_or(anyhow::anyhow!("could not find stream"))?
-                .send(Ch::OutPacket(protocol::Packet {
+                .send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: None,
-                }))?;
+                })?;
 
             return Ok(());
         }
@@ -491,13 +433,20 @@ impl Server {
 
         let cookie: Option<i64> = {
             let mut locks_lock = self.locks.lock().await;
-            if let Some(lock_state) = locks_lock.get(&(folder_id, done.namehash as i64)) {
+            if let Some(lock_state) = locks_lock.get_mut(&(folder_id, done.namehash as i64)) {
                 if lock_state.by == addr {
                     let c = lock_state.cookie as i64;
 
-                    locks_lock.remove(&(folder_id, done.namehash as i64));
+                    // remove done for this user
+                    lock_state.waiting.remove(&addr);
 
-                    Some(c)
+                    if lock_state.waiting.is_empty() {
+                        locks_lock.remove(&(folder_id, done.namehash as i64));
+
+                        Some(c)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -508,11 +457,6 @@ impl Server {
 
         if let Some(cookie) = cookie {
             tracing::info!("lock released by {:?} for file {}", addr, done.namehash);
-
-            {
-                let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-                outgoing_lock.remove(&(done.namehash as i64));
-            }
 
             Self::delete_delta(&db, folder_id, done.namehash as i64, Some(cookie))?;
         }
@@ -544,7 +488,7 @@ impl Server {
                 let digest = base16ct::lower::encode_string(&final_hash);
 
                 stream
-                    .send(Ch::OutPacket(protocol::Packet {
+                    .send(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(if digest == folder_pass_hash {
                             if db
@@ -575,14 +519,14 @@ impl Server {
                                 reason: Some(String::from("auth failure")),
                             })
                         }),
-                    }))
+                    })
                     .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
                 Ok(())
             })?;
         } else {
             // user wants to create a folder and is new
-            stream.send(Ch::OutPacket(protocol::Packet {
+            stream.send(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
                 message: Some(
                     if let Ok((folder_code, folder_id)) = {
@@ -593,7 +537,7 @@ impl Server {
                         let final_hash = hasher.finalize();
                         let digest = base16ct::lower::encode_string(&final_hash);
 
-                        // in debug mode this will hang if there are more than two folders
+                        // NOTE: in debug mode this will hang if there are more than two folders
                         // because every folder code is "code"
                         let (folder_code, folder_id) = loop {
                             let folder_code = Self::generate_folder_code();
@@ -646,50 +590,8 @@ impl Server {
                         })
                     },
                 ),
-            }))?;
+            })?;
         }
-        Ok(())
-    }
-
-    /// if a client disconnects before a delta xfer is complete,
-    /// the data will be corrupted. this routine allows a file to be restored
-    /// by clearing the files and requesting xfers from any other client
-    async fn clean_file(
-        self: &Arc<Self>,
-        db: PooledConnection<SqliteConnectionManager>,
-        ignore_addr: SocketAddr,
-        folder_id: i64,
-        namehash: i64,
-    ) -> anyhow::Result<()> {
-        let filename: String = db.query_one(
-            "SELECT name FROM filenames WHERE folder = ?1 AND namehash = ?2",
-            [folder_id, namehash],
-            |r| r.get(0),
-        )?;
-
-        db.execute(
-            "DELETE FROM blocks WHERE folder = ?1 AND name = ?2",
-            (folder_id, namehash),
-        )?;
-
-        let streams_lock = self.streams.read().await;
-        for stream in streams_lock.iter() {
-            if *stream.0 == ignore_addr {
-                continue;
-            }
-
-            tracing::debug!("trying to clean {} by asking {}", filename, stream.0);
-
-            stream.1.send(Ch::OutPacket(protocol::Packet {
-                code: protocol::Return::NoneUnspecified as i32,
-                message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
-                    filename,
-                })),
-            }))?;
-
-            return Ok(());
-        }
-
         Ok(())
     }
 
@@ -723,20 +625,6 @@ impl Server {
                 .ok_or(anyhow::anyhow!("tried to remove non-existant stream"))?;
         }
 
-        // remove any deltas or xfer requests
-        {
-            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            if let Some((namehash, _)) = outgoing_lock.iter_mut().find(|(_, v)| v.who == addr) {
-                Self::delete_delta(&db, folder_id, *namehash, None)?;
-
-                // TODO: MARK FILE AS "DIRTY" AND REQUEST FILE AGAIN FROM ANY OTHER USER
-                // IF NO OTHER USERS, DELETE FILE ENTRY
-                self.clean_file(db, addr, folder_id, *namehash).await?;
-            }
-
-            outgoing_lock.retain(|_, v| v.who != addr);
-        }
-
         tracing::debug!("peer {} disconnected: {:?}", addr, die.reason);
 
         Ok(())
@@ -754,12 +642,12 @@ impl Server {
 
         // reject empty manifests
         if manifest.blocks.is_empty() {
-            stream.send(Ch::OutPacket(protocol::Packet {
+            stream.send(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Die(protocol::Die {
                     reason: Some(String::from("rejecting empty manifest")),
                 })),
-            }))?;
+            })?;
 
             return Ok(());
         }
@@ -791,6 +679,18 @@ impl Server {
                 .await?;
         }
 
+        let waiting: HashSet<SocketAddr> = {
+            let mut stmt = db.prepare("SELECT addr FROM users WHERE current_folder = ?1")?;
+            let mut users = stmt.query_map([folder_id], |r| r.get::<_, String>(0))?;
+            let mut set = HashSet::new();
+
+            while let Some(Ok(user)) = users.next() {
+                set.insert(user.parse()?);
+            }
+
+            set
+        };
+
         // are other clients done transferring etc
         {
             let mut locks_lock = self.locks.lock().await;
@@ -798,10 +698,10 @@ impl Server {
                 // if locked, reject
                 Some(lock_state) => {
                     tracing::debug!("file locked by {:?}, rejecting {:?}", lock_state.by, addr);
-                    stream.send(Ch::OutPacket(protocol::Packet {
+                    stream.send(protocol::Packet {
                         code: protocol::Return::TransfersPending as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
-                    }))?;
+                    })?;
                     return Ok(());
                 }
                 // otherwise
@@ -811,6 +711,7 @@ impl Server {
                         LockState {
                             by: addr,
                             cookie: manifest.cookie(),
+                            waiting,
                         },
                     );
                     tracing::debug!("lock acquired by {:?} for file {}", addr, namehash);
@@ -818,117 +719,73 @@ impl Server {
             }
         }
 
-        let mut set: HashSet<TransferMetadata> = HashSet::new();
-        let timestamp = Self::timestamp()?;
-
-        manifest
+        let new_blocks = manifest
             .blocks
             .iter()
-            .map(|block| {
-                let mut stmt =
-                    db.prepare("SELECT * FROM blocks WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5")?;
+            .map(|m| (m.hash, m.start, m.end))
+            .collect();
 
-                if stmt
-                    .query_one(
-                        (folder_id, namehash, block.hash as i64, block.start as i64, block.end as i64),
-                        |_| Ok(()),
-                    )
-                    .is_err()
-                {
-                    set.insert(TransferMetadata {
-                        hash: block.hash,
-                        start: block.start,
-                        end: block.end,
-                        timestamp,
-                        attempts: 0,
-                        cookie: block.cookie,
-                    });
+        let user_id = db.query_row(
+            "SELECT id FROM users WHERE addr = ?1 LIMIT 1",
+            [addr.to_string()],
+            |r| r.get::<_, i64>(0),
+        )?;
 
-                    let mut block_with_namehash = block.clone();
-                    block_with_namehash.namehash = Some(namehash as u64);
-                    block_with_namehash.cookie = block.cookie;
+        let datahash = manifest
+            .hash
+            .ok_or(anyhow::anyhow!("manifest needs a data hash"))?;
 
-                    stream.send(Ch::OutPacket(protocol::Packet {
-                        code: protocol::Return::NoneUnspecified as i32,
-                        message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
-                            metadata: Some(block_with_namehash),
-                            mode: protocol::DataMode::WholeUnspecified as i32,
-                            data: None,
-                        })),
-                    }))?;
-
-                    // tracing::debug!(
-                    //     "requesting block {}:[{}, {}] from client for file {}",
-                    //     block.hash,
-                    //     block.start,
-                    //     block.end,
-                    //     manifest.filename
-                    // );
-                }
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .collect::<anyhow::Result<()>>()?;
-
-        if set.is_empty() {
-            // ignore this, go away
-            tracing::debug!("manifest is identical, ignoring");
-
-            let mut locks_lock = self.locks.lock().await;
-            locks_lock.remove(&(folder_id, namehash));
-
-            return Ok(());
-        }
-
-        {
-            let new_blocks = manifest
-                .blocks
-                .iter()
-                .map(|m| (m.hash, m.start, m.end))
-                .collect();
-
-            let datahash = manifest
-                .hash
-                .ok_or(anyhow::anyhow!("manifest needs a data hash"))?;
-
-            // add data hash to journal w/o any other data
-            // no start,end,contents means full file data hash
-            db.execute(
-                "INSERT OR REPLACE INTO journal (folder, name, hash, cookie)
-                 VALUES (?1, ?2, ?3, ?4)",
-                (
-                    folder_id,
-                    namehash,
-                    datahash as i64,
-                    manifest.cookie() as i64,
-                ),
-            )?;
-
-            // delta has its own cookie and is stored in journal until it is time to apply
-            self.process_delta(
+        // delta has its own cookie and is stored in journal until it is time to apply
+        let delta = self
+            .create_delta(
                 db,
                 folder_id,
                 namehash,
+                &manifest.filename,
+                datahash as i64,
+                user_id,
                 manifest.cookie() as i64,
                 new_blocks,
             )
             .await?;
-
-            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-            outgoing_lock.insert(
-                namehash,
-                IncompleteTransfer {
-                    transfers: set,
-                    who: addr,
-                },
-            );
-        }
 
         tracing::debug!(
             "received manifest for file {} cookie {}",
             manifest.filename,
             manifest.cookie()
         );
+
+        let streams_lock = self.streams.read().await;
+
+        let _ = streams_lock
+            .iter()
+            .map(|s| {
+                if *s.0 == addr {
+                    // tell peer to send queued manifest again if necessary
+                    s.1.send(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::SendAgain(protocol::SendAgain {
+                            namehash: namehash as u64,
+                        })),
+                    })?;
+
+                    tracing::debug!("send {} to send {} again", s.0, namehash);
+
+                    return Ok(());
+                }
+
+                if let Err(e) = s.1.send(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Delta(delta.clone())),
+                }) {
+                    tracing::error!("delta broadcast error: {}", e.to_string());
+                }
+
+                tracing::debug!("sent delta to {}", *s.0);
+
+                Ok(())
+            })
+            .collect::<anyhow::Result<()>>();
 
         Ok(())
     }
@@ -953,13 +810,13 @@ impl Server {
             .await
             .iter()
             .map(|s| {
-                s.1.send(Ch::OutPacket(protocol::Packet {
+                s.1.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(protocol::Event {
                         event: protocol::FileEvent::CreateUnspecified as i32,
                         filename: String::from(name_string),
                     })),
-                }))?;
+                })?;
                 anyhow::Ok(())
             })
             .collect::<anyhow::Result<()>>()?;
@@ -1004,13 +861,13 @@ impl Server {
             .await
             .iter()
             .map(|s| {
-                s.1.send(Ch::OutPacket(protocol::Packet {
+                s.1.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(protocol::Event {
                         event: protocol::FileEvent::Delete as i32,
                         filename: filename.clone(),
                     })),
-                }))?;
+                })?;
                 anyhow::Ok(())
             })
             .collect::<anyhow::Result<()>>()?;
@@ -1050,10 +907,10 @@ impl Server {
                     return Ok(());
                 }
 
-                s.1.send(Ch::OutPacket(protocol::Packet {
+                s.1.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(event.clone())),
-                }))
+                })
             })
             .collect::<Result<(), _>>();
 
@@ -1069,16 +926,18 @@ impl Server {
         Ok(())
     }
 
-    /// aggregates all of the hashes in order by offset
-    /// from the temp and the current then
-    async fn process_delta(
+    /// creates delta
+    async fn create_delta(
         self: &Arc<Self>,
         db: PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
         namehash: i64,
+        filename: &str,
+        datahash: i64,
+        origin_id: i64,
         cookie: i64,
         new_blocks: Vec<(u64, u64, u64)>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<protocol::Delta> {
         let old_blocks: Vec<(u64, u64, u64)> = {
             let mut stmt = db.prepare(
                 "SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2 ORDER BY start ASC"
@@ -1137,45 +996,6 @@ impl Server {
             }
         }
 
-        // insert delta ops without data, transfers will fill these out
-        for op in final_ops {
-            db.execute(
-                "INSERT OR REPLACE INTO journal (folder, name, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                (
-                    folder_id,
-                    namehash,
-                    op.start as i64,
-                    op.end as i64,
-                    op.hash as i64,
-                    cookie,
-                    op.op_type,
-                    Option::<rusqlite::blob::ZeroBlob>::None,
-                )
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn apply_journaled_delta(
-        self: &Arc<Self>,
-        db: PooledConnection<SqliteConnectionManager>,
-        folder_id: i64,
-        namehash: i64,
-        cookie: i64,
-    ) -> anyhow::Result<protocol::Delta> {
-        // fetch delta ops sorted in proper order
-        let mut stmt = db.prepare(
-            "SELECT hash, start, end, op FROM journal WHERE name = ?1 AND cookie = ?2
-             ORDER BY CASE WHEN op = 3 THEN 0 ELSE 1 END, CASE WHEN op = 3 THEN -start ELSE start END",
-        )?;
-
-        let filename: String = db.query_row(
-            "SELECT name FROM filenames WHERE folder = ?1 AND namehash = ?2",
-            [folder_id, namehash],
-            |r| r.get(0),
-        )?;
-
         let largest_end_offset = match db.query_row(
             "SELECT MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
             [folder_id, namehash],
@@ -1185,142 +1005,67 @@ impl Server {
             Err(_) => 0u64,
         };
 
-        let datahash = db.query_row(
-            "DELETE FROM journal
-             WHERE folder = ?1 AND name = ?2 AND cookie = ?3
-             AND start IS NULL AND end IS NULL AND contents IS NULL
-             RETURNING hash",
-            (folder_id, namehash, cookie),
-            |r| r.get::<_, i64>(0),
-        )? as u64;
+        // update datahash
+        db.execute(
+            "UPDATE filenames SET datahash = ?1 WHERE folder = ?2 AND namehash = ?3",
+            [datahash, folder_id, namehash],
+        )?;
 
-        let mut ops = stmt.query([namehash, cookie])?;
-        let mut delta = protocol::Delta {
+        // execute delta serverside
+        let delta = protocol::Delta {
             size: largest_end_offset,
-            filename,
+            filename: String::from(filename),
+            origin: origin_id as u64,
             cookie: cookie as u64,
-            hash: datahash,
-            ops: vec![],
+            hash: datahash as u64,
+            ops: final_ops,
         };
 
-        while let Ok(Some(row)) = ops.next() {
-            let (hash, start, end, op) = (
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                protocol::delta::OpType::try_from(row.get::<_, i64>(3)? as i32)?,
-            );
-
-            delta.ops.push(protocol::delta::Operation {
-                op_type: op as i32,
-                start: start as u64,
-                end: end as u64,
-                hash: hash as u64,
-            });
-
-            match op {
+        for op in &delta.ops {
+            match op.op_type() {
                 protocol::delta::OpType::Delete => {
                     db.execute(
                         "DELETE FROM blocks
                          WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5",
-                        (folder_id, namehash, hash as i64, start as i64, end),
+                        (
+                            folder_id,
+                            namehash,
+                            op.hash as i64,
+                            op.start as i64,
+                            op.end as i64,
+                        ),
                     )?;
                 }
 
                 protocol::delta::OpType::Insert | protocol::delta::OpType::EqualUnspecified => {
                     db.execute(
-                        "INSERT OR REPLACE INTO blocks
-                         SELECT folder, name, hash, start, end, contents FROM journal
-                         WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
-                         (
-                             folder_id, namehash, hash as i64, start as i64, end, cookie
-                         ))?;
+                        "INSERT INTO blocks (folder, name, hash, start, end, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        (
+                            folder_id,
+                            namehash,
+                            op.hash as i64,
+                            op.start as i64,
+                            op.end as i64,
+                            origin_id,
+                        ),
+                    )?;
                 }
 
                 protocol::delta::OpType::Modify => {
                     db.execute(
-                        "DELETE FROM blocks
-                              WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4",
-                        (folder_id, namehash, start as i64, end),
+                        "DELETE FROM blocks WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4",
+                        (folder_id, namehash, op.start as i64, op.end as i64),
                     )?;
 
                     db.execute(
-                        "INSERT INTO blocks (folder, name, hash, start, end, contents)
-                         SELECT folder, name, hash, start, end, contents
-                         FROM journal
-                         WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 AND hash = ?5 AND cookie = ?6",
-                        (
-                             folder_id, namehash, start as i64, end, hash as i64, cookie
-                         ))?;
+                        "INSERT INTO blocks (folder, name, hash, start, end, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        (folder_id, namehash, op.start as i64, op.end as i64, op.hash as i64, origin_id)
+                    )?;
                 }
             }
-
-            db.execute(
-                "DELETE FROM journal
-                 WHERE folder = ?1 AND name = ?2 AND hash = ?3 AND start = ?4 AND end = ?5 AND cookie = ?6",
-                 (
-                     folder_id, namehash, hash as i64, start as i64, end, cookie
-                 ))?;
-
-            tracing::debug!(
-                "applied {:?} to file {}:{}:{}:[{}, {}] (ck: {})",
-                op,
-                folder_id,
-                namehash as u64,
-                hash as u64,
-                start as u64,
-                end as u64,
-                cookie as u64
-            );
         }
 
         Ok(delta)
-    }
-
-    // apply and broadcast delta
-    async fn consume_delta(
-        self: &Arc<Self>,
-        db: PooledConnection<SqliteConnectionManager>,
-        folder_id: i64,
-        namehash: i64,
-        cookie: i64,
-        origin: SocketAddr,
-    ) -> anyhow::Result<()> {
-        let streams_lock = self.streams.read().await;
-
-        let delta = self.apply_journaled_delta(db, folder_id, namehash, cookie)?;
-
-        let _ = streams_lock
-            .iter()
-            .map(|s| {
-                if *s.0 == origin {
-                    // tell peer to send queued manifest again if necessary
-                    s.1.send(Ch::OutPacket(protocol::Packet {
-                        code: protocol::Return::NoneUnspecified as i32,
-                        message: Some(protocol::packet::Message::SendAgain(protocol::SendAgain {
-                            namehash: namehash as u64,
-                        })),
-                    }))?;
-
-                    tracing::debug!("send {} to send {} again", s.0, namehash);
-
-                    return Ok(());
-                }
-
-                if let Err(e) = s.1.send(Ch::OutPacket(protocol::Packet {
-                    code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Delta(delta.clone())),
-                })) {
-                    tracing::error!("delta broadcast error: {}", e.to_string());
-                }
-
-                tracing::debug!("sent delta to {}", *s.0);
-
-                Ok(())
-            })
-            .collect::<anyhow::Result<()>>();
-
-        Ok(())
     }
 
     async fn handle_transfer(
@@ -1358,175 +1103,8 @@ impl Server {
                 );
                 return Ok(());
             }
-
-            let mut outgoing_lock = self.outgoing_transfer_requests.lock().await;
-
-            if let Some(entry) = outgoing_lock.get_mut(&(namehash as i64)) {
-                if entry
-                    .transfers
-                    .iter()
-                    .find(|e| {
-                        e.start == metadata.start
-                            && e.end == metadata.end
-                            && e.cookie == metadata.cookie
-                            && e.hash == metadata.hash
-                    })
-                    .is_some()
-                {
-                    if hash == metadata.hash {
-                        let rowid = db.query_row(
-                        "UPDATE journal
-                         SET contents = ?7
-                         WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 AND hash = ?5 AND cookie = ?6
-                         RETURNING ROWID",
-                        (
-                            folder_id,
-                            namehash as i64,
-                            metadata.start as i64,
-                            metadata.end as i64,
-                            hash as i64,
-                            metadata.cookie() as i64,
-                            Some(rusqlite::blob::ZeroBlob(
-                                (metadata.end - metadata.start) as i32,
-                            )),
-                        ),
-                        |r| r.get::<_, i64>(0)
-                    )?;
-
-                        let mut blob =
-                            db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, false)?;
-
-                        if blob.write(&data)? != data.len() {
-                            anyhow::bail!("did not write full block to database");
-                        }
-
-                        blob.close()?;
-
-                        tracing::debug!(
-                            "got back data for {}:[{}, {}]",
-                            namehash,
-                            metadata.start,
-                            metadata.end
-                        );
-                    } else {
-                        tracing::debug!("hash mismatch - {} != {}", hash, metadata.hash);
-                    }
-                }
-
-                entry.transfers.retain(|e| {
-                    !(e.start == metadata.start
-                        && e.end == metadata.end
-                        && e.cookie == metadata.cookie
-                        && e.hash == metadata.hash)
-                });
-
-                if entry.transfers.is_empty() {
-                    let who = entry.who;
-
-                    let _ = entry;
-
-                    outgoing_lock
-                        .remove(&(namehash as i64))
-                        .ok_or(anyhow::anyhow!("what?"))?;
-
-                    if hash != metadata.hash {
-                        {
-                            let mut locks_lock = self.locks.lock().await;
-                            locks_lock.remove(&(folder_id, namehash as i64));
-                        }
-
-                        return Ok(());
-                    }
-
-                    drop(outgoing_lock);
-                    drop(streams_lock);
-
-                    tracing::info!(
-                        "transfer queue satisfied for file {namehash}. broadcasting delta"
-                    );
-
-                    self.consume_delta(
-                        db,
-                        folder_id,
-                        namehash as i64,
-                        metadata.cookie() as i64,
-                        who,
-                    )
-                    .await?;
-                }
-            }
         } else {
             // we are getting a request for block data
-            // tracing::debug!(
-            //     "client wants block {}:{}:[{}, {}]",
-            //     namehash,
-            //     metadata.hash,
-            //     metadata.start,
-            //     metadata.end
-            // );
-
-            let res: (i64, i64) = match db.query_row(
-                "SELECT ROWID, hash FROM blocks WHERE folder = ?1 AND name = ?2 AND start = ?3 AND end = ?4 LIMIT 1",
-                [folder_id, namehash as i64, metadata.start as i64, metadata.end as i64],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    streams_lock
-                        .get(&addr)
-                        .ok_or(anyhow::anyhow!("could not get client stream"))?
-                        .send(Ch::OutPacket(protocol::Packet {
-                            code: protocol::Return::BlockNotFound as i32,
-                            message: Some(protocol::packet::Message::Transfer(
-                                protocol::Transfer {
-                                    metadata: Some(metadata),
-                                    mode: protocol::DataMode::WholeUnspecified as i32,
-                                    data: None,
-                                },
-                            )),
-                        }))?;
-
-                    {
-                        let mut locks_lock = self.locks.lock().await;
-                        locks_lock.remove(&(folder_id, namehash as i64));
-                    }
-
-                    anyhow::bail!("could not find block {}:[{}, {}]", metadata.namehash(), metadata.start, metadata.end);
-                }
-            };
-
-            let size_to_read = (metadata.end - metadata.start) as usize;
-            let mut data: Vec<u8> = vec![0u8; size_to_read];
-            let mut contents =
-                db.blob_open(rusqlite::MAIN_DB, "blocks", "contents", res.0, true)?;
-            contents.read_exact(&mut data)?;
-
-            let block_hash = xxhash_rust::xxh3::xxh3_64(&data);
-
-            metadata.hash = if block_hash == res.1 as u64 {
-                res.1 as u64
-            } else {
-                block_hash
-            };
-
-            streams_lock
-                .get(&addr)
-                .ok_or(anyhow::anyhow!("could not get client stream"))?
-                .send(Ch::OutPacket(protocol::Packet {
-                    code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
-                        metadata: Some(metadata),
-                        mode: protocol::DataMode::WholeUnspecified as i32,
-                        data: Some(data),
-                    })),
-                }))?;
-
-            // tracing::debug!(
-            //     "satisfied transfer request for {}:[{}, {}]",
-            //     namehash,
-            //     metadata.start,
-            //     metadata.end
-            // );
         }
 
         Ok(())
@@ -1554,8 +1132,9 @@ impl Server {
         stmt.query_one([whatis.filename.clone()], |row| {
             let filehash = row.get::<_, i64>(0)?;
 
-            let mut blocks_stmt =
-                db.prepare("SELECT hash, start, end FROM blocks WHERE folder = ?1 AND name = ?2")?;
+            let mut blocks_stmt = db.prepare(
+                "SELECT hash, start, end, origin FROM blocks WHERE folder = ?1 AND name = ?2",
+            )?;
 
             let largest_end_offset = match db.query_one(
                 "SELECT MAX(end) FROM blocks WHERE folder = ?1 AND name = ?2",
@@ -1581,6 +1160,7 @@ impl Server {
                     hash: block.get::<_, i64>(0)? as u64,
                     start: block.get::<_, i64>(1)? as u64,
                     end: block.get::<_, i64>(2)? as u64,
+                    origin: block.get::<_, i64>(3).map(|o| o as u64).ok(),
                     cookie: manifest.cookie,
                     namehash: None,
                 });
@@ -1589,90 +1169,14 @@ impl Server {
             tracing::debug!("sending manifest for file {}", manifest.filename);
 
             stream
-                .send(Ch::OutPacket(protocol::Packet {
+                .send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
-                }))
+                })
                 .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
             Ok(())
         })?;
-
-        Ok(())
-    }
-
-    async fn check_outgoing_transfers(self: &Arc<Self>) -> anyhow::Result<()> {
-        let current_timestamp = Self::timestamp()?;
-
-        for (namehash, item) in self.outgoing_transfer_requests.lock().await.iter_mut() {
-            let late_requests: Vec<TransferMetadata> = item
-                .transfers
-                .extract_if(|e| current_timestamp - e.timestamp >= REFRESH_INTERVAL)
-                .collect();
-
-            late_requests
-                .iter()
-                .map(|req| {
-                    if req.attempts + 1 >= REFRESH_ATTEMPTS {
-                        // tracing::debug!(
-                        //     "request for {}:[{}, {}] max attempts reached",
-                        //     req.0,
-                        //     req.1,
-                        //     req.2
-                        // );
-
-                        return Ok(());
-                    }
-
-                    let metadata = protocol::BlockMetadata {
-                        namehash: Some(*namehash as u64),
-                        start: req.start,
-                        end: req.end,
-                        cookie: req.cookie,
-                        hash: req.hash,
-                    };
-
-                    tokio::task::block_in_place(|| {
-                        self.streams
-                            .blocking_read()
-                            .get(&item.who)
-                            .map(|stream| {
-                                stream.send(Ch::OutPacket(protocol::Packet {
-                                    code: protocol::Return::NoneUnspecified as i32,
-                                    message: Some(protocol::packet::Message::Transfer(
-                                        protocol::Transfer {
-                                            metadata: Some(metadata),
-                                            mode: protocol::DataMode::WholeUnspecified as i32,
-                                            data: None,
-                                        },
-                                    )),
-                                }))?;
-
-                                anyhow::Ok(())
-                            })
-                            .ok_or(anyhow::anyhow!("failed to send transfer request"))
-                    })??;
-
-                    item.transfers.insert(TransferMetadata {
-                        start: req.start,
-                        end: req.end,
-                        attempts: req.attempts + 1,
-                        timestamp: current_timestamp,
-                        cookie: req.cookie,
-                        hash: req.hash,
-                    });
-
-                    // tracing::debug!(
-                    //     "resending transfer request: {}:[{}, {}]",
-                    //     namehash,
-                    //     req.0,
-                    //     req.1
-                    // );
-
-                    anyhow::Ok(())
-                })
-                .collect::<anyhow::Result<()>>()?;
-        }
 
         Ok(())
     }

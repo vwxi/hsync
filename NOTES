@@ -1,0 +1,28 @@
+p2p notes
+
+goal: server will now relay blocks instead of storing actual data
+
+add direct connection stuff later, focus now on relaying
+
+clients drain journals based on "transfers complete"
+when it comes to incoming changes we keep that behavior
+
+sending out blocks from our journal, we delete on fetch
+we cannot do that because not everyone gets the block
+need a way to signal that a client can drop journal blocks
+
+add to the lockstate a list of who we are waiting on for a done message
+
+
+all that remains is making the relay stream
+
+clients receive data through manifests and deltas
+these objects will have an origin attached to them
+    if many clients are requesting directly from the origin will that overwhelm the origin?
+    maybe the server can cache blocks if they are requested often?
+    
+right now: 
+the server journals blocks until the transfer is complete
+then it stores the blocks into the main block table
+    as a relay it will instead not journal anything bc it will not store anything, 
+    applying the manifest to the block table directly

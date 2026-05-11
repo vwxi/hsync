@@ -623,17 +623,7 @@ impl Client {
                         ],
                     )?;
 
-                    // delete from journal
-                    db.execute(
-                        "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 AND cookie = ?5",
-                        (
-                            namehash as i64,
-                            metadata.start as i64,
-                            metadata.end as i64,
-                            hash,
-                            metadata.cookie.map(|c| c as i64),
-                        ),
-                    )?;
+                    // don't delete yet
 
                     // tracing::debug!(
                     //     "journal: fetched block {}:[{}, {}] (ck: {:?})",
@@ -969,6 +959,7 @@ impl Client {
                         start: change.0,
                         end: change.1,
                         hash: change.2,
+                        origin: None,
                         namehash: None,
                         cookie: Some(cookie as u64),
                     });
@@ -1069,6 +1060,7 @@ impl Client {
                 manifest.blocks.push(protocol::BlockMetadata {
                     start,
                     end,
+                    origin: None,
                     namehash: None,
                     cookie: None,
                     hash,
@@ -1081,6 +1073,15 @@ impl Client {
                 if let Err(e) = ch.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Manifest(manifest)),
+                })) {
+                    anyhow::bail!("failed to send message: {}", e.to_string());
+                }
+
+                if let Err(e) = ch.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::Done(protocol::TransferDone {
+                        namehash: namehash as u64,
+                    })),
                 })) {
                     anyhow::bail!("failed to send message: {}", e.to_string());
                 }
@@ -1516,6 +1517,7 @@ impl Client {
                             end: transfer_metadata.end,
                             namehash: Some(namehash as u64),
                             hash: transfer_metadata.hash,
+                            origin: None,
                             cookie: transfer_metadata.cookie,
                         }),
                         mode: protocol::DataMode::WholeUnspecified as i32,
@@ -2032,6 +2034,7 @@ impl Client {
                     hash: block.get::<_, i64>(0)? as u64,
                     start: block.get::<_, i64>(1)? as u64,
                     end: block.get::<_, i64>(2)? as u64,
+                    origin: None,
                     cookie: manifest.cookie,
                     namehash: None,
                 });
@@ -2125,6 +2128,7 @@ impl Client {
                         start: req.start,
                         end: req.end,
                         hash: req.hash,
+                        origin: None,
                         cookie: req.cookie,
                     };
 

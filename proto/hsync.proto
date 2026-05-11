@@ -31,8 +31,12 @@ message BlockMetadata {
   uint64 end = 2;
   optional uint64 namehash = 3;
   uint64 hash = 4;
+  // server id belonging to the origin of the manifest
+  //
+  // only set when server->client
+  optional uint64 origin = 5;
   // server->client ignores this, client->server requires this
-  optional uint64 cookie = 5;
+  optional uint64 cookie = 6;
 }
 
 // describes a file.
@@ -41,12 +45,12 @@ message FileManifest {
   uint64 timestamp = 2;
   uint64 size = 3;
   // what final data hash should be after blocks
-  optional uint64 hash = 4;
+  optional uint64 hash = 5;
   // no cookie means transfers will come from the main block table
   //
   // server->client ignores this, client->server requires this
-  optional uint64 cookie = 5;
-  repeated BlockMetadata blocks = 6;
+  optional uint64 cookie = 6;
+  repeated BlockMetadata blocks = 7;
 }
 
 // get the manifest for a file
@@ -71,9 +75,10 @@ message Delta {
 
   uint64 size = 1;
   string filename = 2;
-  uint64 cookie = 3;
-  uint64 hash = 4;
-  repeated Operation ops = 5;
+  uint64 origin = 3;
+  uint64 cookie = 4;
+  uint64 hash = 5;
+  repeated Operation ops = 6;
 }
 
 enum DataMode {
