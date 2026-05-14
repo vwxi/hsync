@@ -52,6 +52,7 @@ pub struct Server {
     config: Config,
     endpoint: Endpoint,
     db_pool: Pool<SqliteConnectionManager>,
+    aux_streams: RwLock<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
     streams: RwLock<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
     locks: Mutex<HashMap<(i64, i64), LockState>>,
 }
@@ -150,6 +151,7 @@ impl Server {
             config,
             endpoint,
             db_pool: pool.clone(),
+            aux_streams: RwLock::new(HashMap::new()),
             streams: RwLock::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
         }))
@@ -206,11 +208,11 @@ impl Server {
 
         let token = tokio_util::sync::CancellationToken::new();
         let ce_token = token.clone();
-        let rf_token = token.clone();
 
-        let rf_send_ch = send.clone();
+        // jfc
         let self_ = self.clone();
-        let self2_ = self.clone();
+        let self2 = self.clone();
+        let self3 = self.clone();
 
         let addr = conn.remote_address();
 
@@ -263,15 +265,29 @@ impl Server {
                             break;
                         }
 
-                        // TODO: handle a new bidi pipe stream
-                        Ok((mut aux_send, mut aux_recv)) = conn.accept_bi() => {
-                            tracing::debug!("accepted aux stream {}", aux_send.id());
+                        Ok(bidi) = conn.accept_bi() => {
+                            tracing::debug!("accepted aux stream {}", bidi.0.id());
+
+                            let chan = unbounded_channel::<protocol::Packet>();
+
+                            tokio::spawn(self2.clone().handle_aux_stream(
+                                conn.remote_address(),
+                                ce_token.clone(),
+                                bidi,
+                                chan.1
+                            ));
+
+                            // add stream to map
+                            {
+                                let mut aux_streams_lock = self2.aux_streams.write().await;
+                                aux_streams_lock.insert(conn.remote_address(), chan.0);
+                            }
                         }
 
                         p = Self::read_packet(&mut conn_recv) => {
                             match p {
                                 Ok(Some(pkt)) => {
-                                    if let Err(e) = self2_.handle_packet(conn.remote_address(), pkt).await {
+                                    if let Err(e) = self2.handle_packet(conn.remote_address(), pkt).await {
                                         tracing::error!("packet handler: {}", e.to_string());
                                     }
                                 }
@@ -293,7 +309,10 @@ impl Server {
         Ok(())
     }
 
-    async fn write_packet(stream: &mut SendStream, pkt: &protocol::Packet) -> anyhow::Result<()> {
+    pub(crate) async fn write_packet(
+        stream: &mut SendStream,
+        pkt: &protocol::Packet,
+    ) -> anyhow::Result<()> {
         let encoded = pkt.encode_to_vec();
         let len = encoded.len() as u32;
         stream.write_u32(len).await?;
@@ -302,7 +321,9 @@ impl Server {
         Ok(())
     }
 
-    async fn read_packet(stream: &mut RecvStream) -> anyhow::Result<Option<protocol::Packet>> {
+    pub(crate) async fn read_packet(
+        stream: &mut RecvStream,
+    ) -> anyhow::Result<Option<protocol::Packet>> {
         let len = match stream.read_u32().await {
             Ok(len) => len,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),

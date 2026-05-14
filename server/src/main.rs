@@ -1,3 +1,4 @@
+mod relay;
 mod server;
 
 use clap::Parser;

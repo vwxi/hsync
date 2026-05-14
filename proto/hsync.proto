@@ -116,9 +116,16 @@ message SendAgain {
 
 message TransferDone {
   uint64 namehash = 1;
+  optional uint64 cookie = 2;
 }
 
-message Whoami {}
+// if this is sent, the stream will now
+message RelayOpen {
+  uint64 to = 1;
+}
+
+// whatever relay is open on this stream, close it.
+message RelayClose {}
 
 enum Return {
   RETURN_NONE_UNSPECIFIED = 0;
@@ -146,5 +153,9 @@ message Packet {
     WhatIs whatis = 9;
     SendAgain send_again = 10;
     TransferDone done = 11;
+
+    // p2p operations
+    RelayOpen relay_open = 12;
+    RelayClose relay_close = 13;
   }
 }

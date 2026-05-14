@@ -1081,6 +1081,7 @@ impl Client {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Done(protocol::TransferDone {
                         namehash: namehash as u64,
+                        cookie: None,
                     })),
                 })) {
                     anyhow::bail!("failed to send message: {}", e.to_string());
@@ -1311,6 +1312,7 @@ impl Client {
                                     message: Some(protocol::packet::Message::Done(
                                         protocol::TransferDone {
                                             namehash: namehash as u64,
+                                            cookie: metadata.cookie,
                                         },
                                     )),
                                 }))
@@ -1671,6 +1673,7 @@ impl Client {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::Done(protocol::TransferDone {
                             namehash: namehash as u64,
+                            cookie: Some(delta.cookie),
                         })),
                     }))
                 })
@@ -1971,6 +1974,7 @@ impl Client {
 
                             protocol::packet::Message::Done(protocol::TransferDone {
                                 namehash: sendagain.namehash,
+                                cookie: None,
                             })
                         }
                     } else {
@@ -1979,6 +1983,7 @@ impl Client {
 
                         protocol::packet::Message::Done(protocol::TransferDone {
                             namehash: sendagain.namehash,
+                            cookie: None,
                         })
                     },
                 ),
@@ -2059,6 +2064,23 @@ impl Client {
         Ok(())
     }
 
+    async fn handle_done(&mut self, done: protocol::TransferDone) -> anyhow::Result<()> {
+        let db = self.db_pool.get()?;
+
+        let cookie = done
+            .cookie
+            .ok_or(anyhow::anyhow!("server should always send cookie for gc"))?;
+
+        db.execute(
+            "DELETE FROM journal WHERE file = ?1 AND cookie = ?2",
+            [done.namehash as i64, cookie as i64],
+        )?;
+
+        tracing::debug!("journal: gc namehash {} cookie {}", done.namehash, cookie);
+
+        Ok(())
+    }
+
     async fn handle_server_event(&mut self, packet: protocol::Packet) -> anyhow::Result<()> {
         // responded to our heartbeat
         if packet.message.is_none() {
@@ -2096,6 +2118,8 @@ impl Client {
             }
 
             protocol::packet::Message::Whatis(whatis) => self.handle_whatis(whatis).await?,
+
+            protocol::packet::Message::Done(done) => self.handle_done(done).await?,
 
             _ => {}
         }
