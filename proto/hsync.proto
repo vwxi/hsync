@@ -41,9 +41,11 @@ message BlockMetadata {
 
 // describes a file.
 message FileManifest {
-  string filename = 1;
-  uint64 timestamp = 2;
-  uint64 size = 3;
+  // this version specifically refers to the latest version (highest number)
+  uint64 version = 1;
+  string filename = 2;
+  uint64 timestamp = 3;
+  uint64 size = 4;
   // what final data hash should be after blocks
   optional uint64 hash = 5;
   // no cookie means transfers will come from the main block table
@@ -73,12 +75,13 @@ message Delta {
     uint64 end = 4;
   }
 
-  uint64 size = 1;
-  string filename = 2;
-  uint64 origin = 3;
-  uint64 cookie = 4;
-  uint64 hash = 5;
-  repeated Operation ops = 6;
+  uint64 version = 1;
+  uint64 size = 2;
+  string filename = 3;
+  uint64 origin = 4;
+  uint64 cookie = 5;
+  uint64 hash = 6;
+  repeated Operation ops = 7;
 }
 
 enum DataMode {
@@ -92,6 +95,12 @@ message Transfer {
   BlockMetadata metadata = 1;
   DataMode mode = 2;
   optional bytes data = 3;
+}
+
+message BulkTransfer {
+  uint64 version = 1;
+  uint64 namehash = 2;
+  repeated BlockMetadata blocks = 3;
 }
 
 enum FileEvent {
@@ -119,9 +128,10 @@ message TransferDone {
   optional uint64 cookie = 2;
 }
 
-// if this is sent, the stream will now
+// server->client: incoming relay stream from other user
+// client->server: outgoing relay request to another user
 message RelayOpen {
-  uint64 to = 1;
+  uint64 id = 1;
 }
 
 // whatever relay is open on this stream, close it.
@@ -134,6 +144,7 @@ enum Return {
   RETURN_FILE_NOT_FOUND = 3;
   RETURN_BLOCK_NOT_FOUND = 4;
   RETURN_TRANSFERS_PENDING = 5;
+  RETURN_SIZE_LIMIT = 6;
 }
 
 message Packet {
@@ -157,5 +168,6 @@ message Packet {
     // p2p operations
     RelayOpen relay_open = 12;
     RelayClose relay_close = 13;
+    BulkTransfer bulk_transfer = 14;
   }
 }

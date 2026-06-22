@@ -5,11 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::Config;
+use crate::{Config, relay::Relay};
 use anyhow::Context;
 use blake2::Digest;
+use futures::future::join_all;
 use prost::Message;
-use quinn::{Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, crypto::rustls::QuicServerConfig};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::prelude::*;
@@ -36,25 +37,26 @@ const REFRESH_ATTEMPTS: u64 = 3;
 const ALPN_QUIC_HSYNC: &[&[u8]] = &[b"hsync"];
 const CREATE_USERS_STMT: &str = "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT, current_folder INTEGER)";
 const CREATE_FOLDERS_STMT: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, password TEXT)";
-const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE, datahash INTEGER)";
+const CREATE_FILENAMES_STMT: &str = "CREATE TABLE IF NOT EXISTS filenames (folder INTEGER, name TEXT UNIQUE, namehash INTEGER UNIQUE, datahash INTEGER, version INTEGER DEFAULT 0)";
 const CREATE_BLOCKS_STMT: &str = "CREATE TABLE IF NOT EXISTS blocks (folder INTEGER, name INTEGER, hash INTEGER, start INTEGER, end INTEGER, origin INTEGER)";
 const CREATE_JOURNAL_STMT: &str = "CREATE TABLE IF NOT EXISTS journal (folder INTEGER, name INTEGER, start INTEGER, end INTEGER, hash INTEGER, cookie INTEGER, op INTEGER, origin INTEGER, UNIQUE(folder, name, start, end, cookie))";
 
 const EV_BUF_SIZE: usize = 32;
 
-struct LockState {
-    pub by: SocketAddr,
-    pub cookie: u64,
-    pub waiting: HashSet<SocketAddr>,
+pub(crate) struct LockState {
+    pub(crate) by: SocketAddr,
+    pub(crate) cookie: u64,
+    pub(crate) waiting: HashSet<SocketAddr>,
 }
 
 pub struct Server {
-    config: Config,
-    endpoint: Endpoint,
-    db_pool: Pool<SqliteConnectionManager>,
-    aux_streams: RwLock<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
-    streams: RwLock<HashMap<SocketAddr, UnboundedSender<protocol::Packet>>>,
-    locks: Mutex<HashMap<(i64, i64), LockState>>,
+    pub(crate) config: Config,
+    pub(crate) endpoint: Endpoint,
+    pub(crate) db_pool: Pool<SqliteConnectionManager>,
+    pub(crate) relays: RwLock<HashMap<SocketAddr, HashMap<SocketAddr, Relay>>>,
+    pub(crate) streams:
+        RwLock<HashMap<SocketAddr, (UnboundedSender<protocol::Packet>, Connection)>>,
+    pub(crate) locks: Mutex<HashMap<(i64, i64), LockState>>,
 }
 
 impl Server {
@@ -151,7 +153,7 @@ impl Server {
             config,
             endpoint,
             db_pool: pool.clone(),
-            aux_streams: RwLock::new(HashMap::new()),
+            relays: RwLock::new(HashMap::new()),
             streams: RwLock::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
         }))
@@ -212,13 +214,12 @@ impl Server {
         // jfc
         let self_ = self.clone();
         let self2 = self.clone();
-        let self3 = self.clone();
 
         let addr = conn.remote_address();
 
         {
             let mut lock = self.streams.write().await;
-            lock.insert(conn.remote_address(), send);
+            lock.insert(conn.remote_address(), (send.clone(), conn.clone()));
         }
 
         let futs = vec![
@@ -265,29 +266,23 @@ impl Server {
                             break;
                         }
 
-                        Ok(bidi) = conn.accept_bi() => {
-                            tracing::debug!("accepted aux stream {}", bidi.0.id());
+                        Ok(origin_bidi) = conn.accept_bi() => {
+                            tracing::debug!("accepted aux stream {}", origin_bidi.0.id());
 
                             let chan = unbounded_channel::<protocol::Packet>();
 
-                            tokio::spawn(self2.clone().handle_aux_stream(
+                            tokio::spawn(self2.clone().handle_incoming_relay(
                                 conn.remote_address(),
                                 ce_token.clone(),
-                                bidi,
-                                chan.1
+                                origin_bidi,
+                                chan
                             ));
-
-                            // add stream to map
-                            {
-                                let mut aux_streams_lock = self2.aux_streams.write().await;
-                                aux_streams_lock.insert(conn.remote_address(), chan.0);
-                            }
                         }
 
                         p = Self::read_packet(&mut conn_recv) => {
                             match p {
                                 Ok(Some(pkt)) => {
-                                    if let Err(e) = self2.handle_packet(conn.remote_address(), pkt).await {
+                                    if let Err(e) = self2.handle_packet(conn.remote_address(), pkt, &send).await {
                                         tracing::error!("packet handler: {}", e.to_string());
                                     }
                                 }
@@ -304,7 +299,7 @@ impl Server {
             }),
         ];
 
-        futures::future::join_all(futs).await;
+        join_all(futs).await;
 
         Ok(())
     }
@@ -340,6 +335,7 @@ impl Server {
         self: &Arc<Self>,
         addr: SocketAddr,
         pkt: protocol::Packet,
+        send: &UnboundedSender<protocol::Packet>,
     ) -> anyhow::Result<()> {
         // respond to a heartbeat
         if pkt.message.is_none() {
@@ -347,6 +343,7 @@ impl Server {
             streams_lock
                 .get(&addr)
                 .ok_or(anyhow::anyhow!("could not find stream"))?
+                .0
                 .send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: None,
@@ -360,21 +357,19 @@ impl Server {
             .ok_or(anyhow::anyhow!("why is this happening?"))?;
 
         match message {
-            protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth).await?,
+            protocol::packet::Message::Auth(auth) => self.handle_auth(addr, auth, send).await?,
 
             protocol::packet::Message::Die(die) => self.handle_die(addr, die).await?,
 
             protocol::packet::Message::Manifest(manifest) => {
-                self.handle_manifest(addr, manifest).await?
+                self.handle_manifest(addr, manifest, send).await?
             }
 
             protocol::packet::Message::Event(event) => self.handle_event(addr, event).await?,
 
-            protocol::packet::Message::Transfer(transfer) => {
-                self.clone().handle_transfer(addr, transfer).await?
+            protocol::packet::Message::Whatis(whatis) => {
+                self.handle_whatis(addr, whatis, send).await?
             }
-
-            protocol::packet::Message::Whatis(whatis) => self.handle_whatis(addr, whatis).await?,
 
             protocol::packet::Message::Done(done) => self.handle_done(addr, done).await?,
 
@@ -422,27 +417,6 @@ impl Server {
             .collect::<Vec<protocol::room_info::File>>())
     }
 
-    fn delete_delta(
-        db: &PooledConnection<SqliteConnectionManager>,
-        folder_id: i64,
-        namehash: i64,
-        cookie: Option<i64>,
-    ) -> anyhow::Result<()> {
-        if let Some(cookie) = cookie {
-            db.execute(
-                "DELETE FROM journal WHERE folder = ?1 AND name = ?2 AND cookie = ?3",
-                (folder_id, namehash, cookie),
-            )?;
-        } else {
-            db.execute(
-                "DELETE FROM journal WHERE folder = ?1 AND name = ?2",
-                (folder_id, namehash),
-            )?;
-        }
-
-        Ok(())
-    }
-
     async fn handle_done(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -472,7 +446,7 @@ impl Server {
                     streams_lock
                         .get(&b)
                         .map(|s| {
-                            s.send(protocol::Packet {
+                            s.0.send(protocol::Packet {
                                 code: protocol::Return::NoneUnspecified as i32,
                                 message: Some(protocol::packet::Message::Done(
                                     protocol::TransferDone {
@@ -497,12 +471,9 @@ impl Server {
         self: &Arc<Self>,
         addr: SocketAddr,
         auth: protocol::Auth,
+        send: &UnboundedSender<protocol::Packet>,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
-        let streams_lock = self.streams.read().await;
-        let stream = streams_lock
-            .get(&addr)
-            .ok_or(anyhow::anyhow!("could not find stream for client"))?;
 
         if let Some(folder_code) = auth.folder {
             // user wants to join a folder and is new
@@ -516,46 +487,45 @@ impl Server {
                 let final_hash = hasher.finalize();
                 let digest = base16ct::lower::encode_string(&final_hash);
 
-                stream
-                    .send(protocol::Packet {
-                        code: protocol::Return::NoneUnspecified as i32,
-                        message: Some(if digest == folder_pass_hash {
-                            if db
-                                .execute(
-                                    "INSERT INTO users (addr, current_folder) VALUES (?1, ?2)",
-                                    (addr.to_string(), folder_id),
-                                )
-                                .is_ok()
-                            {
-                                if let Ok(files) = Self::enum_files_from_folder(&db, folder_id) {
-                                    protocol::packet::Message::RoomInfo(protocol::RoomInfo {
-                                        id: folder_id as u64,
-                                        code: folder_code.clone(),
-                                        files,
-                                    })
-                                } else {
-                                    protocol::packet::Message::Die(protocol::Die {
-                                        reason: Some(String::from("failed to enumerate directory")),
-                                    })
-                                }
+                send.send(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(if digest == folder_pass_hash {
+                        if db
+                            .execute(
+                                "INSERT INTO users (addr, current_folder) VALUES (?1, ?2)",
+                                (addr.to_string(), folder_id),
+                            )
+                            .is_ok()
+                        {
+                            if let Ok(files) = Self::enum_files_from_folder(&db, folder_id) {
+                                protocol::packet::Message::RoomInfo(protocol::RoomInfo {
+                                    id: folder_id as u64,
+                                    code: folder_code.clone(),
+                                    files,
+                                })
                             } else {
                                 protocol::packet::Message::Die(protocol::Die {
-                                    reason: Some(String::from("could not add user to db")),
+                                    reason: Some(String::from("failed to enumerate directory")),
                                 })
                             }
                         } else {
                             protocol::packet::Message::Die(protocol::Die {
-                                reason: Some(String::from("auth failure")),
+                                reason: Some(String::from("could not add user to db")),
                             })
-                        }),
-                    })
-                    .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+                        }
+                    } else {
+                        protocol::packet::Message::Die(protocol::Die {
+                            reason: Some(String::from("auth failure")),
+                        })
+                    }),
+                })
+                .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
                 Ok(())
             })?;
         } else {
             // user wants to create a folder and is new
-            stream.send(protocol::Packet {
+            send.send(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
                 message: Some(
                     if let Ok((folder_code, folder_id)) = {
@@ -658,15 +628,11 @@ impl Server {
         self: &Arc<Self>,
         addr: SocketAddr,
         manifest: protocol::FileManifest,
+        send: &UnboundedSender<protocol::Packet>,
     ) -> anyhow::Result<()> {
-        let streams_lock = self.streams.read().await;
-        let stream = streams_lock
-            .get(&addr)
-            .ok_or(anyhow::anyhow!("could not find stream for peer"))?;
-
         // reject empty manifests
         if manifest.blocks.is_empty() {
-            stream.send(protocol::Packet {
+            send.send(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
                 message: Some(protocol::packet::Message::Die(protocol::Die {
                     reason: Some(String::from("rejecting empty manifest")),
@@ -723,7 +689,7 @@ impl Server {
                 Some(_) => {
                     tracing::debug!("file locked, rejecting {:?}", addr);
 
-                    stream.send(protocol::Packet {
+                    send.send(protocol::Packet {
                         code: protocol::Return::TransfersPending as i32,
                         message: Some(protocol::packet::Message::Manifest(manifest)),
                     })?;
@@ -765,6 +731,7 @@ impl Server {
         let delta = self
             .create_delta(
                 db,
+                manifest.version,
                 folder_id,
                 namehash,
                 &manifest.filename,
@@ -788,7 +755,7 @@ impl Server {
             .map(|s| {
                 if *s.0 == addr {
                     // tell peer to send queued manifest again if necessary
-                    s.1.send(protocol::Packet {
+                    s.1.0.send(protocol::Packet {
                         code: protocol::Return::NoneUnspecified as i32,
                         message: Some(protocol::packet::Message::SendAgain(protocol::SendAgain {
                             namehash: namehash as u64,
@@ -800,7 +767,7 @@ impl Server {
                     return Ok(());
                 }
 
-                if let Err(e) = s.1.send(protocol::Packet {
+                if let Err(e) = s.1.0.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Delta(delta.clone())),
                 }) {
@@ -836,7 +803,7 @@ impl Server {
             .await
             .iter()
             .map(|s| {
-                s.1.send(protocol::Packet {
+                s.1.0.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(protocol::Event {
                         event: protocol::FileEvent::CreateUnspecified as i32,
@@ -887,7 +854,7 @@ impl Server {
             .await
             .iter()
             .map(|s| {
-                s.1.send(protocol::Packet {
+                s.1.0.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(protocol::Event {
                         event: protocol::FileEvent::Delete as i32,
@@ -933,7 +900,7 @@ impl Server {
                     return Ok(());
                 }
 
-                s.1.send(protocol::Packet {
+                s.1.0.send(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Event(event.clone())),
                 })
@@ -956,6 +923,7 @@ impl Server {
     async fn create_delta(
         self: &Arc<Self>,
         db: PooledConnection<SqliteConnectionManager>,
+        old_version: u64,
         folder_id: i64,
         namehash: i64,
         filename: &str,
@@ -1039,6 +1007,7 @@ impl Server {
 
         // execute delta serverside
         let delta = protocol::Delta {
+            version: old_version + 1,
             size: largest_end_offset,
             filename: String::from(filename),
             origin: origin_id as u64,
@@ -1094,58 +1063,13 @@ impl Server {
         Ok(delta)
     }
 
-    async fn handle_transfer(
-        self: Arc<Self>,
-        addr: SocketAddr,
-        transfer: protocol::Transfer,
-    ) -> anyhow::Result<()> {
-        let db = self.db_pool.get()?;
-
-        let mut metadata = transfer
-            .metadata
-            .ok_or(anyhow::anyhow!("cannot handle transfer with no metadata"))?;
-
-        let namehash = metadata
-            .namehash
-            .ok_or(anyhow::anyhow!("transfer metadata missing namehash"))?;
-
-        let folder_id: i64 = db.query_row(
-            "SELECT current_folder FROM users WHERE addr = ?1",
-            [addr.to_string()],
-            |row| row.get(0),
-        )?;
-
-        let streams_lock = self.streams.read().await;
-
-        // we are getting a response
-        if let Some(data) = transfer.data {
-            let hash = xxhash_rust::xxh3::xxh3_64(&data);
-            if hash != metadata.hash {
-                tracing::debug!(
-                    "hash mismatch - {} != {} (ck: {})",
-                    hash,
-                    metadata.hash,
-                    metadata.cookie()
-                );
-                return Ok(());
-            }
-        } else {
-            // we are getting a request for block data
-        }
-
-        Ok(())
-    }
-
     async fn handle_whatis(
         self: &Arc<Self>,
         addr: SocketAddr,
         whatis: protocol::WhatIs,
+        send: &UnboundedSender<protocol::Packet>,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
-        let streams_lock = self.streams.read().await;
-        let stream = streams_lock
-            .get(&addr)
-            .ok_or(anyhow::anyhow!("could not find stream for client"))?;
 
         let folder_id: i64 = db.query_row(
             "SELECT current_folder FROM users WHERE addr = ?1",
@@ -1153,10 +1077,11 @@ impl Server {
             |row| row.get(0),
         )?;
 
-        let mut stmt = db.prepare("SELECT namehash FROM filenames WHERE name = ?1")?;
+        let mut stmt = db.prepare("SELECT namehash, version FROM filenames WHERE name = ?1")?;
 
         stmt.query_one([whatis.filename.clone()], |row| {
             let filehash = row.get::<_, i64>(0)?;
+            let current_version = row.get::<_, i64>(1)? as u64;
 
             let mut blocks_stmt = db.prepare(
                 "SELECT hash, start, end, origin FROM blocks WHERE folder = ?1 AND name = ?2",
@@ -1172,6 +1097,7 @@ impl Server {
             };
 
             let mut manifest = protocol::FileManifest {
+                version: current_version + 1,
                 filename: whatis.filename,
                 timestamp: Self::timestamp().map_err(|_| rusqlite::Error::UnwindingPanic)?,
                 size: largest_end_offset,
@@ -1194,12 +1120,11 @@ impl Server {
 
             tracing::debug!("sending manifest for file {}", manifest.filename);
 
-            stream
-                .send(protocol::Packet {
-                    code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Manifest(manifest)),
-                })
-                .map_err(|_| rusqlite::Error::UnwindingPanic)?;
+            send.send(protocol::Packet {
+                code: protocol::Return::NoneUnspecified as i32,
+                message: Some(protocol::packet::Message::Manifest(manifest)),
+            })
+            .map_err(|_| rusqlite::Error::UnwindingPanic)?;
 
             Ok(())
         })?;

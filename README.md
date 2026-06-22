@@ -6,4 +6,4 @@ similar technique to [google's cdc-file-transfer](https://github.com/google/cdc-
 
 ## current state
 
-the server stores state for every folder but i am working on having the server only store metadata and serve as a rendezvous for clients to directly send chunks to eachother
+the server stores state for every folder but i am working on having the server only store metadata and serve as a rendezvous for clients to directly send chunks to eachother. in this new system, the server acts as a relay, a file block index and a semaphore.
