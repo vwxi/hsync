@@ -670,8 +670,8 @@ impl Server {
         }
 
         let waiting: HashSet<SocketAddr> = {
-            let mut stmt = db.prepare("SELECT addr FROM users WHERE current_folder = ?1")?;
-            let mut users = stmt.query_map([folder_id], |r| r.get::<_, String>(0))?;
+            let mut stmt = db.prepare("SELECT addr FROM users WHERE current_folder = ?1 AND addr != ?2")?;
+            let mut users = stmt.query_map((folder_id, addr.to_string()), |r| r.get::<_, String>(0))?;
             let mut set = HashSet::new();
 
             while let Some(Ok(user)) = users.next() {
@@ -686,8 +686,8 @@ impl Server {
             let mut locks_lock = self.locks.lock().await;
             match locks_lock.get(&(folder_id, namehash)) {
                 // if locked, reject
-                Some(_) => {
-                    tracing::debug!("file locked, rejecting {:?}", addr);
+                Some(lock) => {
+                    tracing::debug!("file ({}, {}) locked by {:?}, rejecting {:?}", folder_id, namehash, lock.waiting, addr);
 
                     send.send(protocol::Packet {
                         code: protocol::Return::TransfersPending as i32,
@@ -762,8 +762,6 @@ impl Server {
                         })),
                     })?;
 
-                    tracing::debug!("send {} to send {} again", s.0, namehash);
-
                     return Ok(());
                 }
 
@@ -773,8 +771,6 @@ impl Server {
                 }) {
                     tracing::error!("delta broadcast error: {}", e.to_string());
                 }
-
-                tracing::debug!("sent delta to {}", *s.0);
 
                 Ok(())
             })

@@ -1,6 +1,6 @@
 use std::{collections::hash_map::Entry, net::SocketAddr, sync::Arc};
 
-use futures::future::join_all;
+use futures::{executor::block_on, future::join_all};
 use quinn::{RecvStream, SendStream};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -221,8 +221,6 @@ impl Client {
         bt: protocol::BulkTransfer, 
         send: &UnboundedSender<Ch>
     ) -> anyhow::Result<()> {
-        tracing::debug!("bulk transfer request for {} blocks", bt.blocks.len());
-
         let filepath = self.join_file_and_folder(&db.query_row(
             "SELECT name FROM filenames WHERE hash = ?1", 
             [bt.namehash as i64], 
@@ -232,8 +230,6 @@ impl Client {
         for block in bt.blocks {
             // if blocks exists, serve it
             if let Ok(r) = self.fetch_block(&db, &filepath, bt.namehash as i64, block) {
-                tracing::debug!("sending pkt {}", block.namehash());
-                
                 send.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::Transfer(protocol::Transfer { 
@@ -309,6 +305,44 @@ impl Client {
             _ => {}
         }
 
+        Ok(())
+    }
+
+    /// helper function that groups blocks by their origins and
+    /// sends out bulk transfer requests 
+    pub(crate) async fn bulk_request_blocks(&self, version: u64, namehash: u64, blocks: Vec<protocol::BlockMetadata>) -> anyhow::Result<()> {
+        blocks
+            .chunk_by(|a, b| a.origin == b.origin)
+            .map(|blocks| {
+                
+                let origin = blocks
+                    .first()
+                    .ok_or(anyhow::anyhow!("empty chunk?"))?
+                    .origin
+                    .ok_or(anyhow::anyhow!("no origin?"))?;
+
+                let num_blocks = blocks.len();
+
+                let bulk_transfer = protocol::BulkTransfer {
+                    version,
+                    namehash,
+                    blocks: blocks.to_vec(),
+                };
+
+                block_on(self.relay_id_send_once(
+                    origin,
+                    protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::BulkTransfer(bulk_transfer)),
+                    },
+                ))?;
+
+                tracing::debug!("manifest: sent ID {} a manifest for {} blocks", origin, num_blocks);
+
+                anyhow::Ok(())
+            })
+            .collect::<anyhow::Result<Vec<()>>>()?;
+        
         Ok(())
     }
 }

@@ -84,6 +84,8 @@ message Delta {
   repeated Operation ops = 7;
 }
 
+// whole (uncompressed) is the only supported data mode at the moment
+// but in the future i will add support for compressed data modes
 enum DataMode {
   DATA_MODE_WHOLE_UNSPECIFIED = 0;
   DATA_MODE_DELTA = 1;
@@ -145,6 +147,7 @@ enum Return {
   RETURN_BLOCK_NOT_FOUND = 4;
   RETURN_TRANSFERS_PENDING = 5;
   RETURN_SIZE_LIMIT = 6;
+  RETURN_NO_CHANGE = 7;
 }
 
 message Packet {

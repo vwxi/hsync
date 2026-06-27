@@ -63,7 +63,7 @@ impl Server {
     }
 
     async fn open_relay(
-        self: &Arc<Self>,
+        &self,
         addr: SocketAddr,
         open: protocol::RelayOpen,
         source_send: &UnboundedSender<protocol::Packet>,
@@ -196,14 +196,29 @@ impl Server {
         Ok(())
     }
 
-    async fn close_relay(self: &Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
+    /// close all relays for a single user
+    async fn close_all_relays_one(&self, addr: SocketAddr) -> anyhow::Result<()> {
         let mut relays_lock = self.relays.write().await;
 
+        // kill our relays from other users first then delete ourselves
+        for other in relays_lock
+            .get(&addr)
+            .ok_or(anyhow::anyhow!("relays don't exist"))?
+            .keys()
+            .cloned()
+            .collect::<Vec<SocketAddr>>() {
+            relays_lock.get_mut(&other).iter_mut().for_each(|a| { a.retain(|oa, _| *oa != addr); });
+        }
+
+        relays_lock.remove(&addr).ok_or(anyhow::anyhow!("what?"))?;
+        
+        tracing::debug!("relay: closed all relays related to {}", addr);
+        
         Ok(())
     }
 
     pub(crate) async fn relay_packet(
-        self: &Arc<Self>,
+        &self,
         addr: SocketAddr,
         pkt: protocol::Packet,
         source_send: &UnboundedSender<protocol::Packet>,
@@ -215,7 +230,7 @@ impl Server {
                 return Ok(());
             }
 
-            Some(protocol::packet::Message::RelayClose(_)) => self.close_relay(addr).await?,
+            Some(protocol::packet::Message::RelayClose(_)) => self.close_all_relays_one(addr).await?,
 
             _ => {}
         }
