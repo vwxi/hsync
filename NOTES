@@ -1,3 +1,5 @@
 p2p notes
 
-none at the moment
+broken on big files, 
+
+we should check data hash AFTER applying the delta

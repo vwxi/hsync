@@ -1044,7 +1044,10 @@ impl Client {
         }
 
         if req_blocks.is_empty() {
-            tracing::debug!("delta: we have no deltas we are waiting on. tell the server we're done");
+            tracing::debug!("delta: no deltas to wait on, apply delta and notify done");
+            
+            self.apply_journaled_delta(db, namehash, delta.cookie as i64).await?;
+            self.clear_file_temp_data(namehash, ClearFlags::Transfers | ClearFlags::Queue).await?;
             
             self.send_ch.as_ref().map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,

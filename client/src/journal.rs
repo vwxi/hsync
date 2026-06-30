@@ -276,12 +276,22 @@ impl Client {
             .open(filepath)?;
 
         // fetch delta ops sorted in proper order
+        // deletes order start offsets descending
+        // everything else ascending
+        // this way we don't mess up the offsets of anything 
         let mut stmt = db.prepare(
             "SELECT ROWID, hash, start, end, op FROM journal WHERE file = ?1 AND cookie = ?2
-             ORDER BY ROWID ASC",
+             ORDER BY 
+             CASE WHEN op = ?3 THEN start END DESC,
+             CASE WHEN op <> ?3 THEN start END ASC",
         )?;
 
-        let mut ops = stmt.query([namehash, cookie])?;
+        let mut ops = stmt.query([
+            namehash, 
+            cookie, 
+            protocol::delta::OpType::Delete as i64, 
+        ])?;
+
         let mut count = 0u64;
 
         while let Ok(Some(row)) = ops.next() {
@@ -295,9 +305,18 @@ impl Client {
 
             let size_to_read = (end - start) as usize;
 
+            tracing::debug!("delta: {:?} [{}, {}] ({}) ", op, start, end, hash);
+            
             match op {
                 protocol::delta::OpType::Delete => {
                     Self::truncate_range(&mut file, start, end)?;
+
+                    db.execute(
+                        "DELETE FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4",
+                        [namehash as i64, start as i64, end as i64, hash as i64],
+                    )?;
+
+                    tracing::debug!("delta: {namehash}: delete [{start}, {end}] (hash: {hash})");
                 }
 
                 protocol::delta::OpType::Insert | protocol::delta::OpType::EqualUnspecified => {
@@ -321,6 +340,7 @@ impl Client {
                 }
             }
 
+            // remove entry from journal
             db.execute(
                 "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 AND cookie = ?5",
                 [
@@ -332,10 +352,12 @@ impl Client {
                 ],
             )?;
 
-            db.execute(
-                "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                [namehash as i64, start as i64, end as i64, hash as i64],
-            )?;
+            if op != protocol::delta::OpType::Delete {
+                db.execute(
+                    "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                    [namehash as i64, start as i64, end as i64, hash as i64],
+                )?;
+            }
 
             count += 1;
         }
