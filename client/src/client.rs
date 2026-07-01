@@ -522,6 +522,26 @@ impl Client {
         Ok(())
     }
 
+    async fn send_queued_manifest(&self, namehash: i64) -> anyhow::Result<()> {
+        let mut queue_lock = self.queued_manifests.lock().await;
+        
+        let queue = queue_lock.get_mut(&namehash).ok_or(anyhow::anyhow!("could not acquire queue for namehash"))?;
+        let manifest = queue.pop_front().ok_or(anyhow::anyhow!("queue for namehash is empty"))?;
+
+        if queue.is_empty() {
+            queue_lock.remove(&namehash).ok_or(anyhow::anyhow!("queue doesn't exist in queue list but is used anyways?"))?;
+
+            tracing::debug!("manifest: removed queue for {namehash}");
+        }
+
+        self.send_ch.as_ref().map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
+            code: protocol::Return::NoneUnspecified as i32,
+            message: Some(protocol::packet::Message::Manifest(manifest.1)),
+        }))).ok_or(anyhow::anyhow!("could not send a manifest we were waiting on"))??;
+
+        Ok(())
+    }
+
     async fn handle_file_event(
         &mut self,
         event: notify_debouncer_full::DebouncedEvent,
@@ -868,7 +888,7 @@ impl Client {
                         self.apply_journaled_delta(db, namehash, metadata.cookie() as i64)
                             .await?;
 
-                        self.clear_file_temp_data(namehash, ClearFlags::Transfers | ClearFlags::Queue).await?;
+                        self.clear_file_temp_data(namehash, ClearFlags::Transfers).await?;
 
                         self.send_ch.as_ref().map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
                             code: protocol::Return::NoneUnspecified as i32,
@@ -879,6 +899,10 @@ impl Client {
                                 },
                             )),
                         }))).ok_or(anyhow::anyhow!("could not tell server we were done"))??;
+
+                        // we cannot care about the result of this
+                        // but send a queued manifest if any
+                        let _ = block_on(self.send_queued_manifest(namehash));
                     }
                 }
             }
@@ -921,11 +945,6 @@ impl Client {
         let db = self.db_pool.get()?;
         let filepath = self.join_file_and_folder(&delta.filename)?;
         let namehash = xxhash_rust::xxh3::xxh3_64(delta.filename.as_bytes()) as i64;
-
-        {
-            let mut queue_lock = self.queued_manifests.lock().await;
-            queue_lock.remove(&namehash);
-        }
 
         // we don't have this file yet or the file is wrong with stuff queued, we should ask for it
         if !self
@@ -1047,7 +1066,7 @@ impl Client {
             tracing::debug!("delta: no deltas to wait on, apply delta and notify done");
             
             self.apply_journaled_delta(db, namehash, delta.cookie as i64).await?;
-            self.clear_file_temp_data(namehash, ClearFlags::Transfers | ClearFlags::Queue).await?;
+            self.clear_file_temp_data(namehash, ClearFlags::all()).await?;
             
             self.send_ch.as_ref().map(|ch| ch.send(Ch::OutPacket(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
@@ -1334,25 +1353,27 @@ impl Client {
 
     /// remove all accounting data related to a file hash
     async fn clear_file_temp_data(&self, namehash: i64, flags: ClearFlags) -> anyhow::Result<()> {
+        // fuck this crate in its ass
+        // why can't i have async here
         bitflags::bitflags_match!(flags, {
             ClearFlags::Transfers => {
-                tracing::debug!("delete transfers for {namehash}");
+                tracing::debug!("gc: delete transfers for {namehash}");
 
-                let mut transfers_lock = self.outgoing_transfer_requests.blocking_lock();
+                let mut transfers_lock = block_on(self.outgoing_transfer_requests.lock());
                 transfers_lock.remove(&namehash);
             },
 
             ClearFlags::Accesses => {
-                tracing::debug!("delete accesses for {namehash}");
+                tracing::debug!("gc: delete accesses for {namehash}");
 
-                let mut accesses_lock = self.current_accesses.blocking_lock();
+                let mut accesses_lock = block_on(self.current_accesses.lock());
                 accesses_lock.remove(&namehash);
             },
 
             ClearFlags::Queue => {
-                tracing::debug!("delete queue for {namehash}");
+                tracing::debug!("gc: delete queue for {namehash}");
 
-                let mut queue_lock = self.queued_manifests.blocking_lock();
+                let mut queue_lock = block_on(self.queued_manifests.lock());
                 queue_lock.remove(&namehash);
             },
 
@@ -1364,40 +1385,20 @@ impl Client {
 
     async fn handle_sendagain(&mut self, sendagain: protocol::SendAgain) -> anyhow::Result<()> {
         // if there's a queued manifest, send it over now
-        let mut queue_lock = self.queued_manifests.lock().await;
-
-        self.send_ch.as_ref().map(|ch| {
-            ch.send(Ch::OutPacket(protocol::Packet {
-                code: protocol::Return::NoneUnspecified as i32,
-                message: Some(
-                    // we should resend a manifest
-                    if let Some(queue) = queue_lock.get_mut(&(sendagain.namehash as i64)) {
-                        if let Some(next_manifest) = queue.pop_front() {
-                            if queue.is_empty() {
-                                tracing::debug!("clear queue for {}", sendagain.namehash);
-
-                                queue_lock.remove(&(sendagain.namehash as i64));
-                            }
-
-                            tracing::warn!("sending queued manifest for {}", sendagain.namehash);
-
-                            protocol::packet::Message::Manifest(next_manifest.1)
-                        } else {
-                            protocol::packet::Message::Done(protocol::TransferDone {
-                                namehash: sendagain.namehash,
-                                cookie: None,
-                            })
-                        }
-                    } else {
+        if block_on(self.send_queued_manifest(sendagain.namehash as i64)).is_err() {
+            self.send_ch.as_ref().map(|ch| {
+                ch.send(Ch::OutPacket(protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some( 
                         // we are done and should send a done to unlock the file on the server
                         protocol::packet::Message::Done(protocol::TransferDone {
                             namehash: sendagain.namehash,
                             cookie: None,
                         })
-                    },
-                ),
-            }))
-        });
+                    ),
+                }))
+            }).ok_or(anyhow::anyhow!("could not send done to server"))??;
+        }
 
         Ok(())
     }
