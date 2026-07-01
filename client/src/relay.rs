@@ -47,6 +47,8 @@ impl Client {
             tokio::task::spawn(async move {
                 signal.1.await?;
 
+                tracing::debug!("relay: opened for {id}");
+                
                 let relays_lock = relays.lock().await;
                 let relay = relays_lock
                     .get(&id)
@@ -337,7 +339,7 @@ impl Client {
                     },
                 ))?;
 
-                tracing::debug!("manifest: sent ID {} a manifest for {} blocks", origin, num_blocks);
+                tracing::debug!("bulk: sent ID {} a transfer request for {} blocks", origin, num_blocks);
 
                 anyhow::Ok(())
             })

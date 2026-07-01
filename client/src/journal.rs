@@ -146,11 +146,6 @@ impl Client {
                         Self::modify_block(&mut file, metadata.start, &data)?;
                     }
 
-                    tokio::task::block_in_place(|| {
-                        let mut accesses_lock = self.current_accesses.blocking_lock();
-                        accesses_lock.remove(&namehash);
-                    });
-
                     // insert into main block
                     db.execute(
                         "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",

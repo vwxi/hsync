@@ -611,7 +611,7 @@ impl Client {
                     "UPDATE filenames SET version = version + 1 WHERE hash = ?1 RETURNING version",
                     [namehash],
                     |r| r.get::<_, i64>(0),
-                )? as u64)
+                ).unwrap_or(1i64) as u64)
                     .saturating_sub(1);
 
                 // if this fails, then we are trying to fetch some sort of swap file
@@ -843,6 +843,12 @@ impl Client {
 
             let mut transfers_lock = self.outgoing_transfer_requests.lock().await;
 
+            // add access to set
+            {
+                let mut accesses_lock = self.current_accesses.lock().await;
+                accesses_lock.insert(namehash);
+            }
+
             if let Some(entry) = transfers_lock.get_mut(&namehash) {
                 if let Some(t) = entry.iter().find(|e| {
                     e.start == metadata.start
@@ -856,12 +862,6 @@ impl Client {
                             && e.end == metadata.end
                             && e.cookie == metadata.cookie)
                     });
-
-                    // add access to set
-                    {
-                        let mut accesses_lock = self.current_accesses.lock().await;
-                        accesses_lock.insert(namehash);
-                    }
 
                     Self::hydrate_block(
                         &db,
