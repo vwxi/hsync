@@ -1,11 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    ffi::{OsStr, OsString},
-    fs::metadata,
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::{ffi::OsStrExt, fs::FileExt},
-    path::PathBuf,
-    sync::Arc,
+    collections::{HashMap, HashSet, VecDeque}, ffi::{OsStr, OsString}, fs::metadata, io::{Read, Seek, SeekFrom, Write}, os::unix::{ffi::OsStrExt, fs::FileExt}, path::PathBuf, sync::Arc, time::Duration,
 };
 
 use futures::{StreamExt, executor::block_on, future::join_all};
@@ -151,6 +145,7 @@ pub struct Client {
     outgoing_manifest_requests: Arc<Mutex<HashSet<i64>>>,
     /// (cookie, manifest)
     queued_manifests: Arc<Mutex<HashMap<i64, VecDeque<(u64, protocol::FileManifest)>>>>,
+    pub(crate) relay_message_queue: Arc<Mutex<HashMap<u64, Vec<protocol::Packet>>>>,
     pub(crate) relays: Arc<Mutex<HashMap<u64, Relay>>>,
 }
 
@@ -262,11 +257,15 @@ impl Client {
             outgoing_transfer_requests: Arc::new(Mutex::new(HashMap::new())),
             outgoing_manifest_requests: Arc::new(Mutex::new(HashSet::new())),
             queued_manifests: Arc::new(Mutex::new(HashMap::new())),
+            relay_message_queue: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
         };
 
         {
             let conn = client.db_pool.get()?;
+
+            conn.pragma_update(Some(rusqlite::MAIN_DB.to_str()?), "journal_mode", "WAL")?;
+            
             conn.execute(CREATE_FILENAMES_STMT, ())?;
             conn.execute(CREATE_BLOCKS_STMT, ())?;
             conn.execute(CREATE_JOURNAL_STMT, ())?;
@@ -1107,7 +1106,8 @@ impl Client {
         )?;
 
         if !parent.exists() {
-            std::fs::create_dir(parent)?;
+            tracing::debug!("parent: {:?}", parent);
+            std::fs::create_dir_all(parent)?;
         }
 
         if metadata(&filepath).is_err() {
@@ -1137,8 +1137,8 @@ impl Client {
             return Ok(());
         }
 
-        db.execute("DELETE FROM blocks WHERE file = ?1", [namehash])?;
-        db.execute("DELETE FROM filenames WHERE hash = ?1", [namehash])?;
+        Self::db_keep_trying(|| db.execute("DELETE FROM blocks WHERE file = ?1", [namehash]))?;
+        Self::db_keep_trying(|| db.execute("DELETE FROM filenames WHERE hash = ?1", [namehash]))?;
 
         tracing::debug!("deleted all blocks related to file {} in folder", namehash,);
 
@@ -1479,14 +1479,10 @@ impl Client {
     async fn handle_done(&mut self, done: protocol::TransferDone) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
-        let cookie = done
-            .cookie
-            .ok_or(anyhow::anyhow!("server should always send cookie for gc"))?;
-
-        db.execute(
+        Self::db_keep_trying(|| db.execute(
             "DELETE FROM journal WHERE file = ?1 AND cookie = ?2",
-            [done.namehash as i64, cookie as i64],
-        )?;
+            [done.namehash as i64, done.cookie() as i64],
+        ))?;
 
         //tracing::debug!("journal: gc namehash {} cookie {}", done.namehash, cookie);
 

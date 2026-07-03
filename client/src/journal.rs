@@ -100,14 +100,9 @@ impl Client {
         Ok(())
     }
 
-    /// this is for pending blocks being sent to the server,
-    /// transferring the block from journal to main block table.
-    /// this procedure differs from receiving an external change
-    /// because although they operate on the same journal they
-    /// do not cross paths
-    /// 
-    /// this function returns an error if there is really no possible
-    /// data entry fitting the metadata
+    /// fetch a block to serve. the block will come from these origins in this order:
+    /// - the journal
+    /// - underlying file data
     pub(crate) fn fetch_block(
         &self,
         db: &PooledConnection<SqliteConnectionManager>,
@@ -119,8 +114,8 @@ impl Client {
         // otherwise, get it from the main table
         if let Some(cookie) = metadata.cookie {
             match db.query_one(
-                "SELECT ROWID, hash FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND cookie = ?4 LIMIT 1",
-                [namehash, metadata.start as i64, metadata.end as i64, cookie as i64],
+                "SELECT ROWID FROM journal WHERE file = ?1 AND hash = ?2 AND cookie = ?3 LIMIT 1",
+                [namehash, metadata.hash as i64, cookie as i64],
                 |r| r.get::<_, i64>(0),
             ) {
                 Ok(rowid) => {
@@ -129,22 +124,6 @@ impl Client {
                     let mut contents =
                         db.blob_open(rusqlite::MAIN_DB, "journal", "contents", rowid, true)?;
                     contents.read_exact(&mut data)?;
-
-                    // write journaled block to file
-
-                    tokio::task::block_in_place(|| {
-                        let mut accesses_lock = self.current_accesses.blocking_lock();
-                        accesses_lock.insert(namehash);
-                    });
-
-                    {
-                        let mut file = std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(filepath)?;
-
-                        Self::modify_block(&mut file, metadata.start, &data)?;
-                    }
 
                     // insert into main block
                     db.execute(
@@ -156,8 +135,6 @@ impl Client {
                             metadata.hash as i64,
                         ],
                     )?;
-
-                    // don't delete yet
 
                     // tracing::debug!(
                     //     "journal: fetched block {}:[{}, {}] (ck: {:?})",
@@ -189,15 +166,15 @@ impl Client {
                             anyhow::bail!("bad datahash in fetch_block");
                         }
                     })() {
-                        db.execute(
-                            "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
-                            [
-                                namehash as i64,
-                                metadata.start as i64,
-                                metadata.end as i64,
-                                metadata.hash as i64,
-                            ],
-                        )?;
+                        // db.execute(
+                        //     "INSERT OR REPLACE INTO blocks (file, start, end, hash) VALUES (?1, ?2, ?3, ?4)",
+                        //     [
+                        //         namehash as i64,
+                        //         metadata.start as i64,
+                        //         metadata.end as i64,
+                        //         metadata.hash as i64,
+                        //     ],
+                        // )?;
 
                         tracing::debug!(
                             "fs: fetched block {}:[{}, {}] (ck: {:?})",

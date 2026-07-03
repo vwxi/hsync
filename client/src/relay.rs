@@ -1,4 +1,4 @@
-use std::{collections::hash_map::Entry, net::SocketAddr, sync::Arc};
+use std::{collections::{VecDeque, hash_map::Entry}, net::SocketAddr, sync::Arc};
 
 use futures::{executor::block_on, future::join_all};
 use quinn::{RecvStream, SendStream};
@@ -18,6 +18,7 @@ pub(crate) struct Relay {
 }
 
 impl Client {
+    /// send a message if the relay exists. otherwise, create a relay and send when it is ready
     pub(crate) async fn relay_id_send_many(
         &self,
         id: u64,
@@ -34,8 +35,23 @@ impl Client {
                 }
             });
         } else {
+            {
+                let mut mqueue_lock = self.relay_message_queue.lock().await;
+
+                if let Some(entry) = mqueue_lock.get_mut(&id) {
+                    tracing::debug!("relay: queueing {} message(s) for {}", messages.len(), id);
+                    
+                    messages.into_iter().for_each(|m| entry.push(m));
+                    
+                    return Ok(());
+                } else {
+                    mqueue_lock.insert(id, messages);
+                }
+            }
+
             let signal = oneshot::channel();
 
+            // if id has a message queue, add to it. otherwise create one
             self.send_ch
                 .as_ref()
                 .map(|ch| ch.send(Ch::OpenStream(id, signal.0)))
@@ -44,6 +60,7 @@ impl Client {
             drop(relays_lock);
 
             let relays = self.relays.clone();
+            let relay_message_queue = self.relay_message_queue.clone();
             tokio::task::spawn(async move {
                 signal.1.await?;
 
@@ -64,14 +81,16 @@ impl Client {
                     })),
                 }))?;
 
-                messages
-                    .into_iter()
-                    .map(|m| {
-                        relay.send.send(Ch::OutPacket(m))?;
-
-                        anyhow::Ok(())
-                    })
-                    .collect::<anyhow::Result<Vec<()>>>()?;
+                {
+                    let mut mqueue_lock = relay_message_queue.lock().await;
+                    // consume the queue
+                    if let Some(queue) = mqueue_lock.remove(&id) {
+                        // it's fifo
+                        for message in queue {
+                            relay.send.send(Ch::OutPacket(message))?;
+                        }
+                    }
+                }
 
                 anyhow::Ok(())
             });

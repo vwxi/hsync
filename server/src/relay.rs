@@ -47,7 +47,6 @@ impl Server {
                         Ok(Some(pkt)) => {
                             if let Err(e) = self.relay_packet(addr, pkt, &chan.0, &mut recipient_addr).await {
                                 tracing::error!("aux packet handler: {}", e.to_string());
-                                chan.1.close();
                             }
                         }
 
@@ -197,7 +196,7 @@ impl Server {
     }
 
     /// close all relays for a single user
-    async fn close_all_relays_one(&self, addr: SocketAddr) -> anyhow::Result<()> {
+    pub(crate) async fn close_all_relays_one(&self, addr: SocketAddr) -> anyhow::Result<()> {
         let mut relays_lock = self.relays.write().await;
 
         // kill our relays from other users first then delete ourselves
@@ -219,30 +218,39 @@ impl Server {
 
     pub(crate) async fn relay_packet(
         &self,
-        addr: SocketAddr,
+        s_addr: SocketAddr,
         pkt: protocol::Packet,
         source_send: &UnboundedSender<protocol::Packet>,
         recipient_addr: &mut Option<SocketAddr>,
     ) -> anyhow::Result<()> {
         match pkt.message {
             Some(protocol::packet::Message::RelayOpen(open)) => {
-                self.open_relay(addr, open, source_send, recipient_addr,).await?;
+                self.open_relay(s_addr, open, source_send, recipient_addr,).await?;
                 return Ok(());
             }
 
-            Some(protocol::packet::Message::RelayClose(_)) => self.close_all_relays_one(addr).await?,
+            Some(protocol::packet::Message::RelayClose(_)) => self.close_all_relays_one(s_addr).await?,
 
             _ => {}
         }
 
         let relays_lock = self.relays.read().await;
-        recipient_addr.map(|r_addr| {
-            relays_lock
-                .get(&addr)
-                .map(|r_map| r_map.get(&r_addr))
-                .flatten()
-                .map(|relay| relay.recipient_send.send(pkt))
-        }).ok_or(anyhow::anyhow!("could not relay packet"))?;
+
+        if let Some(r_addr) = recipient_addr {
+            // does a relay map exist for the source?
+            if let Some(s_map) = relays_lock.get(&s_addr) {
+                // does a relay to the recipient exist?
+                if let Some(r_relay) = s_map.get(&r_addr) {
+                    r_relay.recipient_send.send(pkt)?;
+                } else {
+                    tracing::error!("relay: relay for {s_addr} -> {r_addr} does not exist");
+                }
+            } else {
+                tracing::error!("relay: relay map for {s_addr} does not exist");
+            }
+        } else {
+            tracing::error!("relay: attempting to send a message over a relay without a recipient");
+        }
 
         Ok(())
     }

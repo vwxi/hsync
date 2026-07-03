@@ -8,6 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::client::{Client, protocol};
 
+pub(crate) const DB_ATTEMPTS: u64 = 8;
+
 bitflags::bitflags! {
     #[derive(PartialEq, Eq)]
     pub(crate) struct ClearFlags: u8 {
@@ -36,7 +38,6 @@ impl Client {
         let len = match stream.read_u32().await {
             Ok(len) => len,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                tracing::error!("stream: {:?} {:?}", stream.id().initiator(), stream.id());
                 return Ok(None)
             },
             Err(e) => return Err(e.into()),
@@ -99,5 +100,13 @@ impl Client {
         Ok(std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
             .as_secs())
+    }
+
+    /// bullshit function to keep trying to execute something on the db
+    /// in case db keeps locking
+    pub(crate) fn db_keep_trying<T: Fn() -> Result<usize, rusqlite::Error>>(f: T) -> anyhow::Result<()> {
+        while f().is_err() {}
+
+        Ok(())
     }
 }

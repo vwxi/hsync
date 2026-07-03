@@ -140,6 +140,9 @@ impl Server {
         let pool = Pool::new(manager)?;
         {
             let conn = pool.get()?;
+
+            conn.pragma_update(Some(rusqlite::MAIN_DB.to_str()?), "journal_mode", "WAL")?;
+
             conn.execute(CREATE_USERS_STMT, ())?;
             conn.execute(CREATE_FOLDERS_STMT, ())?;
             conn.execute(CREATE_FILENAMES_STMT, ())?;
@@ -267,7 +270,7 @@ impl Server {
                         }
 
                         Ok(origin_bidi) = conn.accept_bi() => {
-                            tracing::debug!("accepted aux stream {}", origin_bidi.0.id());
+                            tracing::debug!("accepted aux stream {} from {}", origin_bidi.0.id(), conn.remote_address());
 
                             let chan = unbounded_channel::<protocol::Packet>();
 
@@ -283,7 +286,7 @@ impl Server {
                             match p {
                                 Ok(Some(pkt)) => {
                                     if let Err(e) = self2.handle_packet(conn.remote_address(), pkt, &send).await {
-                                        tracing::error!("packet handler: {}", e.to_string());
+                                        tracing::error!("packet handler: {}, {}", e.to_string(), e.backtrace());
                                     }
                                 }
 
@@ -619,6 +622,19 @@ impl Server {
                 .ok_or(anyhow::anyhow!("tried to remove non-existant stream"))?;
         }
 
+        // remove from all file lock waiting lists
+        {
+            let mut locks_lock = self.locks.lock().await;
+            locks_lock.retain(|_, lock| {
+                lock.waiting.remove(&addr);
+
+                lock.by != addr
+            });
+        }
+
+        // remove any relays
+        self.close_all_relays_one(addr).await?;
+
         tracing::debug!("peer {} disconnected: {:?}", addr, die.reason);
 
         Ok(())
@@ -630,19 +646,21 @@ impl Server {
         manifest: protocol::FileManifest,
         send: &UnboundedSender<protocol::Packet>,
     ) -> anyhow::Result<()> {
-        // reject empty manifests
+        let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
+
+        // reject empty manifest by telling it that we are finished with it
         if manifest.blocks.is_empty() {
             send.send(protocol::Packet {
                 code: protocol::Return::NoneUnspecified as i32,
-                message: Some(protocol::packet::Message::Die(protocol::Die {
-                    reason: Some(String::from("rejecting empty manifest")),
+                message: Some(protocol::packet::Message::Done(protocol::TransferDone {
+                    namehash: namehash as u64,
+                    cookie: manifest.cookie,
                 })),
             })?;
 
             return Ok(());
         }
 
-        let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
 
         let db = self.db_pool.get()?;
 
