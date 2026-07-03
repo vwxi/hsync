@@ -231,9 +231,9 @@ impl Client {
             }),
         ];
 
-        join_all(futs).await;
-
         tracing::debug!("relay: handled new relay");
+
+        join_all(futs).await;
     }
 
     pub(crate) async fn handle_bulk_transfer(
@@ -259,6 +259,10 @@ impl Client {
                         data: Some(r) 
                     }))
                 }))?;
+
+                tracing::debug!("served file {} block {}", filepath.to_string_lossy(), bt.namehash);
+            } else {
+                tracing::error!("failed to get block {} for {}", bt.namehash, filepath.to_string_lossy());
             }
         }
 

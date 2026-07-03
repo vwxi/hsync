@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Config, relay::Relay};
+use crate::{Config, relay::{RELAY_BUFSZ, Relay}};
 use anyhow::Context;
 use blake2::Digest;
 use futures::future::join_all;
@@ -18,11 +18,8 @@ use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rusqlite::fallible_iterator::FallibleIterator;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    select,
-    sync::{
-        Mutex, RwLock,
-        mpsc::{UnboundedSender, unbounded_channel},
+    io::{AsyncReadExt, AsyncWriteExt}, select, sync::{
+        Mutex, RwLock, mpsc::{UnboundedSender, channel, unbounded_channel},
     },
 };
 use tracing::{Instrument, Span};
@@ -272,7 +269,7 @@ impl Server {
                         Ok(origin_bidi) = conn.accept_bi() => {
                             tracing::debug!("accepted aux stream {} from {}", origin_bidi.0.id(), conn.remote_address());
 
-                            let chan = unbounded_channel::<protocol::Packet>();
+                            let chan = channel::<protocol::Packet>(RELAY_BUFSZ);
 
                             tokio::spawn(self2.clone().handle_incoming_relay(
                                 conn.remote_address(),
@@ -409,12 +406,13 @@ impl Server {
         db: &PooledConnection<SqliteConnectionManager>,
         folder_id: i64,
     ) -> anyhow::Result<Vec<protocol::room_info::File>> {
-        let mut stmt = db.prepare("SELECT name FROM filenames WHERE folder = ?1")?;
+        let mut stmt = db.prepare("SELECT name, datahash FROM filenames WHERE folder = ?1")?;
         Ok(stmt
             .query_map([folder_id], |r| {
                 let name = r.get::<_, String>(0)?;
+                let hash = r.get::<_, i64>(1)? as u64;
 
-                Ok(protocol::room_info::File { name })
+                Ok(protocol::room_info::File { name, hash })
             })?
             .filter_map(|r| r.ok())
             .collect::<Vec<protocol::room_info::File>>())
@@ -569,17 +567,7 @@ impl Server {
 
                         Ok::<(String, i64), anyhow::Error>((folder_code, folder_id))
                     } {
-                        let mut stmt =
-                            db.prepare("SELECT name FROM filenames WHERE folder = ?1")?;
-
-                        let files: Vec<protocol::room_info::File> = stmt
-                            .query_map([folder_id], |row| {
-                                let name = row.get::<_, String>(0)?;
-
-                                Ok(protocol::room_info::File { name })
-                            })?
-                            .filter_map(|r| r.ok())
-                            .collect();
+                        let files = Self::enum_files_from_folder(&db, folder_id)?;
 
                         protocol::packet::Message::RoomInfo(protocol::RoomInfo {
                             id: folder_id as u64,

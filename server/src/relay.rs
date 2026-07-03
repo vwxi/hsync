@@ -1,16 +1,19 @@
 //! there is only one relay per pair of clients
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{any::Any, collections::HashMap, net::SocketAddr, sync::Arc};
 
 use quinn::{Connection, RecvStream, SendStream};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::server::{Server, protocol};
 
+pub(crate) const RELAY_BUFSZ: usize = 32;
+
 pub(crate) struct Relay {
-    pub(crate) source_send: UnboundedSender<protocol::Packet>,
-    pub(crate) recipient_send: UnboundedSender<protocol::Packet>,
+    pub(crate) source_send: Sender<protocol::Packet>,
+    pub(crate) recipient_send: Sender<protocol::Packet>,
+    token: CancellationToken,
 }
 
 impl Server {
@@ -20,18 +23,25 @@ impl Server {
         token: CancellationToken,
         mut bidi: (SendStream, RecvStream),
         mut chan: (
-            UnboundedSender<protocol::Packet>,
-            UnboundedReceiver<protocol::Packet>,
+            Sender<protocol::Packet>,
+            Receiver<protocol::Packet>,
         ),
     ) {
+        let kill_token = CancellationToken::new();
         let mut recipient_addr: Option<SocketAddr> = None;
 
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
+                    tracing::debug!("relay: relay for {} <-> {:?} closed externally", addr, recipient_addr);
                     break;
                 }
 
+                _ = kill_token.cancelled() => {
+                    tracing::debug!("relay: relay for {} <-> {:?} closed internally", addr, recipient_addr);
+                    break;
+                }
+                
                 // outbound messages
                 Some(p) = chan.1.recv() => {
                     if let Err(e) = Self::write_packet(&mut bidi.0, &p).await {
@@ -47,6 +57,7 @@ impl Server {
                         Ok(Some(pkt)) => {
                             if let Err(e) = self.relay_packet(addr, pkt, &chan.0, &mut recipient_addr).await {
                                 tracing::error!("aux packet handler: {}", e.to_string());
+                                kill_token.cancel();
                             }
                         }
 
@@ -65,7 +76,7 @@ impl Server {
         &self,
         addr: SocketAddr,
         open: protocol::RelayOpen,
-        source_send: &UnboundedSender<protocol::Packet>,
+        source_send: &Sender<protocol::Packet>,
         recipient_addr: &mut Option<SocketAddr>,
     ) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
@@ -94,7 +105,9 @@ impl Server {
             .is_none()
         {
             // create a channel for source->recipient
-            let mut r_chan = unbounded_channel::<protocol::Packet>();
+            let mut r_chan = channel::<protocol::Packet>(RELAY_BUFSZ);
+
+            let kill_token = CancellationToken::new();
 
             // open a new stream on the recipients end
             let (mut r_send, mut r_recv) = {
@@ -123,24 +136,32 @@ impl Server {
             
             // create recipient->source listener
             let source_send_ = source_send.clone();
+            let kill_token_ = kill_token.clone();
             tokio::task::spawn(async move {
-                while let Ok(Some(r_pkt)) = Self::read_packet(&mut r_recv).await {
-                    match r_pkt.message {
-                        // ignore this type of message
-                        Some(protocol::packet::Message::RelayOpen(_)) => {
-                            continue;
+                loop {
+                    tokio::select! {
+                        _ = kill_token_.cancelled() => {
+                            tracing::debug!("relay: single-way relay {} -> {} closed internally", relay_addr, addr);
+                            return;
                         }
 
-                        Some(protocol::packet::Message::RelayClose(_)) => {
-                            break;
+                        Ok(Some(r_pkt)) = Self::read_packet(&mut r_recv) => {
+                            match r_pkt.message {
+                                // ignore this type of message
+                                Some(protocol::packet::Message::RelayOpen(_)) => {}
+
+                                Some(protocol::packet::Message::RelayClose(_)) => {
+                                    kill_token_.cancel();
+                                    return;
+                                }
+
+                                _ => if let Err(e) = source_send_.send(r_pkt).await {
+                                    tracing::error!("relay {} -> {} write: {}", relay_addr, addr, e.to_string());
+                                    kill_token_.cancel();
+                                    return;
+                                }
+                            };
                         }
-
-                        _ => {}
-                    };
-
-                    if let Err(e) = source_send_.send(r_pkt) {
-                        tracing::error!("relay {} -> {} write: {}", relay_addr, addr, e.to_string());
-                        break;
                     }
                 }
             });
@@ -151,11 +172,25 @@ impl Server {
             // wasn't being used.
 
             // create source->recipient listener
+            let kill_token_ = kill_token.clone();
             tokio::task::spawn(async move {
-                while let Some(s_pkt) = r_chan.1.recv().await {
-                    if let Err(e) = Self::write_packet(&mut r_send, &s_pkt).await {
-                        tracing::error!("relay {} -> {} write: {}", addr, relay_addr, e.to_string());
-                        break;
+                loop {
+                    tokio::select! {
+                        _ = kill_token_.cancelled() => {
+                            tracing::debug!("relay: single-way relay {} -> {} closed internally", relay_addr, addr);
+                            return;
+                        }
+
+
+                        Some(s_pkt) = r_chan.1.recv() => {
+                            tracing::debug!("relay pkt {:?} for {} -> {}", s_pkt.message.as_ref().map(|rp| rp.type_id()), addr, relay_addr);
+
+                            if let Err(e) = Self::write_packet(&mut r_send, &s_pkt).await {
+                                tracing::error!("relay {} -> {} write: {}", addr, relay_addr, e.to_string());
+                                kill_token_.cancel();
+                                return;
+                            }
+                        }
                     }
                 }
             });
@@ -169,6 +204,7 @@ impl Server {
                             Relay {
                                 source_send: source_send.clone(),
                                 recipient_send: r_chan.0.clone(),
+                                token: kill_token.clone(),
                             },
                         );
                     }
@@ -181,6 +217,7 @@ impl Server {
                         Relay {
                             source_send: source_send.clone(),
                             recipient_send: r_chan.0.clone(),
+                            token: kill_token,
                         },
                     );
 
@@ -206,7 +243,15 @@ impl Server {
             .keys()
             .cloned()
             .collect::<Vec<SocketAddr>>() {
-            relays_lock.get_mut(&other).iter_mut().for_each(|a| { a.retain(|oa, _| *oa != addr); });
+            relays_lock.get_mut(&other).iter_mut().for_each(|a| { 
+                a.retain(|oa, r| {
+                    if *oa == addr {
+                        r.token.cancel();
+                    }
+
+                    *oa != addr
+                }); 
+            });
         }
 
         relays_lock.remove(&addr).ok_or(anyhow::anyhow!("what?"))?;
@@ -220,7 +265,7 @@ impl Server {
         &self,
         s_addr: SocketAddr,
         pkt: protocol::Packet,
-        source_send: &UnboundedSender<protocol::Packet>,
+        source_send: &Sender<protocol::Packet>,
         recipient_addr: &mut Option<SocketAddr>,
     ) -> anyhow::Result<()> {
         match pkt.message {
@@ -229,8 +274,10 @@ impl Server {
                 return Ok(());
             }
 
-            Some(protocol::packet::Message::RelayClose(_)) => self.close_all_relays_one(s_addr).await?,
-
+            Some(protocol::packet::Message::RelayClose(_)) => {                
+                self.close_all_relays_one(s_addr).await?;
+            },
+            
             _ => {}
         }
 
@@ -241,7 +288,7 @@ impl Server {
             if let Some(s_map) = relays_lock.get(&s_addr) {
                 // does a relay to the recipient exist?
                 if let Some(r_relay) = s_map.get(&r_addr) {
-                    r_relay.recipient_send.send(pkt)?;
+                    r_relay.recipient_send.send(pkt).await?;
                 } else {
                     tracing::error!("relay: relay for {s_addr} -> {r_addr} does not exist");
                 }

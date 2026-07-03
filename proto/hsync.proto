@@ -15,6 +15,7 @@ message Auth {
 message RoomInfo {
   message File {
     string name = 1;
+    uint64 hash = 2;
   }
 
   uint64 id = 1;

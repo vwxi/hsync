@@ -692,11 +692,12 @@ impl Client {
 
         let db = self.db_pool.get()?;
         for file in room_info.files {
-            let mut stmt = db.prepare("SELECT * FROM filenames WHERE name = ?1")?;
+            let mut stmt = db.prepare("SELECT hash FROM filenames WHERE name = ?1")?;
+            let hash = stmt.query_one([file.name.clone()], |r| r.get::<_, i64>(0));
 
-            // if file does not exist, request manifest
-            if stmt.query_one([file.name.clone()], |_| Ok(())).is_err() {
-                tracing::debug!("file {} does not exist, requesting manifest", file.name);
+            // if file does not exist or doesnt match, request manifest
+            if !hash.map(|h| h as u64 != file.hash).unwrap_or(false) {
+                tracing::debug!("roominfo: file {} does not exist, requesting manifest", file.name);
 
                 self.send_ch
                     .as_ref()
@@ -1100,10 +1101,11 @@ impl Client {
             return Ok(());
         }
 
-        db.execute(
+        let timestamp = Self::timestamp()? as i64;
+        Self::db_keep_trying(|| db.execute(
             "INSERT OR REPLACE INTO filenames (name, hash, timestamp) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
-            (name_string, namehash, Self::timestamp()? as i64),
-        )?;
+            (name_string, namehash, timestamp),
+        ))?;
 
         if !parent.exists() {
             tracing::debug!("parent: {:?}", parent);
