@@ -1518,7 +1518,7 @@ impl Client {
             }
 
             protocol::packet::Message::Transfer(transfer) => {
-                dbg!(self.handle_transfer(code, transfer, send_ch).await)?
+                self.handle_transfer(code, transfer, send_ch).await?
             }
 
             protocol::packet::Message::Delta(delta) => self.handle_delta(delta).await?,
