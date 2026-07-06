@@ -105,7 +105,7 @@ impl Client {
 
 /// bullshit function to keep trying to execute something on the db
 /// in case db keeps locking
-pub(crate) fn db_keep_trying<T: Fn() -> Result<usize, rusqlite::Error>>(f: T) -> anyhow::Result<()> {
+pub(crate) fn db_keep_trying<T: Fn() -> Result<U, rusqlite::Error>, U>(f: T) -> anyhow::Result<()> {
     while f().is_err() {}
 
     Ok(())

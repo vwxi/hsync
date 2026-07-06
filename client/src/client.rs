@@ -247,6 +247,7 @@ impl Client {
         });
 
         let db_pool = Pool::new(manager)?;
+        
         let client = Client {
             config: config.clone(),
             watcher: Arc::new(watcher),
@@ -902,7 +903,7 @@ impl Client {
 
                         // we cannot care about the result of this
                         // but send a queued manifest if any
-                        let _ = block_on(self.send_queued_manifest(namehash));
+                        let _ = self.send_queued_manifest(namehash).await;
                     }
                 }
             }
@@ -1356,39 +1357,33 @@ impl Client {
 
     /// remove all accounting data related to a file hash
     async fn clear_file_temp_data(&self, namehash: i64, flags: ClearFlags) -> anyhow::Result<()> {
-        // fuck this crate in its ass
-        // why can't i have async here
-        bitflags::bitflags_match!(flags, {
-            ClearFlags::Transfers => {
-                tracing::debug!("gc: delete transfers for {namehash}");
+        if flags.contains(ClearFlags::Transfers) {
+            tracing::debug!("gc: delete transfers for {namehash}");
 
-                let mut transfers_lock = block_on(self.outgoing_transfer_requests.lock());
-                transfers_lock.remove(&namehash);
-            },
+            let mut transfers_lock = self.outgoing_transfer_requests.lock().await;
+            transfers_lock.remove(&namehash);
+        }
 
-            ClearFlags::Accesses => {
-                tracing::debug!("gc: delete accesses for {namehash}");
+        if flags.contains(ClearFlags::Accesses) {
+            tracing::debug!("gc: delete accesses for {namehash}");
 
-                let mut accesses_lock = block_on(self.current_accesses.lock());
-                accesses_lock.remove(&namehash);
-            },
+            let mut accesses_lock = self.current_accesses.lock().await;
+            accesses_lock.remove(&namehash);
+        }
 
-            ClearFlags::Queue => {
-                tracing::debug!("gc: delete queue for {namehash}");
+        if flags.contains(ClearFlags::Queue) {
+            tracing::debug!("gc: delete queue for {namehash}");
 
-                let mut queue_lock = block_on(self.queued_manifests.lock());
-                queue_lock.remove(&namehash);
-            },
-
-            _ => {},
-        });
+            let mut queue_lock = self.queued_manifests.lock().await;
+            queue_lock.remove(&namehash);
+        }
 
         Ok(())
     }
 
     async fn handle_sendagain(&mut self, sendagain: protocol::SendAgain) -> anyhow::Result<()> {
         // if there's a queued manifest, send it over now
-        if block_on(self.send_queued_manifest(sendagain.namehash as i64)).is_err() {
+        if self.send_queued_manifest(sendagain.namehash as i64).await.is_err() {
             self.send_ch.as_ref().map(|ch| {
                 ch.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
@@ -1523,7 +1518,7 @@ impl Client {
             }
 
             protocol::packet::Message::Transfer(transfer) => {
-                self.handle_transfer(code, transfer, send_ch).await?
+                dbg!(self.handle_transfer(code, transfer, send_ch).await)?
             }
 
             protocol::packet::Message::Delta(delta) => self.handle_delta(delta).await?,

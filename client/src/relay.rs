@@ -258,7 +258,6 @@ impl Client {
 
                         _ = hb_kill_token.cancelled() => {
                             tracing::warn!("relay: heartbeat relay for relay ID {:?} has been closed internally", relay_who);
-                            hb_global_token.cancel();
                             break;
                         }
                     }
