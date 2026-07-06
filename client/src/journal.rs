@@ -5,7 +5,7 @@ use std::{io::{Read, Seek, SeekFrom, Write}, path::PathBuf};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 
-use crate::client::{Ch, Client, protocol};
+use crate::{client::{Ch, Client, protocol}, util::db_keep_trying};
 
 impl Client {
     /// journal block for after modify etc
@@ -283,10 +283,10 @@ impl Client {
                 protocol::delta::OpType::Delete => {
                     Self::truncate_range(&mut file, start, end)?;
 
-                    db.execute(
+                    db_keep_trying(|| db.execute(
                         "DELETE FROM blocks WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4",
                         [namehash as i64, start as i64, end as i64, hash as i64],
-                    )?;
+                    ))?;
 
                     tracing::debug!("delta: {namehash}: delete [{start}, {end}] (hash: {hash})");
                 }
@@ -313,7 +313,7 @@ impl Client {
             }
 
             // remove entry from journal
-            db.execute(
+            db_keep_trying(|| db.execute(
                 "DELETE FROM journal WHERE file = ?1 AND start = ?2 AND end = ?3 AND hash = ?4 AND cookie = ?5",
                 [
                     namehash as i64,
@@ -322,7 +322,7 @@ impl Client {
                     hash as i64,
                     cookie,
                 ],
-            )?;
+            ))?;
 
             if op != protocol::delta::OpType::Delete {
                 db.execute(

@@ -47,7 +47,7 @@ impl Server {
                     if let Err(e) = Self::write_packet(&mut bidi.0, &p).await {
                         tracing::error!("aux packet out: {}", e.to_string());
 
-                        token.cancel();
+                        kill_token.cancel();
                     }
                 }
 
@@ -64,7 +64,7 @@ impl Server {
                         _ => {
                             tracing::debug!("ending client event thread");
 
-                            token.cancel();
+                            kill_token.cancel();
                         }
                     }
                 }
@@ -151,6 +151,7 @@ impl Server {
                                 Some(protocol::packet::Message::RelayOpen(_)) => {}
 
                                 Some(protocol::packet::Message::RelayClose(_)) => {
+                                    tracing::debug!("relay {} -> {}: relay close", relay_addr, addr);
                                     kill_token_.cancel();
                                     return;
                                 }
@@ -183,8 +184,6 @@ impl Server {
 
 
                         Some(s_pkt) = r_chan.1.recv() => {
-                            tracing::debug!("relay pkt {:?} for {} -> {}", s_pkt.message.as_ref().map(|rp| rp.type_id()), addr, relay_addr);
-
                             if let Err(e) = Self::write_packet(&mut r_send, &s_pkt).await {
                                 tracing::error!("relay {} -> {} write: {}", addr, relay_addr, e.to_string());
                                 kill_token_.cancel();

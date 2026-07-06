@@ -5,12 +5,13 @@ use quinn::{RecvStream, SendStream};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use tokio::sync::{
-    mpsc::{UnboundedSender, unbounded_channel},
-    oneshot,
+    mpsc::{UnboundedSender, channel, unbounded_channel}, oneshot,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{Ch, Client, HEARTBEAT_INTERVAL, protocol};
+
+const RELAY_BUFSZ: usize = 32;
 
 pub(crate) struct Relay {
     send: UnboundedSender<Ch>,
@@ -120,10 +121,13 @@ impl Client {
         let kill_token = CancellationToken::new();
         let mut chan = unbounded_channel::<Ch>();
 
+        let cmp_ch = chan.0.clone();
         let hb_send_ch = chan.0.clone();
         let hb_global_token = global_token.clone();
         let hb_kill_token = kill_token.clone();
-
+        let in_global_token = global_token.clone();
+        let in_kill_token = kill_token.clone();
+        
         // add relay entry into global relay list, if exists
         if let Some(o_id) = relay_who {
             let mut relays_lock = self.relays.lock().await;
@@ -146,7 +150,39 @@ impl Client {
 
         tracing::debug!("relay {:?} has stream id {}", relay_who, bidi.0.id());
 
+        let (in_send, mut in_recv) = channel::<anyhow::Result<Option<protocol::Packet>>>(RELAY_BUFSZ);
+
+        let self_ = self.clone();
         let futs = vec![
+            tokio::spawn(async move {
+                let mut recv = bidi.1;
+
+                loop {
+                    tokio::select! {
+                        _ = in_global_token.cancelled() => {
+                            tracing::warn!("relay: in task has been closed externally");
+                            in_kill_token.cancel();
+
+                            break;
+                        }
+
+                        _ = in_kill_token.cancelled() => {
+                            tracing::warn!("relay: in task has been closed internally");
+                            break;
+                        }
+
+                        res = Self::read_packet(&mut recv) => match res {
+                            Ok(Some(pkt)) => {                                                                                                                                                                                    
+                                if in_send.send(Ok(Some(pkt))).await.is_err() { break; }                                                                                                                             
+                            }                                            
+
+                            Ok(None) => { let _ = in_send.send(Ok(None)); break; }
+
+                            Err(e) => { let _ = in_send.send(Err(e)); break; }
+                        }
+                    }
+                }
+            }),
             tokio::spawn(async move {
                 let mut recv_id: Option<u64> = relay_who;
 
@@ -180,19 +216,17 @@ impl Client {
                             }
                         }
 
-                        p = Self::read_packet(&mut bidi.1) => {
-                            match p {
-                                Ok(Some(pkt)) => {
-                                    if let Err(e) = self.handle_aux_packet(pkt, &chan.0, &mut recv_id, &kill_token).await {
-                                        tracing::error!("aux packet handler: {}", e.to_string());
-                                        kill_token.cancel();
-                                    }
-                                }
-
-                                a => {
-                                    tracing::debug!("ending relay for {:?} event thread, {:?}", relay_who, a);
+                        Some(res) = in_recv.recv() => match res {
+                            Ok(Some(pkt)) => {
+                                if let Err(e) = self_.handle_aux_packet(pkt, &chan.0, &mut recv_id, &kill_token).await {
+                                    tracing::debug!("aux packet handler: {}, {}", e.to_string(), e.backtrace());
                                     kill_token.cancel();
                                 }
+                            }
+
+                            _ => {
+                                tracing::debug!("relay stream ended for {:?}", relay_who); 
+                                kill_token.cancel();
                             }
                         }
                     }
@@ -224,6 +258,7 @@ impl Client {
 
                         _ = hb_kill_token.cancelled() => {
                             tracing::warn!("relay: heartbeat relay for relay ID {:?} has been closed internally", relay_who);
+                            hb_global_token.cancel();
                             break;
                         }
                     }
@@ -234,6 +269,15 @@ impl Client {
         tracing::debug!("relay: handled new relay");
 
         join_all(futs).await;
+
+        tracing::debug!("relay: closing relay");
+
+        if let Some(o_id) = relay_who {
+            let mut relays_lock = self.relays.lock().await;
+            if relays_lock.get(&o_id).map(|r| r.send.same_channel(&cmp_ch)).unwrap_or(false) {
+                relays_lock.remove(&o_id);
+            }
+        }
     }
 
     pub(crate) async fn handle_bulk_transfer(
@@ -336,37 +380,31 @@ impl Client {
     /// helper function that groups blocks by their origins and
     /// sends out bulk transfer requests 
     pub(crate) async fn bulk_request_blocks(&self, version: u64, namehash: u64, blocks: Vec<protocol::BlockMetadata>) -> anyhow::Result<()> {
-        blocks
-            .chunk_by(|a, b| a.origin == b.origin)
-            .map(|blocks| {
-                
-                let origin = blocks
-                    .first()
-                    .ok_or(anyhow::anyhow!("empty chunk?"))?
-                    .origin
-                    .ok_or(anyhow::anyhow!("no origin?"))?;
+        for blocks in blocks.chunk_by(|a, b| a.origin == b.origin) {
+            let origin = blocks
+                .first()
+                .ok_or(anyhow::anyhow!("empty chunk?"))?
+                .origin
+                .ok_or(anyhow::anyhow!("no origin?"))?;
 
-                let num_blocks = blocks.len();
+            let num_blocks = blocks.len();
 
-                let bulk_transfer = protocol::BulkTransfer {
-                    version,
-                    namehash,
-                    blocks: blocks.to_vec(),
-                };
+            let bulk_transfer = protocol::BulkTransfer {
+                version,
+                namehash,
+                blocks: blocks.to_vec(),
+            };
 
-                block_on(self.relay_id_send_once(
-                    origin,
-                    protocol::Packet {
-                        code: protocol::Return::NoneUnspecified as i32,
-                        message: Some(protocol::packet::Message::BulkTransfer(bulk_transfer)),
-                    },
-                ))?;
+            self.relay_id_send_once(
+                origin,
+                protocol::Packet {
+                    code: protocol::Return::NoneUnspecified as i32,
+                    message: Some(protocol::packet::Message::BulkTransfer(bulk_transfer)),
+                },
+            ).await?;
 
-                tracing::debug!("bulk: sent ID {} a transfer request for {} blocks", origin, num_blocks);
-
-                anyhow::Ok(())
-            })
-            .collect::<anyhow::Result<Vec<()>>>()?;
+            tracing::debug!("bulk: sent ID {} a transfer request for {} blocks", origin, num_blocks);
+        }
         
         Ok(())
     }

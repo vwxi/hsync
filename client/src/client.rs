@@ -28,7 +28,7 @@ use tokio::{
 use tracing::instrument;
 use xxhash_rust;
 
-use crate::{Config, relay::Relay, util::ClearFlags};
+use crate::{Config, relay::Relay, util::{ClearFlags, db_keep_trying}};
 
 pub mod protocol {
     include!(concat!(env!("OUT_DIR"), "/hsync.rs"));
@@ -1102,7 +1102,7 @@ impl Client {
         }
 
         let timestamp = Self::timestamp()? as i64;
-        Self::db_keep_trying(|| db.execute(
+        db_keep_trying(|| db.execute(
             "INSERT OR REPLACE INTO filenames (name, hash, timestamp) SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM filenames WHERE name = ?1)",
             (name_string, namehash, timestamp),
         ))?;
@@ -1139,8 +1139,8 @@ impl Client {
             return Ok(());
         }
 
-        Self::db_keep_trying(|| db.execute("DELETE FROM blocks WHERE file = ?1", [namehash]))?;
-        Self::db_keep_trying(|| db.execute("DELETE FROM filenames WHERE hash = ?1", [namehash]))?;
+        db_keep_trying(|| db.execute("DELETE FROM blocks WHERE file = ?1", [namehash]))?;
+        db_keep_trying(|| db.execute("DELETE FROM filenames WHERE hash = ?1", [namehash]))?;
 
         tracing::debug!("deleted all blocks related to file {} in folder", namehash,);
 
@@ -1347,6 +1347,7 @@ impl Client {
                 .filter_map(anyhow::Result::ok)
                 .collect::<Vec<protocol::BlockMetadata>>();
 
+            tracing::debug!("bulk: requesting {} blocks for {}", req_blocks.len(), manifest.filename);
             self.bulk_request_blocks(manifest.version, namehash as u64, req_blocks).await?;
         }
 
@@ -1481,7 +1482,7 @@ impl Client {
     async fn handle_done(&mut self, done: protocol::TransferDone) -> anyhow::Result<()> {
         let db = self.db_pool.get()?;
 
-        Self::db_keep_trying(|| db.execute(
+        db_keep_trying(|| db.execute(
             "DELETE FROM journal WHERE file = ?1 AND cookie = ?2",
             [done.namehash as i64, done.cookie() as i64],
         ))?;
