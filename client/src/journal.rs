@@ -20,7 +20,7 @@ impl Client {
         hash: i64,
     ) -> anyhow::Result<()> {
         if let Some(cookie) = cookie {
-            db.execute(
+            db_keep_trying(|| db.execute(
                 "INSERT INTO journal (file, start, end, hash, cookie, op, contents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 (
                     namehash,
@@ -31,7 +31,7 @@ impl Client {
                     op_type.map(|o| o as i64),
                     data.as_ref().map(|_| rusqlite::blob::ZeroBlob((end - start) as i32)),
                 ),
-            )?;
+            ))?;
 
             if let Some(data) = data {
                 let rowid = db.last_insert_rowid();

@@ -1503,38 +1503,40 @@ impl Client {
         let code = packet.code();
         let message = packet.message.unwrap();
 
-        match message {
+        if let Err(e) = match message {
             protocol::packet::Message::Die(die) => {
-                self.handle_die(die).await?;
+                self.handle_die(die).await
             }
 
             protocol::packet::Message::RoomInfo(room_info) => {
-                self.handle_roominfo(room_info).await?;
+                self.handle_roominfo(room_info).await
             }
 
             protocol::packet::Message::Event(event) => {
-                self.handle_ext_file_event(event).await?;
+                self.handle_ext_file_event(event).await
             }
 
             protocol::packet::Message::Manifest(manifest) => {
-                self.handle_manifest(code, manifest).await?
+                self.handle_manifest(code, manifest).await
             }
 
             protocol::packet::Message::Transfer(transfer) => {
-                self.handle_transfer(code, transfer, send_ch).await?
+                self.handle_transfer(code, transfer, send_ch).await
             }
 
-            protocol::packet::Message::Delta(delta) => self.handle_delta(delta).await?,
+            protocol::packet::Message::Delta(delta) => self.handle_delta(delta).await,
 
             protocol::packet::Message::SendAgain(sendagain) => {
-                self.handle_sendagain(sendagain).await?
+                self.handle_sendagain(sendagain).await
             }
 
-            protocol::packet::Message::Whatis(whatis) => self.handle_whatis(whatis).await?,
+            protocol::packet::Message::Whatis(whatis) => self.handle_whatis(whatis).await,
 
-            protocol::packet::Message::Done(done) => self.handle_done(done).await?,
+            protocol::packet::Message::Done(done) => self.handle_done(done).await,
 
-            _ => {}
+            _ => Ok(())
+        } {
+            tracing::error!("server packet: {}", e.to_string());
         }
 
         Ok(())
