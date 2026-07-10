@@ -3,7 +3,6 @@ use std::{
 };
 
 use futures::{StreamExt, executor::block_on, future::join_all};
-use glob::glob;
 use notify::Watcher;
 use prost::Message;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, crypto::rustls::QuicClientConfig};
@@ -298,28 +297,23 @@ impl Client {
         folder: &PathBuf,
         db: &PooledConnection<SqliteConnectionManager>,
     ) -> anyhow::Result<()> {
-        let folder_glob = format!(
-            "{}/*",
-            folder.to_str().ok_or(anyhow::anyhow!("malformed folder"))?
-        );
-
         let current_timestamp = Self::timestamp()? as i64;
 
-        for entry in glob(&folder_glob)? {
+        for entry in ignore::WalkBuilder::new(folder.as_path())
+            .standard_filters(!self.config.no_ignore)
+            .build() {
             match entry {
                 Ok(path) => {
-                    if path.is_file() {
-                        let current_datahash = self.get_file_hash(&path)? as i64;
+                    if path.path().is_file() {
+                        let current_datahash = self.get_file_hash(&path.clone().into_path())? as i64;
 
                         self.process_change(
                             db,
-                            &path,
+                            &path.into_path(),
                             current_datahash,
                             current_timestamp,
                             None,
                         )?;
-                    } else if path.is_dir() {
-                        self.process_files_into_db(&path, db)?;
                     }
                 }
                 _ => continue,
@@ -591,6 +585,16 @@ impl Client {
             | notify::event::EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Any,
             )) => {
+                // if ignoring stuff, should this be ignored
+                // i really don't like how this works
+                if ignore::WalkBuilder::new(self.config.folder.as_ref().expect("folder should be set"))
+                    .standard_filters(!self.config.no_ignore)
+                    .build()
+                    .any(|f| f.map(|g| g.path() == event_path).unwrap_or(false)) {
+                    tracing::debug!("event: filtered and ignored {}", event_path.to_string_lossy());
+                    return Ok(());
+                }
+
                 // if we are currently accessing this, skip
                 let current_timestamp = Self::timestamp()? as i64;
                 let current_datahash = self.get_file_hash(event_path)? as i64;
@@ -1169,7 +1173,8 @@ impl Client {
             }
 
             protocol::FileEvent::Delete => {
-                self.delete_file_by_hash(&db, namehash)?;
+                // let's stop complaining about this
+                let _ = self.delete_file_by_hash(&db, namehash);
             }
         }
 
@@ -1181,8 +1186,6 @@ impl Client {
         code: protocol::Return,
         mut manifest: protocol::FileManifest,
     ) -> anyhow::Result<()> {
-        // TODO: SET A HARD LIMIT ON FILE SIZES
-
         let namehash = xxhash_rust::xxh3::xxh3_64(manifest.filename.as_bytes()) as i64;
 
         // queue this for later

@@ -46,6 +46,10 @@ struct Config {
     /// path to metadata store file
     #[arg(short, long, value_name = "DB")]
     db: Option<PathBuf>,
+
+    /// disregard hardcoded ignore logic
+    #[arg(short, long, value_name = "NOIGNORE")]
+    no_ignore: bool,
 }
 
 fn main() -> anyhow::Result<()> {
