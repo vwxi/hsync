@@ -1,0 +1,5 @@
+p2p notes
+
+broken on big files, 
+
+we should check data hash AFTER applying the delta

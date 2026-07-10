@@ -1,0 +1,88 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "attach",
+            "name": "Attach",
+            "pid": "${command:pickMyProcess}" // use ${command:pickProcess} to pick other users' processes
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'hsync-server'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=hsync-server",
+                    "--package=hsync-server"
+                ],
+                "filter": {
+                    "name": "hsync-server",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'hsync-server'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=hsync-server",
+                    "--package=hsync-server"
+                ],
+                "filter": {
+                    "name": "hsync-server",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'hsync-client'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=hsync-client",
+                    "--package=hsync-client"
+                ],
+                "filter": {
+                    "name": "hsync-client",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'hsync-client'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=hsync-client",
+                    "--package=hsync-client"
+                ],
+                "filter": {
+                    "name": "hsync-client",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

@@ -1,4 +1,8 @@
 mod client;
+mod relay;
+mod block;
+mod util;
+mod journal;
 
 use clap::Parser;
 use std::{fs::metadata, net::SocketAddr, path::PathBuf};
@@ -41,6 +45,10 @@ struct Config {
     /// path to metadata store file
     #[arg(short, long, value_name = "DB")]
     db: Option<PathBuf>,
+
+    /// disregard hardcoded ignore logic
+    #[arg(short, long, value_name = "NOIGNORE")]
+    no_ignore: bool,
 }
 
 fn main() -> anyhow::Result<()> {

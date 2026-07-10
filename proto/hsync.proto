@@ -15,6 +15,7 @@ message Auth {
 message RoomInfo {
   message File {
     string name = 1;
+    uint64 hash = 2;
   }
 
   uint64 id = 1;
@@ -31,22 +32,28 @@ message BlockMetadata {
   uint64 end = 2;
   optional uint64 namehash = 3;
   uint64 hash = 4;
+  // server id belonging to the origin of the manifest
+  //
+  // only set when server->client
+  optional uint64 origin = 5;
   // server->client ignores this, client->server requires this
-  optional uint64 cookie = 5;
+  optional uint64 cookie = 6;
 }
 
 // describes a file.
 message FileManifest {
-  string filename = 1;
-  uint64 timestamp = 2;
-  uint64 size = 3;
+  // this version specifically refers to the latest version (highest number)
+  uint64 version = 1;
+  string filename = 2;
+  uint64 timestamp = 3;
+  uint64 size = 4;
   // what final data hash should be after blocks
-  optional uint64 hash = 4;
+  optional uint64 hash = 5;
   // no cookie means transfers will come from the main block table
   //
   // server->client ignores this, client->server requires this
-  optional uint64 cookie = 5;
-  repeated BlockMetadata blocks = 6;
+  optional uint64 cookie = 6;
+  repeated BlockMetadata blocks = 7;
 }
 
 // get the manifest for a file
@@ -69,13 +76,17 @@ message Delta {
     uint64 end = 4;
   }
 
-  uint64 size = 1;
-  string filename = 2;
-  uint64 cookie = 3;
-  uint64 hash = 4;
-  repeated Operation ops = 5;
+  uint64 version = 1;
+  uint64 size = 2;
+  string filename = 3;
+  uint64 origin = 4;
+  uint64 cookie = 5;
+  uint64 hash = 6;
+  repeated Operation ops = 7;
 }
 
+// whole (uncompressed) is the only supported data mode at the moment
+// but in the future i will add support for compressed data modes
 enum DataMode {
   DATA_MODE_WHOLE_UNSPECIFIED = 0;
   DATA_MODE_DELTA = 1;
@@ -87,6 +98,12 @@ message Transfer {
   BlockMetadata metadata = 1;
   DataMode mode = 2;
   optional bytes data = 3;
+}
+
+message BulkTransfer {
+  uint64 version = 1;
+  uint64 namehash = 2;
+  repeated BlockMetadata blocks = 3;
 }
 
 enum FileEvent {
@@ -111,9 +128,17 @@ message SendAgain {
 
 message TransferDone {
   uint64 namehash = 1;
+  optional uint64 cookie = 2;
 }
 
-message Whoami {}
+// server->client: incoming relay stream from other user
+// client->server: outgoing relay request to another user
+message RelayOpen {
+  uint64 id = 1;
+}
+
+// whatever relay is open on this stream, close it.
+message RelayClose {}
 
 enum Return {
   RETURN_NONE_UNSPECIFIED = 0;
@@ -122,6 +147,8 @@ enum Return {
   RETURN_FILE_NOT_FOUND = 3;
   RETURN_BLOCK_NOT_FOUND = 4;
   RETURN_TRANSFERS_PENDING = 5;
+  RETURN_SIZE_LIMIT = 6;
+  RETURN_NO_CHANGE = 7;
 }
 
 message Packet {
@@ -141,5 +168,10 @@ message Packet {
     WhatIs whatis = 9;
     SendAgain send_again = 10;
     TransferDone done = 11;
+
+    // p2p operations
+    RelayOpen relay_open = 12;
+    RelayClose relay_close = 13;
+    BulkTransfer bulk_transfer = 14;
   }
 }
