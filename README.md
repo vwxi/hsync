@@ -1,6 +1,8 @@
 # hsync
 
-this is a real-time file-syncing program for collaborative programming in instances that require more granular synchronization.
+this is a real-time file-syncing program for collaborative programming in instances that require more granular syncing.  
+written with hackathons and other short-term commitments in mind, it will propagate changes as you save files.  
+it also respects `.gitignore` style files to prevent sending garbage over the network.
 
 ## how to use
 
