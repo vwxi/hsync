@@ -1675,7 +1675,7 @@ impl Client {
                     tokio::select! {
                         Some(incoming) = client.endpoint.accept() => {
                             if incoming.remote_address_validated() {
-                                tokio::spawn(client.clone().handle_direct(incoming));
+                                tokio::spawn(Self::handle_direct(incoming));
                             } else {
                                 let _ = incoming.retry();
                             }
