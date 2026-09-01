@@ -1,9 +1,34 @@
 # hsync
 
-this is a work-in-progress real-time file syncing program that runs over QUIC and requires almost zero babysitting.  
+this is a real-time file-syncing program for collaborative programming in instances that require more granular synchronization.
 
-similar technique to [google's cdc-file-transfer](https://github.com/google/cdc-file-transfer/), uses fastcdc to do content-defined chunking and myers diffing to be able to pass blocks of data over the network when need be without having to shift around blocks.   
+## how to use
 
-## current state
+### server
 
-the server stores state for every folder but i am working on having the server only store metadata and serve as a rendezvous for clients to directly send chunks to eachother. in this new system, the server acts as a relay, a file block index and a semaphore.
+```
+hsync-server --db [path to database]
+```
+
+### client (folder host)
+
+```
+hsync-client --addr [server addr] --folder [folder to share] --password [password for folder] (--insecure)
+```
+
+if you actually want to try this out i recommend using `--insecure` because the QUIC library used requires certificates signed by an authority (which are somewhat annoying to procure).  
+
+on establishing a new connection, you will be provided with a code to send to other users.
+
+> [!NOTE]
+> on debug builds, the code will always be "code" for testing but this will break on multi-tenant setups
+
+### client (joining a folder)
+
+```
+hsync-client --addr [server addr] --code [code] --password [password for folder]
+```
+
+## how?
+
+similar technique to [google's cdc-file-transfer](https://github.com/google/cdc-file-transfer/), uses fastcdc to do content-defined chunking and myers diffing to be able to pass blocks of data over the network when need be without having to shift around blocks.  

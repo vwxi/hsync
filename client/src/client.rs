@@ -1673,6 +1673,14 @@ impl Client {
 
                 loop {
                     tokio::select! {
+                        Some(incoming) = client.endpoint.accept() => {
+                            if incoming.remote_address_validated() {
+                                tokio::spawn(client.clone().handle_direct(incoming));
+                            } else {
+                                let _ = incoming.retry();
+                            }
+                        }
+
                         Ok(incoming_bidi) = conn.accept_bi() => {
                             tracing::debug!("relay: incoming bidi ({})", incoming_bidi.0.id());
                             tokio::task::spawn(client.clone().handle_relay(incoming_bidi, token.clone(), None, None));

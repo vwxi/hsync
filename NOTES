@@ -1,5 +1,14 @@
-p2p notes
+holepunch notes
 
-broken on big files, 
+because Endpoint can hold multiple connections at once 
+we can simplify to this procedure:
 
-we should check data hash AFTER applying the delta
+given peers A and B, server S:
+
+A->S: i want to connect to B, notify them of that
+S->A: okay, B's address is xyz
+S->B: A wants to connect to you. its public address is abc
+(A and B will send garbage to each other's public addresses
+ and simultaneously try to connect N amount of times)
+
+the packet handler function should be the same but the initiator should begin yapping asap

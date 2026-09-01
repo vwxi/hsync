@@ -3,6 +3,7 @@ mod relay;
 mod block;
 mod util;
 mod journal;
+mod direct;
 
 use clap::Parser;
 use std::{fs::metadata, net::SocketAddr, path::PathBuf};
