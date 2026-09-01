@@ -31,4 +31,9 @@ hsync-client --addr [server addr] --code [code] --password [password for folder]
 
 ## how?
 
-similar technique to [google's cdc-file-transfer](https://github.com/google/cdc-file-transfer/), uses fastcdc to do content-defined chunking and myers diffing to be able to pass blocks of data over the network when need be without having to shift around blocks.  
+similar technique to [google's cdc-file-transfer](https://github.com/google/cdc-file-transfer/), uses fastcdc to do content-defined chunking and myers diffing to be able to pass blocks of data over the network when need be without having to shift around blocks. 
+
+## future
+
+- [ ] holepunching and direct connections
+- [ ] UI
