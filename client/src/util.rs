@@ -37,9 +37,7 @@ impl Client {
     ) -> anyhow::Result<Option<protocol::Packet>> {
         let len = match stream.read_u32().await {
             Ok(len) => len,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None)
-            },
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         };
 
@@ -81,16 +79,24 @@ impl Client {
         Ok(folder.join(name))
     }
 
-    pub(crate) fn resolve_relative_path(&self, path: &PathBuf) -> anyhow::Result<String> {
+    pub(crate) fn resolve_relative_path(&self, path: &PathBuf) -> anyhow::Result<PathBuf> {
+        let prefix_stripped = path.strip_prefix(
+            self.config
+                .folder
+                .as_ref()
+                .ok_or(anyhow::anyhow!("no folder found"))?,
+        );
+
+        Ok(prefix_stripped
+            .map_err(|_| anyhow::anyhow!("could not stripped prefix"))?
+            .to_path_buf())
+    }
+
+    pub(crate) fn resolve_relative_path_string(&self, path: &PathBuf) -> anyhow::Result<String> {
         let relative_path = String::from(
-            path.strip_prefix(
-                self.config
-                    .folder
-                    .as_ref()
-                    .ok_or(anyhow::anyhow!("no folder found"))?,
-            )?
-            .to_str()
-            .ok_or(anyhow::anyhow!("relative path encode error"))?,
+            self.resolve_relative_path(path)?
+                .to_str()
+                .ok_or(anyhow::anyhow!("could not convert path to string"))?,
         );
 
         Ok(relative_path)
