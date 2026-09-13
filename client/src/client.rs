@@ -336,8 +336,6 @@ impl Client {
             }
         }
 
-        // Ignore files define which other files are synchronized, so they must
-        // be synchronized even when the ignore walker would exclude them.
         if !self.config.no_ignore {
             for entry in ignore::WalkBuilder::new(
                 self.config
@@ -354,27 +352,15 @@ impl Client {
                     Err(_) => continue,
                 };
 
+                // allow ignore control files
                 if path.is_file() && Self::is_ignore_control_file(&path) {
                     let current_datahash = self.get_file_hash(&path)? as i64;
-                    self.process_change(
-                        db,
-                        &path,
-                        current_datahash,
-                        current_timestamp,
-                        None,
-                    )?;
+                    self.process_change(db, &path, current_datahash, current_timestamp, None)?;
                 }
             }
         }
 
         Ok(())
-    }
-
-    fn is_ignore_control_file(path: &PathBuf) -> bool {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == ".gitignore" || name == ".ignore")
-            || path.ends_with(PathBuf::from(".git").join("info").join("exclude"))
     }
 
     async fn maybe_request_file_manifest(&self, path: &PathBuf) -> anyhow::Result<bool> {
@@ -774,39 +760,42 @@ impl Client {
     async fn handle_roominfo(&mut self, room_info: protocol::RoomInfo) -> anyhow::Result<()> {
         tracing::info!("connect to this room using this code: {}", room_info.code);
 
-        let db = self.db_pool.get()?;
-        for file in room_info.files {
-            let mut stmt = db.prepare("SELECT hash FROM filenames WHERE name = ?1")?;
-            let hash = stmt.query_one([file.name.clone()], |r| r.get::<_, i64>(0));
+        let server_files: HashSet<String> = room_info
+            .files
+            .iter()
+            .map(|file| file.name.clone())
+            .collect();
 
-            // if file does not exist or doesnt match, request manifest
-            if !hash.map(|h| h as u64 != file.hash).unwrap_or(false) {
-                tracing::debug!(
-                    "roominfo: file {} does not exist, requesting manifest",
-                    file.name
-                );
+        for file in &room_info.files {
+            tracing::debug!(
+                "roominfo: requesting authoritative server manifest for {}",
+                file.name
+            );
 
-                self.send_ch
-                    .as_ref()
-                    .map(|ch| {
-                        ch.send(Ch::OutPacket(protocol::Packet {
-                            code: protocol::Return::NoneUnspecified as i32,
-                            message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
-                                filename: file.name.clone(),
-                            })),
-                        }))
-                    })
-                    .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
-            }
+            self.send_ch
+                .as_ref()
+                .map(|ch| {
+                    ch.send(Ch::OutPacket(protocol::Packet {
+                        code: protocol::Return::NoneUnspecified as i32,
+                        message: Some(protocol::packet::Message::Whatis(protocol::WhatIs {
+                            filename: file.name.clone(),
+                        })),
+                    }))
+                })
+                .ok_or(anyhow::anyhow!("could not request file {}", file.name))??;
         }
 
-        // get starting on syncing
-        self.send_own_manifests().await?;
+        // local-only files may be introduced to the room, but if the
+        // file exists on the server the server's copy takes precedence
+        self.send_own_manifests_excluding(&server_files).await?;
 
         Ok(())
     }
 
-    async fn send_own_manifests(&mut self) -> anyhow::Result<()> {
+    async fn send_own_manifests_excluding(
+        &mut self,
+        excluded_files: &HashSet<String>,
+    ) -> anyhow::Result<()> {
         let conn = self.db_pool.get()?;
 
         let mut query_files = conn.prepare("SELECT name, hash, version FROM filenames")?;
@@ -816,6 +805,14 @@ impl Client {
             let filename = row.get::<_, String>(0)?;
             let namehash = row.get::<_, i64>(1)?;
             let version = row.get::<_, i64>(2)? as u64;
+
+            if excluded_files.contains(&filename) {
+                tracing::debug!(
+                    "join: skipping local manifest for server-owned file {}",
+                    filename
+                );
+                continue;
+            }
 
             let mut manifest = protocol::FileManifest::default();
 

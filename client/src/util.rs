@@ -107,6 +107,13 @@ impl Client {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
             .as_secs())
     }
+
+    pub(crate) fn is_ignore_control_file(path: &PathBuf) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == ".gitignore" || name == ".ignore")
+            || path.ends_with(PathBuf::from(".git").join("info").join("exclude"))
+    }
 }
 
 /// bullshit function to keep trying to execute something on the db
