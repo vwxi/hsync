@@ -336,7 +336,45 @@ impl Client {
             }
         }
 
+        // Ignore files define which other files are synchronized, so they must
+        // be synchronized even when the ignore walker would exclude them.
+        if !self.config.no_ignore {
+            for entry in ignore::WalkBuilder::new(
+                self.config
+                    .folder
+                    .as_ref()
+                    .ok_or(anyhow::anyhow!("no folder found"))?,
+            )
+            .standard_filters(false)
+            .require_git(false)
+            .build()
+            {
+                let path = match entry {
+                    Ok(path) => path.into_path(),
+                    Err(_) => continue,
+                };
+
+                if path.is_file() && Self::is_ignore_control_file(&path) {
+                    let current_datahash = self.get_file_hash(&path)? as i64;
+                    self.process_change(
+                        db,
+                        &path,
+                        current_datahash,
+                        current_timestamp,
+                        None,
+                    )?;
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    fn is_ignore_control_file(path: &PathBuf) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == ".gitignore" || name == ".ignore")
+            || path.ends_with(PathBuf::from(".git").join("info").join("exclude"))
     }
 
     async fn maybe_request_file_manifest(&self, path: &PathBuf) -> anyhow::Result<bool> {
@@ -611,22 +649,21 @@ impl Client {
             | notify::event::EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Any,
             )) => {
-                // if ignoring stuff, should this be ignored
-
                 let relative_path_obj = self.resolve_relative_path(event_path)?;
                 let relative_path = relative_path_obj.as_path();
 
-                let matches_ignore = self
-                    .walk_builder
-                    .standard_filters(!self.config.no_ignore)
-                    .require_git(false)
-                    .build_matchers()
-                    .iter_mut()
-                    .any(|m| {
-                        let res = m.matched(relative_path, relative_path.is_dir());
+                let matches_ignore = !Self::is_ignore_control_file(&relative_path_obj)
+                    && self
+                        .walk_builder
+                        .standard_filters(!self.config.no_ignore)
+                        .require_git(false)
+                        .build_matchers()
+                        .iter_mut()
+                        .any(|m| {
+                            let res = m.matched(relative_path, relative_path.is_dir());
 
-                        res.is_ignore() && !res.is_whitelist()
-                    });
+                            res.is_ignore() && !res.is_whitelist()
+                        });
 
                 if matches_ignore {
                     tracing::debug!(

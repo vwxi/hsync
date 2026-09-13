@@ -1,11 +1,16 @@
-use std::{collections::{VecDeque, hash_map::Entry}, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{VecDeque, hash_map::Entry},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use futures::{executor::block_on, future::join_all};
 use quinn::{RecvStream, SendStream};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use tokio::sync::{
-    mpsc::{UnboundedSender, channel, unbounded_channel}, oneshot,
+    mpsc::{UnboundedSender, channel, unbounded_channel},
+    oneshot,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,9 +46,9 @@ impl Client {
 
                 if let Some(entry) = mqueue_lock.get_mut(&id) {
                     tracing::debug!("relay: queueing {} message(s) for {}", messages.len(), id);
-                    
+
                     messages.into_iter().for_each(|m| entry.push(m));
-                    
+
                     return Ok(());
                 } else {
                     mqueue_lock.insert(id, messages);
@@ -66,7 +71,7 @@ impl Client {
                 signal.1.await?;
 
                 tracing::debug!("relay: opened for {id}");
-                
+
                 let relays_lock = relays.lock().await;
                 let relay = relays_lock
                     .get(&id)
@@ -127,7 +132,7 @@ impl Client {
         let hb_kill_token = kill_token.clone();
         let in_global_token = global_token.clone();
         let in_kill_token = kill_token.clone();
-        
+
         // add relay entry into global relay list, if exists
         if let Some(o_id) = relay_who {
             let mut relays_lock = self.relays.lock().await;
@@ -150,7 +155,8 @@ impl Client {
 
         tracing::debug!("relay {:?} has stream id {}", relay_who, bidi.0.id());
 
-        let (in_send, mut in_recv) = channel::<anyhow::Result<Option<protocol::Packet>>>(RELAY_BUFSZ);
+        let (in_send, mut in_recv) =
+            channel::<anyhow::Result<Option<protocol::Packet>>>(RELAY_BUFSZ);
 
         let self_ = self.clone();
         let futs = vec![
@@ -172,9 +178,9 @@ impl Client {
                         }
 
                         res = Self::read_packet(&mut recv) => match res {
-                            Ok(Some(pkt)) => {                                                                                                                                                                                    
-                                if in_send.send(Ok(Some(pkt))).await.is_err() { break; }                                                                                                                             
-                            }                                            
+                            Ok(Some(pkt)) => {
+                                if in_send.send(Ok(Some(pkt))).await.is_err() { break; }
+                            }
 
                             Ok(None) => { let _ = in_send.send(Ok(None)); break; }
 
@@ -220,12 +226,11 @@ impl Client {
                             Ok(Some(pkt)) => {
                                 if let Err(e) = self_.handle_aux_packet(pkt, &chan.0, &mut recv_id, &kill_token).await {
                                     tracing::debug!("aux packet handler: {}, {}", e.to_string(), e.backtrace());
-                                    kill_token.cancel();
                                 }
                             }
 
                             _ => {
-                                tracing::debug!("relay stream ended for {:?}", relay_who); 
+                                tracing::debug!("relay stream ended for {:?}", relay_who);
                                 kill_token.cancel();
                             }
                         }
@@ -273,22 +278,26 @@ impl Client {
 
         if let Some(o_id) = relay_who {
             let mut relays_lock = self.relays.lock().await;
-            if relays_lock.get(&o_id).map(|r| r.send.same_channel(&cmp_ch)).unwrap_or(false) {
+            if relays_lock
+                .get(&o_id)
+                .map(|r| r.send.same_channel(&cmp_ch))
+                .unwrap_or(false)
+            {
                 relays_lock.remove(&o_id);
             }
         }
     }
 
     pub(crate) async fn handle_bulk_transfer(
-        &self, 
+        &self,
         db: PooledConnection<SqliteConnectionManager>,
-        bt: protocol::BulkTransfer, 
-        send: &UnboundedSender<Ch>
+        bt: protocol::BulkTransfer,
+        send: &UnboundedSender<Ch>,
     ) -> anyhow::Result<()> {
         let filepath = self.join_file_and_folder(&db.query_row(
-            "SELECT name FROM filenames WHERE hash = ?1", 
-            [bt.namehash as i64], 
-            |r| r.get::<_, String>(0)
+            "SELECT name FROM filenames WHERE hash = ?1",
+            [bt.namehash as i64],
+            |r| r.get::<_, String>(0),
         )?)?;
 
         for block in bt.blocks {
@@ -296,16 +305,24 @@ impl Client {
             if let Ok(r) = self.fetch_block(&db, &filepath, bt.namehash as i64, block) {
                 send.send(Ch::OutPacket(protocol::Packet {
                     code: protocol::Return::NoneUnspecified as i32,
-                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer { 
-                        metadata: Some(block), 
-                        mode: protocol::DataMode::WholeUnspecified as i32, 
-                        data: Some(r) 
-                    }))
+                    message: Some(protocol::packet::Message::Transfer(protocol::Transfer {
+                        metadata: Some(block),
+                        mode: protocol::DataMode::WholeUnspecified as i32,
+                        data: Some(r),
+                    })),
                 }))?;
 
-                tracing::debug!("served file {} block {}", filepath.to_string_lossy(), bt.namehash);
+                tracing::debug!(
+                    "served file {} block {}",
+                    filepath.to_string_lossy(),
+                    bt.namehash
+                );
             } else {
-                tracing::error!("failed to get block {} for {}", bt.namehash, filepath.to_string_lossy());
+                tracing::error!(
+                    "failed to get block {} for {}",
+                    bt.namehash,
+                    filepath.to_string_lossy()
+                );
             }
         }
 
@@ -367,7 +384,8 @@ impl Client {
             }
 
             protocol::packet::Message::Transfer(transfer) => {
-                self.handle_transfer(protocol::Return::NoneUnspecified, transfer, send).await?;
+                self.handle_transfer(protocol::Return::NoneUnspecified, transfer, send)
+                    .await?;
             }
 
             _ => {}
@@ -377,8 +395,13 @@ impl Client {
     }
 
     /// helper function that groups blocks by their origins and
-    /// sends out bulk transfer requests 
-    pub(crate) async fn bulk_request_blocks(&self, version: u64, namehash: u64, blocks: Vec<protocol::BlockMetadata>) -> anyhow::Result<()> {
+    /// sends out bulk transfer requests
+    pub(crate) async fn bulk_request_blocks(
+        &self,
+        version: u64,
+        namehash: u64,
+        blocks: Vec<protocol::BlockMetadata>,
+    ) -> anyhow::Result<()> {
         for blocks in blocks.chunk_by(|a, b| a.origin == b.origin) {
             let origin = blocks
                 .first()
@@ -400,11 +423,16 @@ impl Client {
                     code: protocol::Return::NoneUnspecified as i32,
                     message: Some(protocol::packet::Message::BulkTransfer(bulk_transfer)),
                 },
-            ).await?;
+            )
+            .await?;
 
-            tracing::debug!("bulk: sent ID {} a transfer request for {} blocks", origin, num_blocks);
+            tracing::debug!(
+                "bulk: sent ID {} a transfer request for {} blocks",
+                origin,
+                num_blocks
+            );
         }
-        
+
         Ok(())
     }
 }
