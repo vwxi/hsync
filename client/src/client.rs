@@ -767,11 +767,6 @@ impl Client {
             .collect();
 
         for file in &room_info.files {
-            tracing::debug!(
-                "roominfo: requesting authoritative server manifest for {}",
-                file.name
-            );
-
             self.send_ch
                 .as_ref()
                 .map(|ch| {
